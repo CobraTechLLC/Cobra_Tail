@@ -1,0 +1,19 @@
+[Unit]
+Description=The Vault — Post-Quantum Key Manager
+After=dev-ttyACM0.device
+Wants=dev-ttyACM0.device
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/python3 /home/cryptkeeper/cript_keeper.py serve
+WorkingDirectory=/home/cryptkeeper
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

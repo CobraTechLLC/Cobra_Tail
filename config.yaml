@@ -1,0 +1,162 @@
+# ─────────────────────────────────────────────────────────────
+# THE LIGHTHOUSE — Configuration
+# Post-Quantum VPN Coordination Server
+# ─────────────────────────────────────────────────────────────
+# Place this file at: /etc/lighthouse/config.yaml
+# Or pass with: python lighthouse.py serve --config /path/to/config.yaml
+
+# ─── Server ──────────────────────────────────────────────────
+# The public-facing URL that remote clients will use to reach
+# this server. This is what you type into the client config.
+# Must match the port you forward on your router.
+#
+# Examples:
+#   https://myvpn.duckdns.org:8443
+#   http://YOUR_PUBLIC_IP:8443
+#
+server_url: "https://<ROUTER_IPV4>:<external_port#>"
+
+# The LAN-local URL for clients on the same network.
+# Clients try this first — if it responds, they skip the
+# public IP and connect directly over the LAN.
+# This solves hairpin NAT issues and reduces latency.
+local_server_url: "https://<LIGHTHOUSE_Reserved_pi>:<Internal_port#>"
+
+# Address and port to bind the API server to.
+# 0.0.0.0 = listen on all interfaces (needed for port forwarding)
+# Forward this port (TCP) on your router to the Pi 4's local IP.
+listen_addr: "0.0.0.0"
+listen_port: <Internal_port#>
+
+# ─── TLS ─────────────────────────────────────────────────────
+# Self-signed cert with certificate pinning (MITM-proof).
+# Generate the cert with:
+#   python lighthouse.py generate-cert --config /etc/lighthouse/config.yaml
+# The fingerprint is printed at generation time and on every boot.
+# Pass it to clients with: --cert-fingerprint <sha256hex>
+#
+tls:
+  enabled: true
+  cert_file: "/etc/lighthouse/server.crt"
+  key_file: "/etc/lighthouse/server.key"
+
+  # SHA-256 fingerprint of the self-signed cert.
+  # Auto-populated by 'generate-cert' command.
+  cert_fingerprint: ""
+
+  # Cert validity in days
+  cert_days: 365
+
+  # Subject name for the self-signed cert
+  cert_subject: "The Lighthouse"
+
+# ─── Vault UART Link ────────────────────────────────────────
+# The Pi Zero 2 W (Vault) connects to the Pi 4 via GPIO UART.
+# Pi Zero TX (GPIO14, pin 8)  →  Pi 4 RX (GPIO15, pin 10)
+# Pi Zero RX (GPIO15, pin 10) →  Pi 4 TX (GPIO14, pin 8)
+# Pi Zero GND (pin 6)         →  Pi 4 GND (pin 6)
+#
+# On the Pi 4, the UART device is typically /dev/ttyAMA0
+# after enabling it in /boot/config.txt with enable_uart=1
+#
+vault_uart:
+  enabled: true
+  device: "/dev/ttyAMA0"
+  baud_rate: 115200
+
+# ─── WireGuard ───────────────────────────────────────────────
+# WireGuard tunnel settings. The Lighthouse manages the wg0
+# interface on the Pi 4 and generates configs for clients.
+#
+wireguard:
+  # WireGuard listen port — forward this port (UDP) on your router
+  listen_port: 51820
+
+  # Private network range for VPN clients
+  # Each client gets an address from this range
+  address_pool: "10.100.0.0/24"
+
+  # The Pi 4's address inside the VPN tunnel
+  server_address: "10.100.0.1/24"
+
+  # Network interface name
+  interface: "wg0"
+
+  # DNS servers pushed to clients (optional)
+  dns:
+    - "1.1.1.1"
+    - "9.9.9.9"
+
+  # Set the Pi 4 as an exit node so all client traffic
+  # routes through your home network
+  exit_node: true
+
+  # Path to store WireGuard keys
+  key_dir: "/etc/lighthouse/wg_keys"
+
+# ─── Post-Quantum Crypto ────────────────────────────────────
+# ML-KEM-1024 (formerly Kyber-1024) settings.
+# The quantum PSK is layered on top of WireGuard's standard
+# Curve25519 key exchange for defense-in-depth.
+#
+pqc:
+  algorithm: "ML-KEM-1024"
+
+  # How often to rotate the quantum PSK (hours)
+  # 0 = never rotate automatically
+  key_rotation_hours: 24
+
+# ─── Persistence ─────────────────────────────────────────────
+# Peer directory and handshake state are stored in SQLite
+# so they survive reboots.
+#
+database:
+  path: "/var/lib/lighthouse/lighthouse.db"
+
+# ─── LAN Peer Discovery ─────────────────────────────────────
+# Clients on the same LAN can discover each other directly
+# via UDP broadcast, avoiding the public IP entirely.
+# This is the foundation for mesh peer-to-peer tunnels.
+#
+discovery:
+  enabled: true
+
+  # UDP port for LAN broadcast announcements
+  # Clients broadcast their device_id, vpn_address, and
+  # LAN IP on this port every broadcast_interval seconds.
+  broadcast_port: 5391
+
+  # How often clients announce themselves on the LAN (seconds)
+  broadcast_interval: 30
+
+# ─── Peers ───────────────────────────────────────────────────
+# How long before a peer is considered offline (seconds)
+peer_timeout: 120
+
+# Maximum number of registered clients
+max_clients: 25
+
+# ─── Mesh Networking ─────────────────────────────────────────
+# Clients can establish direct peer-to-peer WireGuard tunnels.
+# The Lighthouse brokers the quantum PSK exchange between peers.
+# Each pair of peers gets its own ML-KEM-1024 PSK.
+#
+mesh:
+  enabled: true
+
+  # WireGuard listen port for mesh peer tunnels (separate from server tunnel)
+  # Forward this port (UDP) on your router for remote mesh peers
+  wg_listen_port: 51821
+
+  # Auto-accept mesh requests from any registered peer
+  auto_accept: true
+
+  # Maximum mesh peers per client
+  max_peers: 10
+
+# ─── Logging ─────────────────────────────────────────────────
+log:
+  level: "info"           # debug, info, warning, error
+  file: "/var/log/lighthouse/lighthouse.log"
+  max_size_mb: 10
+  backup_count: 3
