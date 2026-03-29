@@ -1,66 +1,43 @@
-\# 🐍 Cobra Tail (formerly The Quantum Scale Project)
+	🐍 Cobra Tail: Post-Quantum Mesh VPNVersion: 0.9.5  | Developed by: Cobra Tech LLC 
 
-\[cite\_start]\*\*Version:\*\* 0.9.5 \[cite: 1]  
+Cobra Tail is a high-performance, self-hosted Post-Quantum Mesh VPN. It provides secure, peer-to-peer connectivity across complex network topologies, utilizing a "privacy-first" and "zero-trust" philosophy. Unlike traditional VPNs, Cobra Tail protects against both current and future quantum computing threats by layering ML-KEM-1024 (Kyber) encryption over standard WireGuard tunnels.
 
-\[cite\_start]\*\*Owner:\*\* Cobra Tech LLC \[cite: 2]
+	🛡️ Key Advantages
 
+Post-Quantum Security: Every tunnel—client-to-server and peer-to-peer—is secured with NIST-standardized ML-KEM-1024 for all key exchanges.
 
+Hardware-Backed Trust: The system uses a dedicated ESP32-S3 Physical TRNG to feed high-quality entropy to the cryptographic vault.
 
-\## 🌐 Overview
+True Zero-Trust Mesh: Peers perform direct, hardware-backed KEM exchanges that bypass the coordination server entirely.
 
-\[cite\_start]Cobra Tail is a high-performance, self-hosted \*\*Post-Quantum Mesh VPN\*\*\[cite: 1]. \[cite\_start]It provides secure, peer-to-peer connectivity across complex network topologies, utilizing a "privacy-first" and "zero-trust" philosophy\[cite: 1]. \[cite\_start]Unlike traditional VPNs, Cobra Tail protects against both current and future quantum computing threats by layering \*\*ML-KEM-1024 (Kyber)\*\* encryption over standard WireGuard tunnels\[cite: 1].
+Deterministic IPv6 Identity: Through the Cobra-Dicyanin layer, the system provides predictable, globally routable IPv6 addresses while masking device identity.
 
-
-
-\## 🛠 Hardware Architecture
+	🏗️ Hardware Architecture
 
 The system operates across three specialized hardware tiers to ensure total cryptographic isolation:
 
+The Tongue (ESP32-S3): Provides hardware-validated entropy using a physical True Random Number Generator (TRNG).
 
+The Vault (Raspberry Pi Zero 2 W): Manages all private keys in a secure, non-networked cryptographic path.
 
-\* \[cite\_start]\*\*The Tongue (ESP32-S3):\*\* Provides hardware-validated entropy using a physical True Random Number Generator (TRNG)\[cite: 1].
+The Lighthouse (Raspberry Pi 4): Functions as the central coordination server for peer discovery and NAT pairing.
 
-\* \[cite\_start]\*\*The Vault (Raspberry Pi Zero 2 W):\*\* Manages all private keys in a secure, non-networked cryptographic path\[cite: 1].
+	🌐 Networking & Identity (Cobra Tech)
 
-\* \[cite\_start]\*\*The Lighthouse (Raspberry Pi 4):\*\* Functions as the central coordination server for peer discovery and NAT pairing\[cite: 1].
+Cobra Tail features an advanced networking stack designed for stealth and near 100% connectivity:
 
+Identity Spoofing: The device impersonates an Apple/macOS machine at the Physical (MAC), Network (Hostname), Application (DHCP), and Kernel (TTL) layers.
 
+Deterministic IPv6: The Lighthouse can mathematically construct a peer's IPv6 address from its known token, enabling direct dialing before a peer even checks in.
 
-\## 🔒 Security \& Cryptography
+NAT Traversal: Multi-candidate STUN hole punching with NAT type classification for Full Cone, Symmetric Predictable, and Symmetric Random NATs.
 
-\* \[cite\_start]\*\*Post-Quantum Resistance:\*\* Every tunnel is secured with \*\*ML-KEM-1024\*\* for key exchanges\[cite: 1].
+Self-Healing: A continuous path monitor detects network changes and updates endpoints live without dropping active connections.
 
-\* \[cite\_start]\*\*Zero-Trust Upgrades:\*\* Peers perform direct, hardware-backed exchanges to upgrade to private shared secrets that the Lighthouse never sees\[cite: 1].
+	🚀 Deployment
 
-\* \[cite\_start]\*\*Automated Rotation:\*\* All quantum keys and mesh tunnel Pre-Shared Keys (PSKs) are rotated every \*\*24 hours\*\* to maintain forward secrecy\[cite: 1].
+1.Configure: Edit config.yaml to set your network parameters and identity spoofing preferences.
 
+2.Initialize Hardware: Ensure the Tongue is connected via UART to provide physical entropy.
 
-
-\## 📡 Networking Stack
-
-Cobra Tail features an advanced NAT traversal engine designed for near 100% connectivity:
-
-\* \[cite\_start]\*\*Direct Path:\*\* Prioritizes IPv6 and local LAN discovery\[cite: 1].
-
-\* \[cite\_start]\*\*Hole Punching:\*\* Utilizes STUN for UDP hole punching through restrictive firewalls\[cite: 1].
-
-\* \[cite\_start]\*\*Fallback:\*\* Includes a guaranteed VPN-routed relay if peer-to-peer connection is impossible\[cite: 1].
-
-\* \[cite\_start]\*\*Self-Healing:\*\* A continuous path monitor detects network changes and updates endpoints live without dropping connections\[cite: 1].
-
-
-
-\## 🚀 Deployment
-
-1\.  \[cite\_start]\*\*Configure:\*\* Edit `config.yaml` with your specific network parameters\[cite: 1].
-
-2\.  \[cite\_start]\*\*Initialize Hardware:\*\* Ensure the "Tongue" is connected via UART to provide entropy\[cite: 1].
-
-3\.  \[cite\_start]\*\*Launch Lighthouse:\*\* Run the coordination server on the Pi 4 to begin brokering peer connections\[cite: 1].
-
-
-
-\---
-
-\*\*Confidentiality Notice:\*\* This project is proprietary to Cobra Tech LLC. \[cite\_start]Unauthorized distribution is prohibited\[cite: 2].
-
+3.Launch Lighthouse: Run the coordination server on the Pi 4 to begin brokering secure, quantum-resistant connections.
