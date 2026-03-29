@@ -1463,7 +1463,22 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
                 [wireguard_exe, "/uninstalltunnelservice", iface],
                 capture_output=True, timeout=10,
             )
-            time.sleep(1)
+            # Windows needs time to fully release the service handle.
+            # 1 second is not enough — the service manager may still
+            # hold a lock, causing "Tunnel already installed" errors.
+            time.sleep(3)
+
+            # Verify the service is actually gone before proceeding
+            for _ in range(5):
+                check = subprocess.run(
+                    [wireguard_exe, "/uninstalltunnelservice", iface],
+                    capture_output=True, text=True, timeout=5,
+                )
+                stderr = (check.stderr or "").lower()
+                if "not found" in stderr or "not installed" in stderr or \
+                   "already" not in stderr:
+                    break
+                time.sleep(1)
         except Exception:
             pass
 
@@ -1475,8 +1490,36 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
             log.info(f"Mesh peer added: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
             return True
         except subprocess.CalledProcessError as e:
-            log.error(f"Failed to install mesh tunnel service: {e.stderr.decode() if e.stderr else e}")
-            return False
+            stderr = e.stderr.decode() if e.stderr else str(e)
+            # "Already installed and running" means the uninstall didn't finish in time
+            # but the config file was already updated, so the OLD service is still running
+            # with the OLD config. We need to force a restart.
+            if "already" in stderr.lower():
+                log.warning(f"Tunnel service still running — forcing restart...")
+                try:
+                    # Force stop via taskkill as a last resort
+                    subprocess.run(
+                        ["taskkill", "/F", "/FI", f"SERVICES eq WireGuardTunnel$wg_mesh"],
+                        capture_output=True, timeout=10,
+                    )
+                    time.sleep(3)
+                    subprocess.run(
+                        [wireguard_exe, "/uninstalltunnelservice", iface],
+                        capture_output=True, timeout=10,
+                    )
+                    time.sleep(2)
+                    subprocess.run(
+                        [wireguard_exe, "/installtunnelservice", str(mesh_conf_path)],
+                        check=True, capture_output=True, timeout=15,
+                    )
+                    log.info(f"Mesh peer added (after forced restart): {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+                    return True
+                except Exception as e2:
+                    log.error(f"Failed to force restart mesh tunnel: {e2}")
+                    return False
+            else:
+                log.error(f"Failed to install mesh tunnel service: {stderr}")
+                return False
         except FileNotFoundError:
             log.error("wireguard.exe not found -- install WireGuard from https://www.wireguard.com/install/")
             return False
@@ -2128,7 +2171,8 @@ class PeerKEMExchange:
     def _apply_new_psk(self, peer_wg_pubkey: str, peer_endpoint: str,
                        peer_vpn_address: str, new_psk: str) -> None:
         """Update the mesh WireGuard peer with the new directly-derived PSK.
-        Preserves mesh IPs so the AllowedIPs don't revert from 10.200.0.x to 10.100.0.x."""
+        Preserves mesh IPs so the AllowedIPs don't revert from 10.200.0.x to 10.100.0.x.
+        On Windows, retries if the tunnel service is still being released."""
         # Look up the mesh IP and my mesh IP so apply_mesh_peer uses the right AllowedIPs
         peer_mesh_ip = ""
         my_mesh_ip = ""
@@ -2143,16 +2187,24 @@ class PeerKEMExchange:
         except Exception:
             pass
 
-        success = apply_mesh_peer(
-            peer_wg_pubkey, peer_endpoint, peer_vpn_address,
-            new_psk, self.service.mesh_wg_privkey, MESH_WG_LISTEN_PORT,
-            my_mesh_ip=my_mesh_ip, peer_mesh_ip=peer_mesh_ip,
-        )
-        if success:
-            log.info(f"Peer KEM: mesh WireGuard updated with direct PSK for {peer_mesh_ip or peer_vpn_address}")
-        else:
-            log.error(f"Peer KEM: failed to apply new PSK for {peer_mesh_ip or peer_vpn_address}")
+        # Retry loop for Windows service timing issues
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            success = apply_mesh_peer(
+                peer_wg_pubkey, peer_endpoint, peer_vpn_address,
+                new_psk, self.service.mesh_wg_privkey, MESH_WG_LISTEN_PORT,
+                my_mesh_ip=my_mesh_ip, peer_mesh_ip=peer_mesh_ip,
+            )
+            if success:
+                log.info(f"Peer KEM: mesh WireGuard updated with direct PSK for {peer_mesh_ip or peer_vpn_address}")
+                return
 
+            if attempt < max_attempts and platform.system() == "Windows":
+                log.info(f"Peer KEM: retrying PSK apply (attempt {attempt}/{max_attempts})...")
+                time.sleep(3)
+            else:
+                log.error(f"Peer KEM: failed to apply new PSK for {peer_mesh_ip or peer_vpn_address}")
+                
     def _find_peer_info(self, device_id: str) -> dict | None:
         """Look up a mesh peer's WG info from our tracked peers."""
         mesh_peers_path = CLIENT_DIR / "mesh_peers.json"
