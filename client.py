@@ -3494,17 +3494,17 @@ def main():
 
     parser.add_argument(
         "--lighthouse",
-        default="https://YOUR_PUBLIC_IP:9443",
+        default="https://<lighthouse-public-ip>:<external-port>",
         help="Lighthouse public URL",
     )
     parser.add_argument(
         "--lighthouse-public",
-        default="https://YOUR_PUBLIC_IP:9443",
+        default="https://<lighthouse-public-ip>:<external-port>",
         help="Lighthouse public URL (for service mode)",
     )
     parser.add_argument(
         "--lighthouse-local",
-        default="https://YOUR_LIGHTHOUSE_IP:8443",
+        default="https://<lighthouse-local-ip>:<internal-port>",
         help="Lighthouse local LAN URL (for service mode)",
     )
     parser.add_argument(
@@ -3552,20 +3552,39 @@ def main():
         UPNP_ENABLED = True
         log.info("UPnP port mapping: ENABLED")
 
+    # Helper: resolve a URL arg — returns empty string if it's still a placeholder
+    def _resolve_url(arg_val, enrollment_key):
+        if arg_val and "://<" not in arg_val:
+            return arg_val
+        return _enrollment.get(enrollment_key, "")
+
     # ── enroll command (must run before service/connect) ──
     if args.command == "enroll":
         _do_enroll(args)
         return
 
     if args.command == "service":
+        public_url = _resolve_url(args.lighthouse_public, "lighthouse_public")
+        local_url = _resolve_url(args.lighthouse_local, "lighthouse_local")
+
+        if not public_url:
+            print("ERROR: No Lighthouse URL configured.")
+            print("  Either enroll first:  python client.py enroll --token <TOKEN> --lighthouse-public <URL>")
+            print("  Or pass it directly:  python client.py service --lighthouse-public https://<ip>:<port>")
+            sys.exit(1)
+
         svc = QuantumVPNService(
-            public_url=args.lighthouse_public,
-            local_url=args.lighthouse_local,
+            public_url=public_url,
+            local_url=local_url,
         )
         svc.run()
 
     elif args.command == "connect":
-        connect(args.lighthouse)
+        lighthouse_url = _resolve_url(args.lighthouse, "lighthouse_public")
+        if not lighthouse_url:
+            print("ERROR: No Lighthouse URL. Enroll first or pass --lighthouse <URL>")
+            sys.exit(1)
+        connect(lighthouse_url)
 
     elif args.command == "status":
         state = load_state()
@@ -3579,16 +3598,24 @@ def main():
         else:
             print("No saved state — client has not connected yet")
 
-        try:
-            resp = get_session().get(f"{args.lighthouse}/api/v1/health", timeout=5)
-            print(f"\nLighthouse:     {json.dumps(resp.json(), indent=2)}")
-        except Exception:
-            print(f"\nLighthouse at {args.lighthouse} not reachable")
+        lighthouse_url = _resolve_url(args.lighthouse, "lighthouse_public")
+        if lighthouse_url:
+            try:
+                resp = get_session().get(f"{lighthouse_url}/api/v1/health", timeout=5)
+                print(f"\nLighthouse:     {json.dumps(resp.json(), indent=2)}")
+            except Exception:
+                print(f"\nLighthouse at {lighthouse_url} not reachable")
 
     elif args.command == "mesh":
-        # Interactive mesh tunnel request
-        lighthouse_url = args.lighthouse_public or args.lighthouse
-        svc_url, _ = select_lighthouse(lighthouse_url, args.lighthouse_local)
+        public_url = _resolve_url(args.lighthouse_public, "lighthouse_public")
+        local_url = _resolve_url(args.lighthouse_local, "lighthouse_local")
+        lighthouse_url = public_url or _resolve_url(args.lighthouse, "lighthouse_public")
+
+        if not lighthouse_url:
+            print("ERROR: No Lighthouse URL. Enroll first or pass --lighthouse-public <URL>")
+            sys.exit(1)
+
+        svc_url, _ = select_lighthouse(lighthouse_url, local_url)
 
         # List available peers
         try:
