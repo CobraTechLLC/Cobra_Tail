@@ -2468,19 +2468,25 @@ def main():
     import uvicorn
     import secrets
 
-    parser = argparse.ArgumentParser(description="The Lighthouse")
-    parser.add_argument(
-        "command",
-        choices=[
-            "serve", "generate-cert", "show-fingerprint",
-            "add-node", "list-nodes", "revoke-node",
-        ],
+    parser = argparse.ArgumentParser(
+        description="The Lighthouse",
+        prog="lighthouse.py",
     )
     parser.add_argument("--config", "-c", default="/etc/lighthouse/config.yaml")
-    parser.add_argument(
-        "node_name", nargs="?", default=None,
-        help="Node name for add-node / revoke-node",
-    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("serve")
+    sub.add_parser("generate-cert")
+    sub.add_parser("show-fingerprint")
+    sub.add_parser("list-nodes")
+
+    p_add = sub.add_parser("add-node")
+    p_add.add_argument("node_name", help="Node name to add")
+
+    p_revoke = sub.add_parser("revoke-node")
+    p_revoke.add_argument("node_name", help="Node name to revoke")
+
     args = parser.parse_args()
 
     global CONFIG
