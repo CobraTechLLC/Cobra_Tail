@@ -32,7 +32,6 @@ REQUIRED_FILES=(
     "lighthouse.py"
     "lighthouse_launcher.py"
     "config.yaml"
-    "lighthouse.service"
 )
 
 for f in "${REQUIRED_FILES[@]}"; do
@@ -74,10 +73,18 @@ chmod 755 "${PKG_DIR}/opt/lighthouse/lighthouse_launcher.py"
 chmod 644 "${PKG_DIR}/opt/lighthouse/config.yaml.template"
 chmod 644 "${PKG_DIR}/opt/lighthouse/version.txt"
 
-# ── Copy systemd service ─────────────────────────────────────
+# ── Generate systemd service ─────────────────────────────────
 
-# We generate the service file with correct paths rather than
-# copying the user's existing one (which has /home/user paths)
+# Always generate with standard /opt/lighthouse paths regardless
+# of where the user's source lighthouse.service lives
+if [ -f "${SCRIPT_DIR}/systemd_setup/lighthouse.service" ]; then
+    echo "  Found lighthouse.service in systemd_setup/ (using standard paths)"
+elif [ -f "${SCRIPT_DIR}/lighthouse.service" ]; then
+    echo "  Found lighthouse.service in repo root (using standard paths)"
+else
+    echo "  Generating lighthouse.service with standard paths"
+fi
+
 cat > "${PKG_DIR}/etc/systemd/system/lighthouse.service" << 'EOF'
 [Unit]
 Description=The Lighthouse — Post-Quantum VPN Coordination Server
@@ -132,7 +139,7 @@ Description: The Lighthouse — Post-Quantum VPN Coordination Server
  .
  Part of the Cobra Tail (PQC-Mesh) project.
  .
- Run 'lighthouse' after installation to start the setup wizard.
+ Run 'sudo lighthouse' after installation to start the setup wizard.
 EOF
 
 # ── postinst — runs after package is installed ────────────────
@@ -244,14 +251,14 @@ systemctl daemon-reload
 echo "  systemd reloaded"
 
 # Don't enable or start the service — the launcher wizard handles that
-# The user needs to run 'lighthouse' first to set up config.yaml
+# The user needs to run 'sudo lighthouse' first to set up config.yaml
 
 echo ""
 echo "═══════════════════════════════════════════════════"
 echo "  Installation complete!"
 echo "═══════════════════════════════════════════════════"
 echo ""
-echo "  Run 'lighthouse' to start the setup wizard."
+echo "  Run 'sudo lighthouse' to start the setup wizard."
 echo ""
 echo "  Files installed:"
 echo "    /opt/lighthouse/          — application code"
@@ -334,14 +341,6 @@ POSTRM
 
 chmod 755 "${PKG_DIR}/DEBIAN/postrm"
 
-# ── conffiles — mark config.yaml as a conffile ────────────────
-# This tells dpkg to preserve the user's config on upgrade
-# (only relevant if they manually created it before the wizard)
-
-cat > "${PKG_DIR}/DEBIAN/conffiles" << 'EOF'
-/etc/lighthouse/config.yaml
-EOF
-
 # ── Build the .deb ────────────────────────────────────────────
 
 echo "[4/5] Building .deb package..."
@@ -376,7 +375,7 @@ if [ -f "${DEB_FILE}" ]; then
     echo "    sudo dpkg -i ${DEB_FILE}"
     echo ""
     echo "  Then run:"
-    echo "    lighthouse"
+    echo "    sudo lighthouse"
     echo ""
 
     # Show package info
