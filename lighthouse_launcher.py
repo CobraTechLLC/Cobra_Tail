@@ -53,6 +53,19 @@ SERVICE_NAME = "lighthouse"
 SERVICE_PATH = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 
 VERSION = "1.0.0"
+VERSION_FILE = LIGHTHOUSE_DIR / "version.txt"
+
+# ─── GitHub Update Config ────────────────────────────────────────────────────
+
+GITHUB_REPO = "CobraTechLLC/Cobra_Tail"
+GITHUB_BRANCH = "main"
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}"
+
+# Files that the updater will pull from GitHub
+UPDATABLE_FILES = {
+    "lighthouse.py": LIGHTHOUSE_PY,
+    "lighthouse_launcher.py": LAUNCHER_PY,
+}
 
 
 # ─── Terminal Helpers ────────────────────────────────────────────────────────
@@ -598,6 +611,196 @@ def _ensure_lighthouse_installed():
     print_warn(f"lighthouse.py not found. Copy it to {LIGHTHOUSE_PY} manually.")
 
 
+# ─── GitHub Update Mechanism ─────────────────────────────────────────────────
+
+
+def get_local_version() -> str:
+    """Read the locally installed version."""
+    if VERSION_FILE.exists():
+        return VERSION_FILE.read_text().strip()
+    return VERSION
+
+
+def get_remote_version() -> str | None:
+    """Fetch the latest version string from GitHub."""
+    url = f"{GITHUB_RAW_BASE}/version.txt"
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(url, timeout=10)
+        return resp.read().decode().strip()
+    except Exception as e:
+        log_debug(f"Failed to check remote version: {e}")
+        return None
+
+
+def log_debug(msg: str):
+    """Debug logging helper — only prints if LIGHTHOUSE_DEBUG is set."""
+    if os.environ.get("LIGHTHOUSE_DEBUG"):
+        print(f"  {Colors.DIM}[debug] {msg}{Colors.RESET}")
+
+
+def download_github_file(filename: str, dest: Path) -> bool:
+    """Download a single file from the GitHub repo to the destination path."""
+    url = f"{GITHUB_RAW_BASE}/{filename}"
+    try:
+        import urllib.request
+        # Download to a temp file first, then validate and move
+        tmp_path = dest.with_suffix(".tmp")
+        urllib.request.urlretrieve(url, str(tmp_path))
+
+        # Validate Python files by parsing them
+        if filename.endswith(".py"):
+            import ast
+            try:
+                ast.parse(tmp_path.read_text())
+            except SyntaxError as e:
+                print_error(f"Downloaded {filename} has syntax errors: {e}")
+                tmp_path.unlink(missing_ok=True)
+                return False
+
+        # Backup existing file
+        if dest.exists():
+            backup = dest.with_suffix(f".bak.{int(time.time())}")
+            shutil.copy2(dest, backup)
+            log_debug(f"Backed up {dest} → {backup}")
+
+        # Move temp file into place
+        shutil.move(str(tmp_path), str(dest))
+        os.chmod(dest, 0o755)
+        return True
+
+    except Exception as e:
+        print_error(f"Failed to download {filename}: {e}")
+        # Clean up temp file if it exists
+        tmp_path = dest.with_suffix(".tmp")
+        if tmp_path.exists():
+            tmp_path.unlink()
+        return False
+
+
+def check_for_updates() -> tuple[str, str, bool]:
+    """
+    Check if updates are available from GitHub.
+    Returns (local_version, remote_version, update_available).
+    """
+    local = get_local_version()
+    remote = get_remote_version()
+
+    if remote is None:
+        return local, "unknown", False
+
+    # Simple string comparison — assumes semantic versioning
+    update_available = remote != local
+    return local, remote, update_available
+
+
+def perform_update() -> bool:
+    """
+    Download and install the latest files from GitHub.
+    Returns True if any files were updated.
+    """
+    c = Colors
+    updated_count = 0
+    failed_count = 0
+
+    print_info("Downloading latest files from GitHub...")
+    print_info(f"Repository: {GITHUB_REPO} ({GITHUB_BRANCH} branch)")
+    print()
+
+    for filename, dest_path in UPDATABLE_FILES.items():
+        print(f"  Updating {filename}...", end=" ", flush=True)
+        if download_github_file(filename, dest_path):
+            print(f"{c.GREEN}OK{c.RESET}")
+            updated_count += 1
+        else:
+            print(f"{c.RED}FAILED{c.RESET}")
+            failed_count += 1
+
+    # Update version.txt
+    remote_version = get_remote_version()
+    if remote_version:
+        VERSION_FILE.write_text(remote_version)
+        print(f"  Updating version.txt...", end=" ")
+        print(f"{c.GREEN}OK{c.RESET} (v{remote_version})")
+
+    print()
+    if failed_count == 0:
+        print_success(f"Updated {updated_count} file(s) successfully.")
+    else:
+        print_warn(f"Updated {updated_count} file(s), {failed_count} failed.")
+
+    return updated_count > 0
+
+
+def menu_check_updates():
+    """Check for available updates from GitHub."""
+    clear_screen()
+    print_banner("Check for Updates")
+
+    c = Colors
+    print_info("Checking GitHub for updates...")
+    print()
+
+    local_ver, remote_ver, available = check_for_updates()
+
+    print(f"  {c.BOLD}Installed version:{c.RESET}  {local_ver}")
+    print(f"  {c.BOLD}Latest version:{c.RESET}     {remote_ver}")
+    print()
+
+    if remote_ver == "unknown":
+        print_error("Could not reach GitHub. Check your internet connection.")
+    elif available:
+        print(f"  {c.GREEN}Update available!{c.RESET} ({local_ver} → {remote_ver})")
+        print()
+        if prompt_confirm("Download and install the update?"):
+            menu_update_from_github()
+            return
+    else:
+        print_success("You're running the latest version.")
+
+    wait_for_key()
+
+
+def menu_update_from_github():
+    """Download and install the latest files from GitHub."""
+    clear_screen()
+    print_banner("Update from GitHub")
+
+    c = Colors
+    running = is_service_running()
+
+    if running:
+        print_warn("The Lighthouse is currently running.")
+        print_info("It will be restarted after the update.")
+        print()
+
+    if not prompt_confirm("Download latest files from GitHub?"):
+        return
+
+    print()
+    updated = perform_update()
+
+    if updated and running:
+        print()
+        if prompt_confirm("Restart the Lighthouse to apply updates?"):
+            if is_service_installed():
+                subprocess.run(["systemctl", "restart", SERVICE_NAME], timeout=15)
+                time.sleep(2)
+                if is_service_running():
+                    print_success("Lighthouse restarted with updated code.")
+                else:
+                    print_error("Restart failed. Check: journalctl -u lighthouse -e")
+            else:
+                print_info("Kill the running process and start it again from the menu.")
+
+    if updated:
+        print()
+        print_warn("The launcher itself was updated. Restart it to use the new version.")
+        print_info("Just exit and run 'lighthouse' again.")
+
+    wait_for_key()
+
+
 # ─── Management Menu (A2) ───────────────────────────────────────────────────
 
 
@@ -630,6 +833,10 @@ def show_menu():
             menu_install_service()
         elif choice == "10":
             menu_rerun_wizard()
+        elif choice == "11":
+            menu_check_updates()
+        elif choice == "12":
+            menu_update_from_github()
         elif choice == "0":
             print_info("Goodbye.")
             break
@@ -670,7 +877,7 @@ def _draw_menu_header():
 
     print()
     print(f"  {c.CYAN}{'═' * 56}{c.RESET}")
-    print(f"  {c.CYAN}║{c.RESET}  {c.BOLD}THE LIGHTHOUSE{c.RESET} — Command Center")
+    print(f"  {c.CYAN}║{c.RESET}  {c.BOLD}THE LIGHTHOUSE{c.RESET} — Command Center  {c.DIM}v{get_local_version()}{c.RESET}")
     print(f"  {c.CYAN}║{c.RESET}")
     print(f"  {c.CYAN}║{c.RESET}  Status:       {status_str}")
     print(f"  {c.CYAN}║{c.RESET}  Peers:        {online_peers} online / {total_peers} total")
@@ -710,6 +917,9 @@ def _draw_menu_options():
         print(f"  [9]  Install as System Service")
 
     print(f"  [10] Re-run Setup Wizard")
+    print(f"  {c.DIM}─────────────────────────────{c.RESET}")
+    print(f"  [11] Check for Updates")
+    print(f"  [12] Update from GitHub")
     print(f"  [0]  Exit")
     print()
 
