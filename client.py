@@ -96,7 +96,7 @@ STATE_PATH = CLIENT_DIR / "client_state.json"
 
 # Timers
 HEARTBEAT_INTERVAL = 30         # Heartbeat to Lighthouse every 30s
-NETWORK_CHECK_INTERVAL = 15     # Check for network changes every 15s
+NETWORK_CHECK_INTERVAL = 5     # Check for network changes every 5s
 DISCOVERY_INTERVAL = 30         # LAN broadcast every 30s
 RECONNECT_DELAY = 10            # Wait before reconnect attempt
 ENDPOINT_PROBE_TIMEOUT = 3      # Timeout for LAN probe (seconds)
@@ -141,7 +141,7 @@ _active_upnp_mappings = {}    # external_port → {"internal_port": int, "gatewa
 
 # ─── Path Monitoring (Phase 4) ───────────────────────────────────────────────
 PATH_MONITOR_INTERVAL = 30           # Check mesh handshake freshness every 30s
-HANDSHAKE_STALE_THRESHOLD = 150      # Seconds since last WG handshake before considered stale (2.5 missed keepalives)
+HANDSHAKE_STALE_THRESHOLD = 90      # Seconds since last WG handshake before considered stale (2.5 missed keepalives)
 PATH_MONITOR_MAX_RETRIES = 3         # Max re-punch attempts before flagging for relay
 PATH_MONITOR_RETRY_DELAYS = [5, 15, 30]  # Delays between re-punch attempts (seconds)
 
@@ -438,17 +438,34 @@ def classify_nat_type(quiet: bool = False) -> tuple[str, list[dict]]:
     Returns (nat_type_string, list_of_mapped_endpoints).
     Each endpoint is {'ip': str, 'port': int, 'stun_server': str}.
     If quiet=True, logs at DEBUG instead of INFO (used by heartbeat to avoid spam).
+    Uses parallel queries to avoid sequential 3s timeouts.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     endpoints = []
-    for host, port in STUN_SERVERS[:4]:
+    servers = STUN_SERVERS[:4]
+
+    def _query_one(host_port):
+        host, port = host_port
         result = stun_query(host, port)
         if result:
             ip, mapped_port = result
-            endpoints.append({
+            return {
                 "ip": ip,
                 "port": mapped_port,
                 "stun_server": f"{host}:{port}",
-            })
+            }
+        return None
+
+    with ThreadPoolExecutor(max_workers=len(servers)) as pool:
+        futures = {pool.submit(_query_one, s): s for s in servers}
+        for fut in as_completed(futures, timeout=5):
+            try:
+                result = fut.result()
+                if result:
+                    endpoints.append(result)
+            except Exception:
+                pass
 
     if len(endpoints) < 2:
         log.warning(f"NAT classification: only {len(endpoints)} STUN responses (need 2+)")
@@ -461,11 +478,9 @@ def classify_nat_type(quiet: bool = False) -> tuple[str, list[dict]]:
     _log = log.debug if quiet else log.info
 
     if len(unique_ports) == 1:
-        # All servers returned the same mapped port — easy NAT
         nat_type = NAT_TYPE_FULL_CONE
         _log(f"NAT type: {nat_type} (all STUN servers returned port {ports[0]})")
     else:
-        # Ports differ — check if they increment sequentially
         sorted_ports = sorted(ports)
         deltas = [sorted_ports[i+1] - sorted_ports[i] for i in range(len(sorted_ports)-1)]
         if all(1 <= d <= 3 for d in deltas):
@@ -1108,7 +1123,7 @@ def initiate_client_encap_handshake(lighthouse_url: str, vault_device_id: str,
     resp = get_session().post(
         f"{lighthouse_url}/api/v1/handshake/client-encap",
         json=payload,
-        timeout=20,
+        timeout=35,
     )
     resp.raise_for_status()
     result = resp.json()
@@ -2510,6 +2525,7 @@ class QuantumVPNService:
         self.mesh_wg_privkey = None
         self.mesh_wg_pubkey = None
         self.mesh_peers = {}  # request_id → {peer_id, vpn_address, ...}
+        self._repunch_active: dict[str, bool] = {}  # peer_id → True if re-punch in progress
         self._mesh_pending_initiations = {}  # device_id → request_id (in-flight requests)
         self.auto_accept_mesh = True  # Auto-accept mesh requests from registered peers
         self.peer_kem = PeerKEMExchange(self)
@@ -2586,9 +2602,21 @@ class QuantumVPNService:
                         if not hb_result:
                             log.warning("Heartbeat failed — connection may be lost")
                             self._handle_connection_loss()
-                        elif isinstance(hb_result, dict) and hb_result.get("pending_mesh_requests", 0) > 0:
-                            # Heartbeat told us there are pending mesh requests — check immediately
-                            self._process_pending_mesh()
+                        else:
+                            if isinstance(hb_result, dict):
+                                if hb_result.get("pending_mesh_requests", 0) > 0:
+                                    # Heartbeat told us there are pending mesh requests — check immediately
+                                    self._process_pending_mesh()
+                                # If a mesh peer pushed new candidates, re-punch immediately
+                                if hb_result.get("peer_candidates_updated") and self.mesh_peers:
+                                    log.info("Heartbeat: peer candidates updated — triggering re-punch")
+                                    for req_id, p_info in list(self.mesh_peers.items()):
+                                        threading.Thread(
+                                            target=self._path_monitor_repunch,
+                                            args=(req_id, p_info),
+                                            daemon=True,
+                                            name=f"hb-repunch-{req_id[:8]}",
+                                        ).start()
                         # Phase 2 U7: Renew UPnP mappings on heartbeat
                         renew_upnp_mappings()
                     last_heartbeat = now
@@ -2764,6 +2792,18 @@ class QuantumVPNService:
                     # Endpoint update failed — do a full reconnect
                     log.info("Endpoint update failed — doing full reconnect")
                     self._full_connect()
+
+            # Immediately re-punch all mesh peers on ANY network change
+            # Don't wait for the path monitor's 30s poll + 150s staleness threshold
+            if self.mesh_peers:
+                log.info(f"Network change: immediately re-punching {len(self.mesh_peers)} mesh peer(s)")
+                for request_id, peer_info in list(self.mesh_peers.items()):
+                    threading.Thread(
+                        target=self._path_monitor_repunch,
+                        args=(request_id, peer_info),
+                        daemon=True,
+                        name=f"netchange-repunch-{request_id[:8]}",
+                    ).start()
         else:
             self.last_gateway = current_gateway
 
@@ -3198,75 +3238,91 @@ class QuantumVPNService:
         latest candidates, and send hole-punch bursts. Retries up to
         PATH_MONITOR_MAX_RETRIES times with increasing delays.
         Also updates WireGuard mesh endpoint to peer's best fresh candidate.
+        Guarded: only one re-punch per peer at a time.
         """
         peer_id = peer_info.get("peer_id", "unknown")
         peer_wg_pubkey = peer_info.get("peer_wg_pubkey", "")
 
-        for attempt, delay in enumerate(PATH_MONITOR_RETRY_DELAYS[:PATH_MONITOR_MAX_RETRIES], 1):
-            if not self._running:
-                return
+        # Guard against concurrent re-punch for the same peer
+        if self._repunch_active.get(peer_id):
+            log.info(f"Path monitor: re-punch already active for {peer_id} — skipping")
+            return
+        self._repunch_active[peer_id] = True
 
-            log.info(f"Path monitor: re-punch attempt {attempt}/{PATH_MONITOR_MAX_RETRIES} for {peer_id}")
+        try:
+            for attempt, delay in enumerate(PATH_MONITOR_RETRY_DELAYS[:PATH_MONITOR_MAX_RETRIES], 1):
+                if not self._running:
+                    return
 
-            try:
-                # Step 1: Re-collect fresh candidates (fresh STUN, fresh IPs)
-                fresh_candidates = collect_endpoint_candidates()
-                nat_type, _ = classify_nat_type()
-                candidates_json = json.dumps(fresh_candidates)
-                log.info(f"Path monitor: collected {len(fresh_candidates)} fresh candidates")
+                log.info(f"Path monitor: re-punch attempt {attempt}/{PATH_MONITOR_MAX_RETRIES} for {peer_id}")
 
-                # Step 2: Push our fresh candidates to the Lighthouse (M4)
-                update_mesh_candidates(
-                    self.lighthouse_url, request_id,
-                    candidates_json, nat_type,
-                )
+                try:
+                    # Step 1: Re-collect fresh candidates (fresh STUN, fresh IPs)
+                    # collect_endpoint_candidates() already calls classify_nat_type() internally,
+                    # so we extract nat_type from the candidates to avoid a redundant STUN round
+                    fresh_candidates = collect_endpoint_candidates()
+                    candidates_json = json.dumps(fresh_candidates)
+                    nat_type = NAT_TYPE_UNKNOWN
+                    for c in fresh_candidates:
+                        if c.get("nat_type"):
+                            nat_type = c["nat_type"]
+                            break
+                    log.info(f"Path monitor: collected {len(fresh_candidates)} fresh candidates")
 
-                # Step 3: Fetch peer's latest candidates from the Lighthouse
-                peer_candidates = fetch_peer_latest_candidates(
-                    self.lighthouse_url, request_id, peer_id,
-                )
+                    # Step 2: Push our fresh candidates to the Lighthouse (M4)
+                    update_mesh_candidates(
+                        self.lighthouse_url, request_id,
+                        candidates_json, nat_type,
+                    )
 
-                # Step 4: Hole-punch with combined endpoints
-                all_endpoints = []
-                if peer_candidates:
-                    all_endpoints = [c["endpoint"] for c in peer_candidates if c.get("endpoint")]
-                    log.info(f"Path monitor: got {len(all_endpoints)} peer endpoints, punching...")
+                    # Step 3: Fetch peer's latest candidates from the Lighthouse
+                    peer_candidates = fetch_peer_latest_candidates(
+                        self.lighthouse_url, request_id, peer_id,
+                    )
 
-                    # Step 5: Update WireGuard mesh endpoint to the best fresh candidate
-                    # Priority: IPv6 > UPnP > STUN > public > LAN > VPN-routed
-                    best_endpoint = self._pick_best_candidate_endpoint(peer_candidates)
-                    if best_endpoint:
+                    # Step 4: Hole-punch with combined endpoints
+                    all_endpoints = []
+                    if peer_candidates:
+                        all_endpoints = [c["endpoint"] for c in peer_candidates if c.get("endpoint")]
+                        log.info(f"Path monitor: got {len(all_endpoints)} peer endpoints, punching...")
+
+                        # Step 5: Update WireGuard mesh endpoint to the best fresh candidate
+                        # Priority: IPv6 > UPnP > STUN > public > LAN > VPN-routed
+                        best_endpoint = self._pick_best_candidate_endpoint(peer_candidates)
+                        if best_endpoint:
+                            current_ep = peer_info.get("endpoint", "")
+                            if best_endpoint != current_ep:
+                                log.info(f"Path monitor: updating WG mesh endpoint: {current_ep} → {best_endpoint}")
+                                self._update_mesh_wg_endpoint(peer_wg_pubkey, best_endpoint)
+                                peer_info["endpoint"] = best_endpoint
+                    else:
+                        # Fallback: use whatever endpoint WireGuard currently has
                         current_ep = peer_info.get("endpoint", "")
-                        if best_endpoint != current_ep:
-                            log.info(f"Path monitor: updating WG mesh endpoint: {current_ep} → {best_endpoint}")
-                            self._update_mesh_wg_endpoint(peer_wg_pubkey, best_endpoint)
-                            peer_info["endpoint"] = best_endpoint
-                else:
-                    # Fallback: use whatever endpoint WireGuard currently has
-                    current_ep = peer_info.get("endpoint", "")
-                    if current_ep:
-                        all_endpoints = [current_ep]
-                    log.info(f"Path monitor: no peer candidates, punching current endpoint")
+                        if current_ep:
+                            all_endpoints = [current_ep]
+                        log.info(f"Path monitor: no peer candidates, punching current endpoint")
 
-                if all_endpoints:
-                    send_holepunch_burst(all_endpoints)
+                    if all_endpoints:
+                        send_holepunch_burst(all_endpoints)
 
-            except Exception as e:
-                log.warning(f"Path monitor: re-punch attempt {attempt} failed: {e}")
+                except Exception as e:
+                    log.warning(f"Path monitor: re-punch attempt {attempt} failed: {e}")
 
-            # Wait, then check if handshake recovered
-            time.sleep(delay)
+                # Wait, then check if handshake recovered
+                time.sleep(delay)
 
-            handshake_map = self._get_mesh_handshake_times()
-            last_hs = handshake_map.get(peer_wg_pubkey, 0)
-            if last_hs > 0 and (time.time() - last_hs) < HANDSHAKE_STALE_THRESHOLD:
-                log.info(f"Path monitor: handshake recovered for {peer_id} after attempt {attempt}")
-                return
+                handshake_map = self._get_mesh_handshake_times()
+                last_hs = handshake_map.get(peer_wg_pubkey, 0)
+                if last_hs > 0 and (time.time() - last_hs) < HANDSHAKE_STALE_THRESHOLD:
+                    log.info(f"Path monitor: handshake recovered for {peer_id} after attempt {attempt}")
+                    return
 
-        log.warning(
-            f"Path monitor: exhausted {PATH_MONITOR_MAX_RETRIES} retries for {peer_id} "
-            f"— path may need relay fallback"
-        )
+            log.warning(
+                f"Path monitor: exhausted {PATH_MONITOR_MAX_RETRIES} retries for {peer_id} "
+                f"— path may need relay fallback"
+            )
+        finally:
+            self._repunch_active.pop(peer_id, None)
 
     def _pick_best_candidate_endpoint(self, candidates: list[dict]) -> str | None:
         """Pick the best endpoint from a candidate list.

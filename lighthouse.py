@@ -942,6 +942,9 @@ def send_to_vault(msg_type: str, data: dict) -> bool:
 _pending_psks: dict[str, str] = {}
 _pending_psks_lock = threading.Lock()
 
+# In-memory tracker for candidate change detection (heartbeat diffing)
+_candidate_versions: dict[str, str] = {}  # "request_id:side" → last known candidates JSON
+
 
 def _store_pending_psk(request_id: str, psk: str) -> None:
     """Store a PSK returned by the Vault for pickup by the API handler."""
@@ -1341,6 +1344,29 @@ async def heartbeat(req: HeartbeatRequest):
             (req.device_id,)
         ).fetchone()[0]
 
+        # Check if any mesh peer has pushed fresh candidates since our last heartbeat
+        # This tells the client "your peer moved networks, re-punch NOW"
+        peer_candidates_updated = False
+        active_tunnels = conn.execute(
+            "SELECT request_id, initiator_id, target_id, "
+            "initiator_candidates, target_candidates FROM mesh_tunnels "
+            "WHERE status = 'active' AND (initiator_id = ? OR target_id = ?)",
+            (req.device_id, req.device_id),
+        ).fetchall()
+
+        for tunnel in active_tunnels:
+            # Check if the OTHER peer's candidates were updated recently
+            # We piggyback on the candidates_updated_at column if it exists,
+            # otherwise we use a simple in-memory tracker
+            peer_side = "target" if tunnel["initiator_id"] == req.device_id else "initiator"
+            tunnel_key = f"{tunnel['request_id']}:{peer_side}"
+            last_known = _candidate_versions.get(tunnel_key, "")
+            current = tunnel[f"{peer_side}_candidates"] or ""
+            if current and current != last_known:
+                _candidate_versions[tunnel_key] = current
+                if last_known:  # Only flag if there WAS a previous version (not first sync)
+                    peer_candidates_updated = True
+
     # DEDENTED: The 'with' block is closed, and the database lock is released.
     # Now it is safe to call cleanup functions that open their own connections.
     try:
@@ -1350,7 +1376,11 @@ async def heartbeat(req: HeartbeatRequest):
         log.error(f"Heartbeat cleanup failed: {e}")
         pass
 
-    return {"status": "ok", "pending_mesh_requests": pending_mesh}
+    return {
+        "status": "ok",
+        "pending_mesh_requests": pending_mesh,
+        "peer_candidates_updated": peer_candidates_updated,
+    }
 
 @app.get("/api/v1/peers")
 async def list_peers():
@@ -1475,7 +1505,7 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
     })
 
     # Wait for the Vault to return the shared secret via UART
-    psk = _wait_for_vault_psk(request_id, timeout=15.0)
+    psk = _wait_for_vault_psk(request_id, timeout=30.0)
 
     if not psk:
         raise HTTPException(504, "Vault did not respond with decapsulated secret in time")
@@ -2468,25 +2498,19 @@ def main():
     import uvicorn
     import secrets
 
-    parser = argparse.ArgumentParser(
-        description="The Lighthouse",
-        prog="lighthouse.py",
+    parser = argparse.ArgumentParser(description="The Lighthouse")
+    parser.add_argument(
+        "command",
+        choices=[
+            "serve", "generate-cert", "show-fingerprint",
+            "add-node", "list-nodes", "revoke-node",
+        ],
     )
     parser.add_argument("--config", "-c", default="/etc/lighthouse/config.yaml")
-
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("serve")
-    sub.add_parser("generate-cert")
-    sub.add_parser("show-fingerprint")
-    sub.add_parser("list-nodes")
-
-    p_add = sub.add_parser("add-node")
-    p_add.add_argument("node_name", help="Node name to add")
-
-    p_revoke = sub.add_parser("revoke-node")
-    p_revoke.add_argument("node_name", help="Node name to revoke")
-
+    parser.add_argument(
+        "node_name", nargs="?", default=None,
+        help="Node name for add-node / revoke-node",
+    )
     args = parser.parse_args()
 
     global CONFIG
