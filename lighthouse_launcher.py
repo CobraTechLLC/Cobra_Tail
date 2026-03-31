@@ -543,7 +543,7 @@ def run_wizard():
 
     try:
         result = subprocess.run(
-            ["python3", str(LIGHTHOUSE_PY), "generate-cert", "--config", str(CONFIG_PATH)],
+            ["python3", str(LIGHTHOUSE_PY), "--config", str(CONFIG_PATH), "generate-cert"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0:
@@ -966,7 +966,7 @@ def menu_start_stop_service():
             print()
             try:
                 proc = subprocess.Popen(
-                    ["python3", str(LIGHTHOUSE_PY), "serve", "--config", str(CONFIG_PATH)],
+                    ["python3", str(LIGHTHOUSE_PY), "--config", str(CONFIG_PATH), "serve"],
                     cwd=str(LIGHTHOUSE_DIR),
                 )
                 proc.wait()
@@ -1002,7 +1002,7 @@ def menu_add_node():
 
     try:
         result = subprocess.run(
-            ["python3", str(LIGHTHOUSE_PY), "add-node", "--config", str(CONFIG_PATH), name],
+            ["python3", str(LIGHTHOUSE_PY), "--config", str(CONFIG_PATH), "add-node", name],
             capture_output=True, text=True, timeout=15,
         )
         print()
@@ -1026,7 +1026,7 @@ def menu_list_nodes():
 
     try:
         result = subprocess.run(
-            ["python3", str(LIGHTHOUSE_PY), "list-nodes", "--config", str(CONFIG_PATH)],
+            ["python3", str(LIGHTHOUSE_PY), "--config", str(CONFIG_PATH), "list-nodes"],
             capture_output=True, text=True, timeout=15,
         )
         for line in result.stdout.strip().split("\n"):
@@ -1046,7 +1046,7 @@ def menu_remove_node():
     # Show current nodes first
     try:
         result = subprocess.run(
-            ["python3", str(LIGHTHOUSE_PY), "list-nodes", "--config", str(CONFIG_PATH)],
+            ["python3", str(LIGHTHOUSE_PY), "--config", str(CONFIG_PATH), "list-nodes"],
             capture_output=True, text=True, timeout=15,
         )
         for line in result.stdout.strip().split("\n"):
@@ -1070,7 +1070,7 @@ def menu_remove_node():
 
     try:
         result = subprocess.run(
-            ["python3", str(LIGHTHOUSE_PY), "revoke-node", "--config", str(CONFIG_PATH), name],
+            ["python3", str(LIGHTHOUSE_PY), "--config", str(CONFIG_PATH), "revoke-node", name],
             capture_output=True, text=True, timeout=15,
         )
         for line in result.stdout.strip().split("\n"):
@@ -1135,7 +1135,7 @@ def menu_regen_cert():
     print_info("Regenerating TLS certificate...")
     try:
         result = subprocess.run(
-            ["python3", str(LIGHTHOUSE_PY), "generate-cert", "--config", str(CONFIG_PATH)],
+            ["python3", str(LIGHTHOUSE_PY), "--config", str(CONFIG_PATH), "generate-cert"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0:
