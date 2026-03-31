@@ -141,7 +141,7 @@ _active_upnp_mappings = {}    # external_port → {"internal_port": int, "gatewa
 
 # ─── Path Monitoring (Phase 4) ───────────────────────────────────────────────
 PATH_MONITOR_INTERVAL = 30           # Check mesh handshake freshness every 30s
-HANDSHAKE_STALE_THRESHOLD = 90      # Seconds since last WG handshake before considered stale (2.5 missed keepalives)
+HANDSHAKE_STALE_THRESHOLD = 120      # Seconds since last WG handshake before considered stale (2.5 missed keepalives)
 PATH_MONITOR_MAX_RETRIES = 3         # Max re-punch attempts before flagging for relay
 PATH_MONITOR_RETRY_DELAYS = [5, 15, 30]  # Delays between re-punch attempts (seconds)
 
@@ -386,7 +386,7 @@ def _discover_public_ip() -> str:
 
     return ""
 
-def stun_query(host: str, port: int, timeout: float = 3.0) -> tuple[str, int] | None:
+def stun_query(host: str, port: int, timeout: float = 2.0) -> tuple[str, int] | None:
     """
     Send a single STUN Binding Request and return (public_ip, mapped_port).
     Returns None on failure. This is the reusable building block for NAT classification.
@@ -457,15 +457,31 @@ def classify_nat_type(quiet: bool = False) -> tuple[str, list[dict]]:
             }
         return None
 
-    with ThreadPoolExecutor(max_workers=len(servers)) as pool:
-        futures = {pool.submit(_query_one, s): s for s in servers}
-        for fut in as_completed(futures, timeout=5):
+    try:
+        with ThreadPoolExecutor(max_workers=len(servers)) as pool:
+            futures = {pool.submit(_query_one, s): s for s in servers}
             try:
-                result = fut.result()
-                if result:
-                    endpoints.append(result)
-            except Exception:
-                pass
+                for fut in as_completed(futures, timeout=5):
+                    try:
+                        result = fut.result()
+                        if result:
+                            endpoints.append(result)
+                    except Exception:
+                        pass
+            except TimeoutError:
+                # Some futures didn't complete in time — collect whatever did finish
+                for fut in futures:
+                    if fut.done():
+                        try:
+                            result = fut.result()
+                            if result:
+                                endpoints.append(result)
+                        except Exception:
+                            pass
+                _log = log.debug if quiet else log.info
+                _log(f"STUN parallel query: {len(endpoints)}/{len(servers)} responded within timeout")
+    except Exception as e:
+        log.warning(f"STUN parallel query failed: {e}")
 
     if len(endpoints) < 2:
         log.warning(f"NAT classification: only {len(endpoints)} STUN responses (need 2+)")
