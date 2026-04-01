@@ -367,6 +367,10 @@ def handle_regen_keys(uart: serial.Serial) -> None:
         uart.write(msg)
         uart.flush()
 
+    # Drain any messages that arrived while we were blocked on
+    # entropy harvest + keygen (kem_requests pile up here)
+    process_lighthouse_messages(uart)
+
 # ─── Lighthouse UART Communication ──────────────────────────────────────────
 
 
@@ -384,12 +388,18 @@ def register_with_lighthouse(uart: serial.Serial, public_key: bytes) -> None:
     uart.flush()
     log.info(f"Sent registration to Lighthouse (device: {device_id})")
 
-    response = read_frame(uart, timeout=5.0)
+    # Short wait for ACK — don't block long or we'll miss kem_requests
+    response = read_frame(uart, timeout=1.0)
     if response and response.get("type") == "ack":
         log.info("Lighthouse acknowledged registration")
+    elif response:
+        # Got a non-ACK message (probably a kem_request that arrived
+        # while we were registering) — process it immediately
+        msg_type = response.get("type", "")
+        log.info(f"Got {msg_type} instead of ACK — processing it")
+        _handle_message(uart, response)
     else:
         log.warning("No ACK from Lighthouse — will retry")
-
 
 def send_heartbeat(uart: serial.Serial) -> None:
     """Send a heartbeat over UART."""
@@ -400,82 +410,93 @@ def send_heartbeat(uart: serial.Serial) -> None:
     uart.write(msg)
     uart.flush()
 
+def _handle_message(uart: serial.Serial, message: dict) -> None:
+    """Process a single UART message. Shared by process_lighthouse_messages
+    and register_with_lighthouse to avoid duplicating dispatch logic."""
+    msg_type = message.get("type", "")
+    data = message.get("data", {})
+
+    if msg_type == "ping":
+        log.info("Ping from Lighthouse — sending full re-registration")
+        if PUBLIC_KEY_PATH.exists():
+            pub_key = PUBLIC_KEY_PATH.read_bytes()
+            register_with_lighthouse(uart, pub_key)
+        else:
+            uart.write(frame_message("heartbeat", {
+                "device_id": get_device_id(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }))
+            uart.flush()
+
+    elif msg_type == "kem_request":
+        log.info(f"KEM request from client: {data.get('client_id', 'unknown')}")
+        try:
+            psk = handle_kem_request(data["ciphertext"])
+            uart.write(frame_message("decap_result", {
+                "request_id": data["request_id"],
+                "client_id": data["client_id"],
+                "device_id": get_device_id(),
+                "status": "complete",
+                "quantum_psk": psk,
+            }))
+            uart.flush()
+            log.info(f"Decap result sent for request {data['request_id']}")
+        except Exception as e:
+            log.error(f"KEM decapsulation failed: {e}")
+            uart.write(frame_message("decap_result", {
+                "request_id": data.get("request_id", ""),
+                "client_id": data.get("client_id", ""),
+                "device_id": get_device_id(),
+                "status": "error",
+                "error": str(e),
+            }))
+            uart.flush()
+
+    elif msg_type == "regen_keys":
+        log.info("Lighthouse requested keypair regeneration")
+        handle_regen_keys(uart)
+
+    elif msg_type == "entropy_request":
+        log.info("Lighthouse requested entropy for TLS cert")
+        try:
+            nbytes = data.get("bytes_needed", 64)
+            entropy = collect_entropy(nbytes)
+            uart.write(frame_message("entropy_response", {
+                "request_id": data.get("request_id", ""),
+                "entropy": base64.b64encode(entropy).decode(),
+                "bytes": len(entropy),
+            }))
+            uart.flush()
+            log.info(f"Sent {len(entropy)} bytes of entropy to Lighthouse")
+        except Exception as e:
+            log.error(f"Entropy request failed: {e}")
+            uart.write(frame_message("entropy_response", {
+                "request_id": data.get("request_id", ""),
+                "entropy": "",
+                "error": str(e),
+            }))
+            uart.flush()
+
+    elif msg_type == "ack":
+        log.debug("ACK from Lighthouse")
+
+    else:
+        log.debug(f"Unknown message type: {msg_type}")
 
 def process_lighthouse_messages(uart: serial.Serial) -> None:
-    """Check for and process incoming messages from the Lighthouse."""
-    while uart.in_waiting > 0:
-        message = read_frame(uart, timeout=1.0)
-        if message is None:
-            break
+    """Check for and process incoming messages from the Lighthouse.
+    Uses read_frame with a short timeout to catch messages that arrive
+    between main loop sleep cycles, not just when bytes are already buffered.
+    Drains all queued messages before returning so back-to-back KEM requests
+    don't pile up in the serial buffer.
+    """
+    message = read_frame(uart, timeout=0.5)
+    if message is None:
+        return
 
-        msg_type = message.get("type", "")
-        data = message.get("data", {})
-
-        if msg_type == "ping":
-            # Respond with a full registration so the Lighthouse gets
-            # our public key and marks us online immediately
-            log.info("Ping from Lighthouse — sending full re-registration")
-            if PUBLIC_KEY_PATH.exists():
-                pub_key = PUBLIC_KEY_PATH.read_bytes()
-                register_with_lighthouse(uart, pub_key)
-            else:
-                uart.write(frame_message("heartbeat", {
-                    "device_id": get_device_id(),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }))
-                uart.flush()
-
-        elif msg_type == "kem_request":
-            log.info(f"KEM request from client: {data.get('client_id', 'unknown')}")
-            try:
-                psk = handle_kem_request(data["ciphertext"])
-                uart.write(frame_message("decap_result", {
-                    "request_id": data["request_id"],
-                    "client_id": data["client_id"],
-                    "device_id": get_device_id(),
-                    "status": "complete",
-                    "quantum_psk": psk,
-                }))
-                uart.flush()
-                log.info(f"Decap result sent for request {data['request_id']}")
-            except Exception as e:
-                log.error(f"KEM decapsulation failed: {e}")
-                uart.write(frame_message("decap_result", {
-                    "request_id": data.get("request_id", ""),
-                    "client_id": data.get("client_id", ""),
-                    "device_id": get_device_id(),
-                    "status": "error",
-                    "error": str(e),
-                }))
-                uart.flush()
-
-        elif msg_type == "regen_keys":
-            log.info("Lighthouse requested keypair regeneration")
-            handle_regen_keys(uart)
-
-        elif msg_type == "entropy_request":
-            log.info("Lighthouse requested entropy for TLS cert")
-            try:
-                nbytes = data.get("bytes_needed", 64)
-                entropy = collect_entropy(nbytes)
-                uart.write(frame_message("entropy_response", {
-                    "request_id": data.get("request_id", ""),
-                    "entropy": base64.b64encode(entropy).decode(),
-                    "bytes": len(entropy),
-                }))
-                uart.flush()
-                log.info(f"Sent {len(entropy)} bytes of entropy to Lighthouse")
-            except Exception as e:
-                log.error(f"Entropy request failed: {e}")
-                uart.write(frame_message("entropy_response", {
-                    "request_id": data.get("request_id", ""),
-                    "entropy": "",
-                    "error": str(e),
-                }))
-                uart.flush()
-
-        else:
-            log.debug(f"Unknown message type: {msg_type}")
+    while message is not None:
+        _handle_message(uart, message)
+        message = read_frame(uart, timeout=0.1)
 
 # ─── Main Service ────────────────────────────────────────────────────────────
 
@@ -507,7 +528,7 @@ def run_service() -> None:
 
     log.info(f"Opening UART to Lighthouse on {LIGHTHOUSE_PORT}...")
     try:
-        uart = serial.Serial(LIGHTHOUSE_PORT, LIGHTHOUSE_BAUD, timeout=0.1)
+        uart = serial.Serial(LIGHTHOUSE_PORT, LIGHTHOUSE_BAUD, timeout=1.0)
     except serial.SerialException as e:
         log.error(f"Cannot open UART {LIGHTHOUSE_PORT}: {e}")
         log.error("Did you run setup.sh and reboot?")

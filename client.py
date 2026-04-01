@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import random
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
@@ -98,9 +99,13 @@ STATE_PATH = CLIENT_DIR / "client_state.json"
 HEARTBEAT_INTERVAL = 30         # Heartbeat to Lighthouse every 30s
 NETWORK_CHECK_INTERVAL = 5     # Check for network changes every 5s
 DISCOVERY_INTERVAL = 30         # LAN broadcast every 30s
-RECONNECT_DELAY = 10            # Wait before reconnect attempt
+RECONNECT_DELAY = 10            # Initial wait before reconnect attempt
+RECONNECT_MAX_DELAY = 120       # Maximum backoff cap (seconds)
+RECONNECT_BACKOFF_FACTOR = 2    # Multiply delay by this on each failure
 ENDPOINT_PROBE_TIMEOUT = 3      # Timeout for LAN probe (seconds)
 
+# Heartbeat jitter — spread load when many clients heartbeat simultaneously
+HEARTBEAT_JITTER = 5            # ±5 seconds random offset per heartbeat cycle
 # LAN Discovery
 DISCOVERY_PORT = 5391
 DISCOVERY_MAGIC = b"QVPN_DISC_v1"
@@ -152,6 +157,16 @@ _stun_cache = {
     "nat_type": None,
     "timestamp": 0,
 }
+
+# ─── Pre-warmed Candidate Cache ─────────────────────────────────────────────
+CANDIDATE_CACHE_TTL = 60          # Pre-warmed candidates valid for 60 seconds
+CANDIDATE_WARM_INTERVAL = 45      # Re-warm candidates every 45s in the service loop
+_candidate_cache = {
+    "candidates": [],
+    "nat_type": NAT_TYPE_UNKNOWN,
+    "timestamp": 0,
+}
+_candidate_cache_lock = threading.Lock()
 
 # ─── Enrollment ──────────────────────────────────────────────────────────────
 ENROLLMENT_PATH = CLIENT_DIR / "enrollment.json"
@@ -627,6 +642,109 @@ def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[
     for c in candidates:
         log.debug(f"  candidate: {c['type']} {c['endpoint']} (pri={c['priority']})")
 
+    return candidates
+
+def collect_endpoint_candidates_cached(listen_port: int = MESH_WG_LISTEN_PORT,
+                                        max_age: float = CANDIDATE_CACHE_TTL) -> list[dict]:
+    """Return cached candidates if fresh enough, otherwise collect new ones.
+    Used by mesh request/accept to avoid redundant 8-second STUN queries
+    when candidates were recently pre-warmed by the service loop.
+    """
+    global _candidate_cache
+    with _candidate_cache_lock:
+        age = time.time() - _candidate_cache["timestamp"]
+        if _candidate_cache["candidates"] and age < max_age:
+            log.info(f"Using pre-warmed candidates ({len(_candidate_cache['candidates'])} candidates, {age:.0f}s old)")
+            return _candidate_cache["candidates"]
+
+    # Cache miss or stale — collect fresh
+    candidates = collect_endpoint_candidates(listen_port)
+    with _candidate_cache_lock:
+        _candidate_cache = {
+            "candidates": candidates,
+            "nat_type": next((c.get("nat_type", NAT_TYPE_UNKNOWN) for c in candidates if c.get("nat_type")), NAT_TYPE_UNKNOWN),
+            "timestamp": time.time(),
+        }
+    return candidates
+
+
+def warm_candidate_cache(listen_port: int = MESH_WG_LISTEN_PORT) -> None:
+    """Pre-warm the candidate cache in the background.
+    Called periodically from the service loop so candidates are ready
+    instantly when a mesh tunnel is requested or accepted.
+    """
+    global _candidate_cache
+    try:
+        candidates = collect_endpoint_candidates(listen_port)
+        with _candidate_cache_lock:
+            _candidate_cache = {
+                "candidates": candidates,
+                "nat_type": next((c.get("nat_type", NAT_TYPE_UNKNOWN) for c in candidates if c.get("nat_type")), NAT_TYPE_UNKNOWN),
+                "timestamp": time.time(),
+            }
+        log.debug(f"Candidate cache warmed: {len(candidates)} candidates")
+    except Exception as e:
+        log.debug(f"Candidate cache warm failed: {e}")
+
+
+def collect_lan_only_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[dict]:
+    """Collect only LAN-relevant candidates, skipping STUN entirely.
+    Used when both peers are known to be on the same LAN subnet,
+    avoiding the ~8 second STUN query overhead.
+    """
+    candidates = []
+    priority = 0
+
+    # IPv6 token candidate (still useful on LAN)
+    identity = _load_ipv6_token_identity()
+    token_addr = identity.get("ipv6_token_addr", "")
+    if token_addr and token_addr != "::1" and not token_addr.startswith("fe80"):
+        candidates.append({
+            "type": "ipv6_token",
+            "endpoint": f"[{token_addr}]:{listen_port}",
+            "priority": priority,
+            "ipv6_token": identity.get("ipv6_token", ""),
+        })
+        priority += 1
+
+    # IPv6 global address
+    ipv6_addr = get_ipv6_address()
+    if ipv6_addr and ipv6_addr != "::1" and not ipv6_addr.startswith("fe80"):
+        ipv6_endpoint = f"[{ipv6_addr}]:{listen_port}"
+        already_listed = any(c["endpoint"] == ipv6_endpoint for c in candidates)
+        if not already_listed:
+            candidates.append({
+                "type": "ipv6",
+                "endpoint": ipv6_endpoint,
+                "priority": priority,
+            })
+            priority += 1
+
+    # LAN IP (physical, not WireGuard)
+    lan_ip = get_physical_ip()
+    if lan_ip and lan_ip != "127.0.0.1":
+        candidates.append({
+            "type": "lan",
+            "endpoint": f"{lan_ip}:{listen_port}",
+            "priority": priority,
+        })
+        priority += 1
+
+    # VPN-routed fallback
+    try:
+        state = load_state()
+        vpn_address = state.get("vpn_address", "")
+        if vpn_address:
+            candidates.append({
+                "type": "vpn_routed",
+                "endpoint": f"{vpn_address}:{listen_port}",
+                "priority": priority,
+            })
+            priority += 1
+    except Exception:
+        pass
+
+    log.info(f"Collected {len(candidates)} LAN-only candidates (STUN skipped)")
     return candidates
 
 def _parse_endpoint(ep_str: str) -> tuple[str, int, int]:
@@ -1262,13 +1380,21 @@ def fetch_online_clients(lighthouse_url: str) -> list:
 
 
 def request_mesh_tunnel(lighthouse_url: str, target_device_id: str,
-                         wg_pubkey: str, wg_listen_port: int = MESH_WG_LISTEN_PORT) -> dict:
-    """Request a mesh tunnel with another client through the Lighthouse."""
+                         wg_pubkey: str, wg_listen_port: int = MESH_WG_LISTEN_PORT,
+                         peer_is_lan: bool = False) -> dict:
+    """Request a mesh tunnel with another client through the Lighthouse.
+    If peer_is_lan=True, uses LAN-only candidates (skips ~8s STUN).
+    Otherwise uses pre-warmed cached candidates when available.
+    """
     client_id = get_client_id()
     public_ip = get_public_ip()
 
-    # Collect multi-candidate endpoints and NAT type
-    candidates = collect_endpoint_candidates(wg_listen_port)
+    # Collect candidates: LAN-only fast path or cached full path
+    if peer_is_lan:
+        candidates = collect_lan_only_candidates(wg_listen_port)
+    else:
+        candidates = collect_endpoint_candidates_cached(wg_listen_port)
+
     nat_type = NAT_TYPE_UNKNOWN
     for c in candidates:
         if c.get("nat_type"):
@@ -1294,13 +1420,21 @@ def request_mesh_tunnel(lighthouse_url: str, target_device_id: str,
     return resp.json()
 
 def accept_mesh_tunnel(lighthouse_url: str, request_id: str,
-                        wg_pubkey: str, wg_listen_port: int = MESH_WG_LISTEN_PORT) -> dict:
-    """Accept a pending mesh tunnel request."""
+                        wg_pubkey: str, wg_listen_port: int = MESH_WG_LISTEN_PORT,
+                        peer_is_lan: bool = False) -> dict:
+    """Accept a pending mesh tunnel request.
+    If peer_is_lan=True, uses LAN-only candidates (skips ~8s STUN).
+    Otherwise uses pre-warmed cached candidates when available.
+    """
     client_id = get_client_id()
     public_ip = get_public_ip()
 
-    # Collect multi-candidate endpoints and NAT type
-    candidates = collect_endpoint_candidates(wg_listen_port)
+    # Collect candidates: LAN-only fast path or cached full path
+    if peer_is_lan:
+        candidates = collect_lan_only_candidates(wg_listen_port)
+    else:
+        candidates = collect_endpoint_candidates_cached(wg_listen_port)
+
     nat_type = NAT_TYPE_UNKNOWN
     for c in candidates:
         if c.get("nat_type"):
@@ -2546,6 +2680,9 @@ class QuantumVPNService:
         self.auto_accept_mesh = True  # Auto-accept mesh requests from registered peers
         self.peer_kem = PeerKEMExchange(self)
         self._path_monitor_thread = None  # Phase 4: mesh path monitor thread
+        # Resilience: exponential backoff tracking
+        self._reconnect_delay = RECONNECT_DELAY  # Current backoff delay (resets on success)
+        self._consecutive_failures = 0            # Count of consecutive reconnect failures
 
     def run(self) -> None:
         """Main service entry point."""
@@ -2580,8 +2717,15 @@ class QuantumVPNService:
             self.mesh_wg_privkey, self.mesh_wg_pubkey = generate_mesh_wireguard_keypair()
             log.info("Generated new mesh WireGuard keypair")
 
-        # Initial connection
-        self._full_connect()
+        # Initial connection with retry — don't enter service loop dead
+        startup_delay = RECONNECT_DELAY
+        while self._running and not self._full_connect():
+            log.warning(f"Initial connection failed — retrying in {startup_delay:.0f}s...")
+            time.sleep(startup_delay)
+            startup_delay = min(startup_delay * RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_DELAY)
+
+        if not self._running:
+            return
 
         # Start LAN discovery if we have a VPN address
         if self.vpn_address:
@@ -2604,6 +2748,11 @@ class QuantumVPNService:
         last_discovery_broadcast = 0
         last_mesh_check = 0
         last_rekey_check = 0
+        last_candidate_warm = 0
+
+        # Heartbeat jitter: randomize the interval each cycle so N clients
+        # don't all hit the Lighthouse in the same second window
+        next_heartbeat_interval = HEARTBEAT_INTERVAL + random.uniform(-HEARTBEAT_JITTER, HEARTBEAT_JITTER)
 
         log.info("Entering service loop...")
 
@@ -2611,14 +2760,20 @@ class QuantumVPNService:
             while self._running:
                 now = time.time()
 
-                # Heartbeat to Lighthouse
-                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                # Heartbeat to Lighthouse (with jitter)
+                if now - last_heartbeat >= next_heartbeat_interval:
                     if self.lighthouse_url and self.connected:
                         hb_result = send_heartbeat(self.lighthouse_url)
                         if not hb_result:
                             log.warning("Heartbeat failed — connection may be lost")
                             self._handle_connection_loss()
                         else:
+                            # Heartbeat succeeded — reset backoff state
+                            if self._consecutive_failures > 0:
+                                log.info(f"Connection stable — resetting backoff (was {self._reconnect_delay:.0f}s after {self._consecutive_failures} failures)")
+                            self._reconnect_delay = RECONNECT_DELAY
+                            self._consecutive_failures = 0
+
                             if isinstance(hb_result, dict):
                                 if hb_result.get("pending_mesh_requests", 0) > 0:
                                     # Heartbeat told us there are pending mesh requests — check immediately
@@ -2636,6 +2791,8 @@ class QuantumVPNService:
                         # Phase 2 U7: Renew UPnP mappings on heartbeat
                         renew_upnp_mappings()
                     last_heartbeat = now
+                    # Pick a fresh jittered interval for next cycle
+                    next_heartbeat_interval = HEARTBEAT_INTERVAL + random.uniform(-HEARTBEAT_JITTER, HEARTBEAT_JITTER)
 
                 # Network change detection
                 if now - last_network_check >= NETWORK_CHECK_INTERVAL:
@@ -2660,6 +2817,16 @@ class QuantumVPNService:
                         self.peer_kem._handle_relay_messages()
                     last_mesh_check = now
 
+                # Pre-warm candidate cache in background so mesh requests are instant
+                if now - last_candidate_warm >= CANDIDATE_WARM_INTERVAL:
+                    if self.lighthouse_url and self.connected:
+                        threading.Thread(
+                            target=warm_candidate_cache,
+                            daemon=True,
+                            name="candidate-warm",
+                        ).start()
+                    last_candidate_warm = now
+
                 # Periodic mesh PSK re-keying (peer-to-peer, no server involvement)
                 if now - last_rekey_check >= MESH_REKEY_CHECK_INTERVAL:
                     if self.lighthouse_url and self.connected:
@@ -2674,8 +2841,10 @@ class QuantumVPNService:
             self._shutdown()
 
     def _full_connect(self) -> bool:
-        """Complete connection flow: select endpoint → register → handshake → tunnel."""
+        """Complete connection flow: select endpoint → register + fetch vault key (parallel) → handshake → tunnel."""
         try:
+            from concurrent.futures import ThreadPoolExecutor
+
             # If WireGuard tunnel is currently up with full-tunnel routing (0.0.0.0/0),
             # skip the LAN probe — it would succeed falsely because traffic routes
             # through the VPN to the Pi's LAN. Only probe LAN when tunnel is down.
@@ -2692,19 +2861,61 @@ class QuantumVPNService:
 
             lan_ip = get_local_ip()
 
-            # Step 2: Register with the Lighthouse
-            reg = register(self.lighthouse_url, self.wg_pubkey, lan_ip)
-            self.vpn_address = reg.get("vpn_address")
-            self.wg_port = int(reg.get("server_endpoint", ":51820").split(":")[-1])
+            # Step 2: Register + fetch vault public key in parallel
+            # These are independent API calls — running them concurrently
+            # saves ~200-300ms on every connect.
+            reg_result = None
+            vault_result = None
+            reg_error = None
+            vault_error = None
 
-            # Step 3: Client-side KEM encapsulation (v0.5.0)
-            try:
-                vault_device_id, vault_pubkey = fetch_vault_public_key(self.lighthouse_url)
-                handshake, _ = initiate_client_encap_handshake(
-                    self.lighthouse_url, vault_device_id, vault_pubkey
-                )
-            except Exception as e:
-                log.warning(f"Client-side encap failed ({e}), falling back to server-side")
+            def _do_register():
+                return register(self.lighthouse_url, self.wg_pubkey, lan_ip)
+
+            def _do_fetch_vault_key():
+                return fetch_vault_public_key(self.lighthouse_url)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                reg_future = pool.submit(_do_register)
+                vault_future = pool.submit(_do_fetch_vault_key)
+
+                try:
+                    reg_result = reg_future.result(timeout=15)
+                except Exception as e:
+                    reg_error = e
+
+                try:
+                    vault_result = vault_future.result(timeout=15)
+                except Exception as e:
+                    vault_error = e
+
+            if reg_error:
+                raise reg_error
+
+            self.vpn_address = reg_result.get("vpn_address")
+            self.wg_port = int(reg_result.get("server_endpoint", ":51820").split(":")[-1])
+
+            # Step 3: Client-side KEM encapsulation (v0.5.0) with retry
+            handshake = None
+            if vault_error is None and oqs is not None:
+                vault_device_id, vault_pubkey = vault_result
+                for encap_attempt in range(2):
+                    try:
+                        handshake, _ = initiate_client_encap_handshake(
+                            self.lighthouse_url, vault_device_id, vault_pubkey
+                        )
+                        break  # Success
+                    except Exception as e:
+                        if encap_attempt == 0:
+                            log.warning(f"Client-side encap attempt 1 failed ({e}), retrying in 2s...")
+                            time.sleep(2)
+                        else:
+                            log.warning(f"Client-side encap attempt 2 failed ({e}), falling back to server-side")
+
+            # Fallback to server-side encapsulation if client-side didn't produce a result
+            if handshake is None:
+                if vault_error:
+                    log.warning(f"Vault key fetch failed ({vault_error}), using server-side encap")
                 vault = discover_vault(self.lighthouse_url)
                 if not vault:
                     log.error("No vault available — will retry")
@@ -2724,18 +2935,14 @@ class QuantumVPNService:
                 self.connected = True
 
                 # Step 6: Once tunnel is up with full routing (remote/public mode),
-                # switch Lighthouse URL to the VPN-internal address. All traffic now
-                # routes through the tunnel, so we must use an address reachable
-                # from inside the VPN — the server's VPN IP on the API port.
+                # switch Lighthouse URL to the VPN-internal address.
                 if not self.is_local:
-                    # Extract the API port from the local URL (e.g., 8443)
                     api_port = 8443
                     if self.local_url:
                         try:
                             api_port = int(self.local_url.split(":")[-1])
                         except (ValueError, IndexError):
                             pass
-                    # Server's VPN address is always .1 in the pool
                     vpn_server_ip = "10.100.0.1"
                     self.lighthouse_url = f"https://{vpn_server_ip}:{api_port}"
                     log.info(f"Switched Lighthouse URL to VPN-internal: {self.lighthouse_url}")
@@ -2824,16 +3031,32 @@ class QuantumVPNService:
             self.last_gateway = current_gateway
 
     def _handle_connection_loss(self) -> None:
-        """Handle a lost connection to the Lighthouse."""
+        """Handle a lost connection to the Lighthouse with exponential backoff.
+        Escalates: 10s → 20s → 40s → 60s → 120s (capped).
+        Resets to base delay on successful reconnect.
+        """
         self.connected = False
-        log.info(f"Attempting reconnect in {RECONNECT_DELAY}s...")
-        time.sleep(RECONNECT_DELAY)
+        self._consecutive_failures += 1
+
+        delay = self._reconnect_delay
+        log.info(f"Attempting reconnect in {delay:.0f}s (attempt #{self._consecutive_failures})...")
+        time.sleep(delay)
 
         # Try to reconnect — endpoint might have changed
         if self._full_connect():
-            log.info("Reconnected successfully")
+            log.info(f"Reconnected successfully after {self._consecutive_failures} attempt(s)")
+            self._reconnect_delay = RECONNECT_DELAY
+            self._consecutive_failures = 0
         else:
-            log.warning("Reconnect failed — will retry on next heartbeat cycle")
+            # Escalate the backoff for next time, capped at RECONNECT_MAX_DELAY
+            self._reconnect_delay = min(
+                self._reconnect_delay * RECONNECT_BACKOFF_FACTOR,
+                RECONNECT_MAX_DELAY,
+            )
+            log.warning(
+                f"Reconnect failed — next attempt in {self._reconnect_delay:.0f}s "
+                f"(will retry on next heartbeat cycle)"
+            )
 
     def _shutdown(self) -> None:
         """Clean shutdown."""
@@ -2886,9 +3109,23 @@ class QuantumVPNService:
 
                 if self.auto_accept_mesh:
                     try:
+                        # Detect if initiator is on the same LAN to skip STUN
+                        initiator_lan_ip = req.get("initiator_lan_ip", "")
+                        my_lan_ip = get_physical_ip()
+                        peer_is_lan = False
+                        if initiator_lan_ip and my_lan_ip:
+                            # Same /24 subnet = same LAN
+                            try:
+                                init_parts = initiator_lan_ip.rsplit(".", 1)[0]
+                                my_parts = my_lan_ip.rsplit(".", 1)[0]
+                                peer_is_lan = (init_parts == my_parts)
+                            except (ValueError, IndexError):
+                                pass
+
                         result = accept_mesh_tunnel(
                             self.lighthouse_url, request_id,
                             self.mesh_wg_pubkey, MESH_WG_LISTEN_PORT,
+                            peer_is_lan=peer_is_lan,
                         )
 
                         if result.get("status") == "active":
@@ -3002,6 +3239,7 @@ class QuantumVPNService:
                 peers_to_mesh[device_id] = {
                     "source": "lan",
                     "lan_ip": peer_info.get("lan_ip", ""),
+                    "is_lan": True,
                 }
 
             # Remote peers from Lighthouse (not already found on LAN)
@@ -3013,6 +3251,7 @@ class QuantumVPNService:
                         peers_to_mesh[device_id] = {
                             "source": "lighthouse",
                             "lan_ip": "",
+                            "is_lan": False,
                         }
             except Exception:
                 pass  # LAN peers still work if Lighthouse fetch fails
@@ -3034,12 +3273,14 @@ class QuantumVPNService:
                     continue
 
                 source = peer_info["source"]
+                is_lan = peer_info["is_lan"]
                 log.info(f"Peer {device_id} found via {source} -- requesting mesh tunnel")
 
                 try:
                     result = request_mesh_tunnel(
                         self.lighthouse_url, device_id,
                         self.mesh_wg_pubkey, MESH_WG_LISTEN_PORT,
+                        peer_is_lan=is_lan,
                     )
                     request_id = result.get("request_id", "")
                     if result.get("status") == "pending" and request_id:
@@ -3255,6 +3496,9 @@ class QuantumVPNService:
         PATH_MONITOR_MAX_RETRIES times with increasing delays.
         Also updates WireGuard mesh endpoint to peer's best fresh candidate.
         Guarded: only one re-punch per peer at a time.
+        Graceful STUN degradation: if STUN fails completely, only punch
+        non-STUN candidates (IPv6, LAN, UPnP, VPN-routed) instead of
+        wasting time on stale port predictions.
         """
         peer_id = peer_info.get("peer_id", "unknown")
         peer_wg_pubkey = peer_info.get("peer_wg_pubkey", "")
@@ -3265,6 +3509,9 @@ class QuantumVPNService:
             return
         self._repunch_active[peer_id] = True
 
+        # Candidate types that are valid without any STUN data
+        STUN_INDEPENDENT_TYPES = {"ipv6_token", "ipv6", "lan", "upnp", "vpn_routed"}
+
         try:
             for attempt, delay in enumerate(PATH_MONITOR_RETRY_DELAYS[:PATH_MONITOR_MAX_RETRIES], 1):
                 if not self._running:
@@ -3274,16 +3521,19 @@ class QuantumVPNService:
 
                 try:
                     # Step 1: Re-collect fresh candidates (fresh STUN, fresh IPs)
-                    # collect_endpoint_candidates() already calls classify_nat_type() internally,
-                    # so we extract nat_type from the candidates to avoid a redundant STUN round
                     fresh_candidates = collect_endpoint_candidates()
                     candidates_json = json.dumps(fresh_candidates)
                     nat_type = NAT_TYPE_UNKNOWN
+                    stun_succeeded = False
                     for c in fresh_candidates:
                         if c.get("nat_type"):
                             nat_type = c["nat_type"]
-                            break
+                        if c.get("type") == "stun":
+                            stun_succeeded = True
                     log.info(f"Path monitor: collected {len(fresh_candidates)} fresh candidates")
+
+                    if not stun_succeeded:
+                        log.info("Path monitor: STUN failed — will only punch non-STUN candidates")
 
                     # Step 2: Push our fresh candidates to the Lighthouse (M4)
                     update_mesh_candidates(
@@ -3299,11 +3549,24 @@ class QuantumVPNService:
                     # Step 4: Hole-punch with combined endpoints
                     all_endpoints = []
                     if peer_candidates:
-                        all_endpoints = [c["endpoint"] for c in peer_candidates if c.get("endpoint")]
+                        # Graceful STUN degradation: if our STUN failed,
+                        # filter out the peer's STUN/predicted/public candidates too —
+                        # our NAT mappings won't match so punching those is wasted effort
+                        if stun_succeeded:
+                            all_endpoints = [c["endpoint"] for c in peer_candidates if c.get("endpoint")]
+                        else:
+                            all_endpoints = [
+                                c["endpoint"] for c in peer_candidates
+                                if c.get("endpoint") and c.get("type") in STUN_INDEPENDENT_TYPES
+                            ]
+                            log.info(
+                                f"Path monitor: filtered to {len(all_endpoints)} non-STUN endpoints "
+                                f"(skipped {sum(1 for c in peer_candidates if c.get('type') not in STUN_INDEPENDENT_TYPES)} STUN-dependent)"
+                            )
+
                         log.info(f"Path monitor: got {len(all_endpoints)} peer endpoints, punching...")
 
                         # Step 5: Update WireGuard mesh endpoint to the best fresh candidate
-                        # Priority: IPv6 > UPnP > STUN > public > LAN > VPN-routed
                         best_endpoint = self._pick_best_candidate_endpoint(peer_candidates)
                         if best_endpoint:
                             current_ep = peer_info.get("endpoint", "")

@@ -815,37 +815,59 @@ def vault_uart_thread() -> None:
                 log.warning(f"Failed to send initial ping to Vault: {e}")
 
             while True:
-                # Process any queued outbound messages first
+                # ── Drain write queue and track whether we sent a KEM ──
+                sent_kem = False
                 while not _vault_write_queue.empty():
                     try:
                         frame_data = _vault_write_queue.get_nowait()
                         vault_uart.write(frame_data)
                         vault_uart.flush()
+                        # Peek at the frame to see if it's a kem_request
+                        # so we can wait longer for the Vault's response
+                        try:
+                            payload = frame_data[3:-1]  # skip STX+len, strip ETX
+                            if b'"kem_request"' in payload:
+                                sent_kem = True
+                        except Exception:
+                            pass
                     except queue.Empty:
                         break
                     except Exception as e:
                         log.error(f"UART write from queue failed: {e}")
 
-                # Read inbound messages
-                message = read_frame(vault_uart, timeout=1.0)
+                # ── Read inbound messages ──
+                # Short timeout (0.3s) for idle polling so the write
+                # queue gets serviced promptly. After sending a
+                # kem_request, extend to 5s so the Pi Zero has time
+                # for AES-GCM decrypt + ML-KEM-1024 decap without
+                # the thread looping back and blocking the response.
+                read_timeout = 5.0 if sent_kem else 0.3
+                message = read_frame(vault_uart, timeout=read_timeout)
+
                 if message is None:
                     continue
 
-                msg_type = message.get("type", "")
-                data = message.get("data", {})
+                # Process this message, then drain any back-to-back
+                # messages (e.g. two simultaneous client requests)
+                while message is not None:
+                    msg_type = message.get("type", "")
+                    data = message.get("data", {})
 
-                if msg_type == "register":
-                    _handle_vault_register(data)
-                elif msg_type == "heartbeat":
-                    _handle_vault_heartbeat(data)
-                elif msg_type == "decap_result":
-                    _handle_vault_decap_result(data)
-                elif msg_type == "regen_complete":
-                    _handle_vault_regen_complete(data)
-                elif msg_type == "entropy_response":
-                    pass  # Handled inline by request_entropy_from_vault()
-                else:
-                    log.debug(f"Unknown UART message type: {msg_type}")
+                    if msg_type == "register":
+                        _handle_vault_register(data)
+                    elif msg_type == "heartbeat":
+                        _handle_vault_heartbeat(data)
+                    elif msg_type == "decap_result":
+                        _handle_vault_decap_result(data)
+                    elif msg_type == "regen_complete":
+                        _handle_vault_regen_complete(data)
+                    elif msg_type == "entropy_response":
+                        pass  # Handled inline by request_entropy_from_vault()
+                    else:
+                        log.debug(f"Unknown UART message type: {msg_type}")
+
+                    # Try to grab another queued message immediately
+                    message = read_frame(vault_uart, timeout=0.1)
 
         except Exception as e:
             log.error(f"Vault UART error: {e} — reconnecting in 5s")
@@ -952,19 +974,22 @@ def _store_pending_psk(request_id: str, psk: str) -> None:
         _pending_psks[request_id] = psk
 
 
-def _wait_for_vault_psk(request_id: str, timeout: float = 15.0) -> str | None:
+def _wait_for_vault_psk(request_id: str, timeout: float = 30.0) -> str | None:
     """
     Block until the Vault's decap_result arrives with the shared secret,
     or timeout. Returns the base64-encoded PSK or None.
+    Polls every 100ms for faster pickup when the Vault responds quickly.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         with _pending_psks_lock:
             psk = _pending_psks.pop(request_id, None)
             if psk is not None:
+                elapsed = timeout - (deadline - time.time())
+                log.info(f"Vault PSK received for {request_id} in {elapsed:.1f}s")
                 return psk
-        time.sleep(0.25)
-    log.warning(f"Timed out waiting for Vault PSK for request {request_id}")
+        time.sleep(0.1)
+    log.warning(f"Timed out waiting for Vault PSK for request {request_id} ({timeout:.0f}s)")
     return None
 
 # ─── Peer KEM Relay Mailbox ─────────────────────────────────────────────────
