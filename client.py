@@ -40,6 +40,27 @@ import requests
 import requests.adapters
 import ssl
 import urllib3
+import ctypes
+
+def secure_wipe(data) -> None:
+    """Zero out sensitive data in memory as best we can in Python.
+    Works on bytearray and memoryview. For str/bytes (immutable),
+    the caller should use bytearray intermediaries instead.
+    Does nothing if data is None or not a mutable type."""
+    if data is None:
+        return
+    try:
+        if isinstance(data, bytearray):
+            ctypes.memset((ctypes.c_char * len(data)).from_buffer(data), 0, len(data))
+        elif isinstance(data, memoryview):
+            ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(data)), 0, len(data))
+    except Exception:
+        # Fallback: overwrite with zeros manually
+        try:
+            for i in range(len(data)):
+                data[i] = 0
+        except Exception:
+            pass
 
 def _find_and_load_oqs():
     """Find oqs.dll and add it to PATH. Auto-persist on first find."""
@@ -178,6 +199,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("client")
 
+# Physical IP cache — avoids spawning PowerShell on every STUN/holepunch call
+_physical_ip_cache = {"ip": "", "timestamp": 0.0}
+_PHYSICAL_IP_CACHE_TTL = 30.0  # Re-check every 30 seconds
 
 # ─── TLS Certificate Pinning ────────────────────────────────────────────────
 
@@ -972,6 +996,7 @@ def get_default_gateway_ip() -> str:
         pass
     return ""
 
+
 def get_physical_ip() -> str:
     """
     Get this device's physical (non-WireGuard) LAN IP address.
@@ -979,14 +1004,61 @@ def get_physical_ip() -> str:
     the WG interface IP or route through the tunnel. This function
     explicitly finds the real physical adapter IP by querying the
     default gateway's interface.
+    Caches the result to avoid spawning PowerShell on every STUN/holepunch call.
+    Cache is invalidated on network change via invalidate_physical_ip_cache().
     """
+    global _physical_ip_cache
+
+    now = time.time()
+    if _physical_ip_cache["ip"] and (now - _physical_ip_cache["timestamp"]) < _PHYSICAL_IP_CACHE_TTL:
+        return _physical_ip_cache["ip"]
+
+    ip = _discover_physical_ip()
+    if ip:
+        _physical_ip_cache = {"ip": ip, "timestamp": now}
+    return ip
+
+
+def invalidate_physical_ip_cache() -> None:
+    """Clear the physical IP cache — call on network change."""
+    global _physical_ip_cache
+    _physical_ip_cache = {"ip": "", "timestamp": 0.0}
+
+
+def _discover_physical_ip() -> str:
+    """Internal: actually query the OS for the physical adapter IP."""
     try:
         if platform.system() == "Windows":
-            # Get the physical interface IP that has the default route
+            # Use $PSItem instead of $_ to avoid Python 3.14 stripping the variable.
+            # Exclude WireGuard adapters that may claim the default route.
+            ps_script = (
+                '$configs = Get-NetIPConfiguration | '
+                'ForEach-Object { if ($PSItem.IPv4DefaultGateway -ne $null -and '
+                '$PSItem.InterfaceDescription -notlike "*WireGuard*" -and '
+                '$PSItem.InterfaceDescription -notlike "*wg_quantum*" -and '
+                '$PSItem.InterfaceDescription -notlike "*wg_mesh*") '
+                '{ $PSItem } }; '
+                'if ($configs) { ($configs | Select-Object -First 1).IPv4Address.IPAddress }'
+            )
             output = subprocess.check_output(
-                ["powershell", "-Command",
-                 "(Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | "
-                 "Select-Object -First 1).IPv4Address.IPAddress"],
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                timeout=5,
+            ).decode().strip()
+            if output and not output.startswith("10.100.") and not output.startswith("10.200."):
+                return output
+
+            # Fallback: find a physical adapter by filtering Get-NetAdapter directly
+            ps_fallback = (
+                '$a = Get-NetAdapter | ForEach-Object { '
+                'if ($PSItem.Status -eq "Up" -and '
+                '$PSItem.InterfaceDescription -notlike "*WireGuard*") '
+                '{ $PSItem } } | Select-Object -First 1; '
+                'if ($a) { (Get-NetIPAddress -InterfaceIndex $a.ifIndex '
+                '-AddressFamily IPv4 -ErrorAction SilentlyContinue | '
+                'Select-Object -First 1).IPAddress }'
+            )
+            output = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", ps_fallback],
                 timeout=5,
             ).decode().strip()
             if output and not output.startswith("10.100.") and not output.startswith("10.200."):
@@ -997,7 +1069,6 @@ def get_physical_ip() -> str:
                 ["ip", "route", "get", "1.1.1.1"],
                 timeout=5,
             ).decode()
-            # Parse "1.1.1.1 via X.X.X.X dev ethN src Y.Y.Y.Y"
             if "src " in output:
                 src_ip = output.split("src ")[1].split()[0]
                 if not src_ip.startswith("10.100.") and not src_ip.startswith("10.200."):
@@ -1222,10 +1293,10 @@ def fetch_vault_public_key(lighthouse_url: str) -> tuple[str, bytes]:
 def initiate_client_encap_handshake(lighthouse_url: str, vault_device_id: str,
                                      vault_pubkey: bytes) -> tuple[dict, str]:
     """
-    v0.5.0 — Client-side KEM encapsulation.
+    Client-side KEM encapsulation — the shared secret is derived HERE,
+    on this machine, not on the Lighthouse. The Lighthouse only relays
+    the ciphertext to the Vault.
 
-    The client encapsulates against the Vault's public key locally,
-    sends only the ciphertext to the Lighthouse (which forwards to the Vault).
     The shared secret never leaves this process until it's used as the WG PSK.
 
     Returns (handshake_result_dict, quantum_psk).
@@ -1241,7 +1312,13 @@ def initiate_client_encap_handshake(lighthouse_url: str, vault_device_id: str,
     # Perform encapsulation locally — this is the key security improvement
     kem = oqs.KeyEncapsulation(KEM_ALGORITHM)
     ciphertext, shared_secret = kem.encap_secret(vault_pubkey)
-    psk = base64.b64encode(shared_secret).decode()
+
+    # Keep PSK as bytearray throughout so we can wipe it
+    secret_buf = bytearray(shared_secret)
+    psk_buf = bytearray(base64.b64encode(secret_buf))
+    secure_wipe(secret_buf)
+
+    psk = psk_buf.decode()  # str copy needed for dict/JSON — wiped later
 
     log.info(f"Client-side KEM encapsulation complete ({len(ciphertext)}B ciphertext)")
 
@@ -1267,6 +1344,7 @@ def initiate_client_encap_handshake(lighthouse_url: str, vault_device_id: str,
 
     # Inject our locally-derived PSK into the result
     result["quantum_psk"] = psk
+    secure_wipe(psk_buf)
     return result, psk
 
 def send_heartbeat(lighthouse_url: str) -> dict | bool:
@@ -2024,7 +2102,11 @@ class PeerKEMExchange:
             # Decapsulate to get the shared secret
             kem_decap = oqs.KeyEncapsulation(KEM_ALGORITHM, secret_key=my_kem_privkey)
             shared_secret = kem_decap.decap_secret(ciphertext)
-            new_psk = base64.b64encode(shared_secret).decode()
+            secret_buf = bytearray(shared_secret)
+            psk_buf = bytearray(base64.b64encode(secret_buf))
+            secure_wipe(secret_buf)
+            new_psk = psk_buf.decode()
+            secure_wipe(psk_buf)
 
             # Send confirmation
             confirm = json.dumps({
@@ -2098,7 +2180,11 @@ class PeerKEMExchange:
             # Step 3: Decapsulate to get the shared secret
             kem_decap = oqs.KeyEncapsulation(KEM_ALGORITHM, secret_key=my_kem_privkey)
             shared_secret = kem_decap.decap_secret(ciphertext)
-            new_psk = base64.b64encode(shared_secret).decode()
+            secret_buf = bytearray(shared_secret)
+            psk_buf = bytearray(base64.b64encode(secret_buf))
+            secure_wipe(secret_buf)
+            new_psk = psk_buf.decode()
+            secure_wipe(psk_buf)
 
             # Step 4: Send confirmation via relay
             confirm_payload = {
@@ -2180,7 +2266,11 @@ class PeerKEMExchange:
             # Encapsulate against the initiator's public key
             kem = oqs.KeyEncapsulation(KEM_ALGORITHM)
             ciphertext, shared_secret = kem.encap_secret(peer_kem_pubkey)
-            new_psk = base64.b64encode(shared_secret).decode()
+            secret_buf = bytearray(shared_secret)
+            psk_buf = bytearray(base64.b64encode(secret_buf))
+            secure_wipe(secret_buf)
+            new_psk = psk_buf.decode()
+            secure_wipe(psk_buf)
 
             # Send ciphertext back
             resp = json.dumps({
@@ -2257,7 +2347,11 @@ class PeerKEMExchange:
             # Encapsulate against the initiator's public key
             kem = oqs.KeyEncapsulation(KEM_ALGORITHM)
             ciphertext, shared_secret = kem.encap_secret(peer_kem_pubkey)
-            new_psk = base64.b64encode(shared_secret).decode()
+            secret_buf = bytearray(shared_secret)
+            psk_buf = bytearray(base64.b64encode(secret_buf))
+            secure_wipe(secret_buf)
+            new_psk = psk_buf.decode()
+            secure_wipe(psk_buf)
 
             # Send ciphertext back via relay
             ct_payload = {
@@ -2362,6 +2456,9 @@ class PeerKEMExchange:
             )
             if success:
                 log.info(f"Peer KEM: mesh WireGuard updated with direct PSK for {peer_mesh_ip or peer_vpn_address}")
+                # Wipe the PSK string now that it's been consumed by WireGuard
+                psk_buf = bytearray(new_psk.encode())
+                secure_wipe(psk_buf)
                 return
 
             if attempt < max_attempts and platform.system() == "Windows":
@@ -2446,6 +2543,7 @@ def build_wireguard_config(handshake_result: dict, wg_privkey: str,
     # feature where users select a specific peer to route traffic through.
     allowed_ips = "10.100.0.0/24, 10.200.0.0/24"
 
+    # Build config as bytearray so we can wipe the PSK from memory after use
     config = (
         "[Interface]\n"
         f"PrivateKey = {wg_privkey}\n"
@@ -2459,11 +2557,21 @@ def build_wireguard_config(handshake_result: dict, wg_privkey: str,
         f"AllowedIPs = {allowed_ips}\n"
         "PersistentKeepalive = 25\n"
     )
+
+    # Wipe the PSK from the handshake dict now that it's embedded in the config
+    if "quantum_psk" in handshake_result:
+        handshake_result["quantum_psk"] = "WIPED"
+
     return config
 
 def apply_wireguard_config(config_text: str) -> bool:
-    """Write the WG config and bring up the tunnel."""
-    WG_CONFIG_PATH.write_text(config_text)
+    """Write the WG config and bring up the tunnel.
+    Wipes the config string from memory after writing to disk."""
+    # Write config as bytes via bytearray so we can wipe after
+    config_buf = bytearray(config_text.encode())
+    WG_CONFIG_PATH.write_bytes(config_buf)
+    secure_wipe(config_buf)
+
     # Note: os.chmod doesn't do much on Windows, but doesn't hurt.
     try:
         os.chmod(WG_CONFIG_PATH, 0o600)
@@ -2475,9 +2583,8 @@ def apply_wireguard_config(config_text: str) -> bool:
     # Bring down existing tunnel if any
     _wireguard_down()
 
-    # FIX: Pass the WG_CONFIG_PATH variable here!
+    # Pass the WG_CONFIG_PATH variable to bring the tunnel up
     return _wireguard_up(WG_CONFIG_PATH)
-
 
 def _wireguard_up(config_path):
     log.info(f"Bringing up WireGuard tunnel using {config_path}...")
@@ -2989,6 +3096,7 @@ class QuantumVPNService:
             global _stun_cache
             _stun_cache["timestamp"] = 0
             log.info("STUN cache invalidated due to network change")
+            invalidate_physical_ip_cache()
 
             # Re-probe and possibly switch endpoints
             new_url, new_is_local = select_lighthouse(self.public_url, self.local_url)

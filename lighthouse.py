@@ -36,7 +36,8 @@ from typing import Optional
 import ssl
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -967,6 +968,57 @@ _pending_psks_lock = threading.Lock()
 # In-memory tracker for candidate change detection (heartbeat diffing)
 _candidate_versions: dict[str, str] = {}  # "request_id:side" → last known candidates JSON
 
+# ─── Rate Limiting ─────────────────────────────────────────────────────────
+# Per-device and per-IP rate limiting to prevent API abuse.
+# Tracks request counts in sliding time windows. No external deps needed.
+
+_rate_limits: dict[str, list[float]] = {}  # key → list of timestamps
+_rate_limits_lock = threading.Lock()
+
+# Limits: (max_requests, window_seconds)
+RATE_LIMIT_RULES = {
+    "/api/v1/register":           (3, 60),     # 3 per minute
+    "/api/v1/enroll":             (5, 300),    # 5 per 5 minutes
+    "/api/v1/heartbeat":          (6, 60),     # 6 per minute
+    "/api/v1/handshake/initiate": (4, 60),     # 4 per minute
+    "/api/v1/handshake/client-encap": (4, 60), # 4 per minute
+    "/api/v1/mesh/request":       (10, 60),    # 10 per minute
+    "/api/v1/mesh/accept":        (10, 60),    # 10 per minute
+    "/api/v1/kem-relay/send":     (30, 60),    # 30 per minute (chatty)
+}
+
+def _check_rate_limit(key: str, path: str) -> bool:
+    """Returns True if the request is allowed, False if rate-limited."""
+    rule = None
+    for prefix, limits in RATE_LIMIT_RULES.items():
+        if path.startswith(prefix):
+            rule = limits
+            break
+    if rule is None:
+        return True  # No rule for this path — allow
+
+    max_requests, window = rule
+    now = time.time()
+    cutoff = now - window
+
+    with _rate_limits_lock:
+        if key not in _rate_limits:
+            _rate_limits[key] = []
+        # Prune old entries
+        _rate_limits[key] = [t for t in _rate_limits[key] if t > cutoff]
+        if len(_rate_limits[key]) >= max_requests:
+            return False
+        _rate_limits[key].append(now)
+        return True
+
+def _rate_limit_cleanup() -> None:
+    """Periodic cleanup of stale rate limit entries."""
+    now = time.time()
+    with _rate_limits_lock:
+        stale = [k for k, v in _rate_limits.items() if not v or v[-1] < now - 300]
+        for k in stale:
+            del _rate_limits[k]
+
 
 def _store_pending_psk(request_id: str, psk: str) -> None:
     """Store a PSK returned by the Vault for pickup by the API handler."""
@@ -997,6 +1049,7 @@ def _wait_for_vault_psk(request_id: str, timeout: float = 30.0) -> str | None:
 # they relay their KEM handshake messages through the Lighthouse API.
 # The Lighthouse only sees opaque KEM public keys and ciphertexts — it cannot
 # derive the shared secret. Messages expire after 120 seconds.
+
 
 _kem_relay: dict[str, list[dict]] = {}   # device_id → [messages]
 _kem_relay_lock = threading.Lock()
@@ -1048,6 +1101,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Per-IP rate limiting on sensitive endpoints."""
+    client_ip = request.client.host if request.client else "unknown"
+    path = request.url.path
+
+    if not _check_rate_limit(f"ip:{client_ip}:{path}", path):
+        log.warning(f"Rate limit exceeded: {client_ip} on {path}")
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded — try again later"},
+        )
+
+    response = await call_next(request)
+    return response
 
 # ─── Pydantic Models ────────────────────────────────────────────────────────
 
@@ -1397,6 +1465,7 @@ async def heartbeat(req: HeartbeatRequest):
     try:
         _cleanup_stale_mesh_tunnels()
         _kem_relay_cleanup()
+        _rate_limit_cleanup()
     except Exception as e:
         log.error(f"Heartbeat cleanup failed: {e}")
         pass
