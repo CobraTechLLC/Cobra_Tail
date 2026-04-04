@@ -42,6 +42,40 @@ import ssl
 import urllib3
 import ctypes
 
+# ─── Windows Subprocess Window Suppression ───────────────────────────────────
+# On Windows, subprocess calls (wg, netsh, etc.) spawn visible console windows
+# that flash on screen. This wraps subprocess.run and subprocess.Popen to
+# automatically hide those windows when running as a background service.
+_SUBPROCESS_ORIG_RUN = subprocess.run
+_SUBPROCESS_ORIG_POPEN = subprocess.Popen
+
+if platform.system() == "Windows":
+    _CREATE_NO_WINDOW = 0x08000000
+    _STARTUPINFO = subprocess.STARTUPINFO()
+    _STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    _STARTUPINFO.wShowWindow = 0  # SW_HIDE
+
+    def _quiet_run(*args, **kwargs):
+        """subprocess.run wrapper that hides console windows on Windows."""
+        if "creationflags" not in kwargs:
+            kwargs["creationflags"] = _CREATE_NO_WINDOW
+        if "startupinfo" not in kwargs:
+            kwargs["startupinfo"] = _STARTUPINFO
+        return _SUBPROCESS_ORIG_RUN(*args, **kwargs)
+
+    class _QuietPopen(subprocess.Popen):
+        """Popen wrapper that hides console windows on Windows."""
+        def __init__(self, *args, **kwargs):
+            if "creationflags" not in kwargs:
+                kwargs["creationflags"] = _CREATE_NO_WINDOW
+            if "startupinfo" not in kwargs:
+                kwargs["startupinfo"] = _STARTUPINFO
+            super().__init__(*args, **kwargs)
+
+    subprocess.run = _quiet_run
+    subprocess.Popen = _QuietPopen
+
+
 def secure_wipe(data) -> None:
     """Zero out sensitive data in memory as best we can in Python.
     Works on bytearray and memoryview. For str/bytes (immutable),
@@ -69,12 +103,18 @@ def _find_and_load_oqs():
         return
 
     search_paths = [
+        # CobraTail installed location
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "CobraTail" / "bin" / "lib",
+        # Build locations
         Path.home() / "liboqs" / "build" / "bin" / "Release",
         Path.home() / "liboqs" / "build" / "bin",
         Path("C:/Program Files/liboqs/bin"),
         Path("C:/Program Files (x86)/liboqs/bin"),
+        # Dev mode — same directory as this script
         Path(__file__).parent / "lib",
         Path(__file__).parent / "oqs",
+        # Legacy location
+        Path.home() / ".quantum_vpn" / "lib",
     ]
     env_path = os.environ.get("OQS_INSTALL_PATH", "")
     if env_path:
@@ -111,10 +151,52 @@ except (ImportError, RuntimeError, OSError):
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 KEM_ALGORITHM = "ML-KEM-1024"
-CLIENT_DIR = Path.home() / ".quantum_vpn"
-CLIENT_ID_PATH = CLIENT_DIR / "client_id"
-WG_CONFIG_PATH = CLIENT_DIR / "wg_quantum.conf"
-STATE_PATH = CLIENT_DIR / "client_state.json"
+
+# ─── CobraTail Directory Detection ──────────────────────────────────────────
+# Priority: installed location → dev mode (same dir as script) → legacy fallback
+def _detect_cobratail_dir() -> Path:
+    """Detect the CobraTail install directory."""
+    if platform.system() == "Windows":
+        installed = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "CobraTail"
+    else:
+        installed = Path("/opt/cobratail")
+
+    # Check for managed install marker
+    if (installed / ".cobratail").exists():
+        return installed
+
+    # Dev mode — config/data alongside the script
+    script_dir = Path(__file__).parent.resolve()
+    if (script_dir / "enrollment.json").exists() or (script_dir / "config" / "enrollment.json").exists():
+        return script_dir
+
+    # Legacy ~/.quantum_vpn
+    legacy = Path.home() / ".quantum_vpn"
+    if legacy.exists():
+        return legacy
+
+    # Default to installed path (will be created)
+    return installed
+
+COBRATAIL_DIR = _detect_cobratail_dir()
+
+# Subdirectory layout (new install) vs flat layout (legacy/dev)
+if (COBRATAIL_DIR / "config").is_dir() or (COBRATAIL_DIR / ".cobratail").exists():
+    # New organized layout
+    CONFIG_DIR = COBRATAIL_DIR / "config"
+    DATA_DIR = COBRATAIL_DIR / "data"
+    LOG_DIR = COBRATAIL_DIR / "logs"
+else:
+    # Legacy flat layout (everything in one dir)
+    CONFIG_DIR = COBRATAIL_DIR
+    DATA_DIR = COBRATAIL_DIR
+    LOG_DIR = COBRATAIL_DIR
+
+CLIENT_DIR = COBRATAIL_DIR  # Backward compat for mkdir calls
+
+CLIENT_ID_PATH = CONFIG_DIR / "client_id"
+WG_CONFIG_PATH = CONFIG_DIR / "wg_quantum.conf"
+STATE_PATH = DATA_DIR / "client_state.json"
 
 # Timers
 HEARTBEAT_INTERVAL = 30         # Heartbeat to Lighthouse every 30s
@@ -190,7 +272,7 @@ _candidate_cache = {
 _candidate_cache_lock = threading.Lock()
 
 # ─── Enrollment ──────────────────────────────────────────────────────────────
-ENROLLMENT_PATH = CLIENT_DIR / "enrollment.json"
+ENROLLMENT_PATH = CONFIG_DIR / "enrollment.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -206,7 +288,7 @@ _PHYSICAL_IP_CACHE_TTL = 30.0  # Re-check every 30 seconds
 # ─── TLS Certificate Pinning ────────────────────────────────────────────────
 
 CERT_FINGERPRINT = ""
-CERT_FINGERPRINT_PATH = CLIENT_DIR / "cert_fingerprint"
+CERT_FINGERPRINT_PATH = CONFIG_DIR / "cert_fingerprint"
 
 
 class CertPinningAdapter(requests.adapters.HTTPAdapter):
@@ -280,7 +362,7 @@ def create_pinned_session(fingerprint: str = None) -> requests.Session:
 
 def save_fingerprint(fingerprint: str) -> None:
     """Persist the cert fingerprint for future runs."""
-    CLIENT_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CERT_FINGERPRINT_PATH.write_text(fingerprint)
 
 
@@ -322,7 +404,7 @@ def get_client_id() -> str:
             pass
 
     # Legacy: existing client_id file
-    CLIENT_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if CLIENT_ID_PATH.exists():
         return CLIENT_ID_PATH.read_text().strip()
 
@@ -368,7 +450,7 @@ def _load_ipv6_token_identity() -> dict:
     Returns dict with ipv6_token, ipv6_prefix, ipv6_token_addr or empty strings.
     Falls back gracefully — if identity_manager hasn't run, all values are empty.
     """
-    identity_path = CLIENT_DIR / "node_identity.json"
+    identity_path = DATA_DIR / "node_identity.json"
     result = {"ipv6_token": "", "ipv6_prefix": "", "ipv6_token_addr": ""}
 
     if not identity_path.exists():
@@ -979,17 +1061,18 @@ def get_default_gateway_ip() -> str:
     """Get the default gateway — used to detect network changes."""
     try:
         if platform.system() == "Windows":
-            output = subprocess.check_output(
-                ["powershell", "-Command",
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
                  "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select -First 1).NextHop"],
-                timeout=5,
-            ).decode().strip()
-            return output
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.stdout.strip()
         else:
-            output = subprocess.check_output(
-                ["ip", "route", "show", "default"], timeout=5
-            ).decode()
-            parts = output.split()
+            result = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=5,
+            )
+            parts = result.stdout.split()
             if "via" in parts:
                 return parts[parts.index("via") + 1]
     except Exception:
@@ -1040,10 +1123,11 @@ def _discover_physical_ip() -> str:
                 '{ $PSItem } }; '
                 'if ($configs) { ($configs | Select-Object -First 1).IPv4Address.IPAddress }'
             )
-            output = subprocess.check_output(
+            result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_script],
-                timeout=5,
-            ).decode().strip()
+                capture_output=True, text=True, timeout=5,
+            )
+            output = result.stdout.strip()
             if output and not output.startswith("10.100.") and not output.startswith("10.200."):
                 return output
 
@@ -1057,18 +1141,20 @@ def _discover_physical_ip() -> str:
                 '-AddressFamily IPv4 -ErrorAction SilentlyContinue | '
                 'Select-Object -First 1).IPAddress }'
             )
-            output = subprocess.check_output(
+            result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_fallback],
-                timeout=5,
-            ).decode().strip()
+                capture_output=True, text=True, timeout=5,
+            )
+            output = result.stdout.strip()
             if output and not output.startswith("10.100.") and not output.startswith("10.200."):
                 return output
         else:
             # Linux: get the source IP for the default route
-            output = subprocess.check_output(
+            result = subprocess.run(
                 ["ip", "route", "get", "1.1.1.1"],
-                timeout=5,
-            ).decode()
+                capture_output=True, text=True, timeout=5,
+            )
+            output = result.stdout
             if "src " in output:
                 src_ip = output.split("src ")[1].split()[0]
                 if not src_ip.startswith("10.100.") and not src_ip.startswith("10.200."):
@@ -1105,15 +1191,19 @@ def generate_wireguard_keypair() -> tuple[str, str]:
     try:
         if platform.system() == "Windows":
             wg_path = _find_wg_windows()
-            privkey = subprocess.check_output([wg_path, "genkey"]).decode().strip()
-            pubkey = subprocess.check_output(
-                [wg_path, "pubkey"], input=privkey.encode()
-            ).decode().strip()
+            result = subprocess.run([wg_path, "genkey"], capture_output=True, timeout=10)
+            privkey = result.stdout.decode().strip()
+            result = subprocess.run(
+                [wg_path, "pubkey"], input=privkey.encode(), capture_output=True, timeout=10
+            )
+            pubkey = result.stdout.decode().strip()
         else:
-            privkey = subprocess.check_output(["wg", "genkey"]).decode().strip()
-            pubkey = subprocess.check_output(
-                ["wg", "pubkey"], input=privkey.encode()
-            ).decode().strip()
+            result = subprocess.run(["wg", "genkey"], capture_output=True, timeout=10)
+            privkey = result.stdout.decode().strip()
+            result = subprocess.run(
+                ["wg", "pubkey"], input=privkey.encode(), capture_output=True, timeout=10
+            )
+            pubkey = result.stdout.decode().strip()
         return privkey, pubkey
     except FileNotFoundError:
         log.warning("wg command not found — install wireguard-tools")
@@ -1132,13 +1222,23 @@ def _find_wg_windows() -> str:
     # Try PATH
     return "wg"
 
+def _find_wireguard_windows() -> str:
+    """Find wireguard.exe on Windows (the tunnel service manager, not wg.exe)."""
+    candidates = [
+        r"C:\Program Files\WireGuard\wireguard.exe",
+        r"C:\Program Files (x86)\WireGuard\wireguard.exe",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return "wireguard.exe"  # Last resort — hope it's in PATH
 
 # ─── State Persistence ───────────────────────────────────────────────────────
 
 
 def save_state(state: dict) -> None:
     """Save client state to disk so we survive restarts."""
-    CLIENT_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
@@ -1608,6 +1708,34 @@ def generate_mesh_wireguard_keypair() -> tuple[str, str]:
     """Generate a separate WireGuard keypair for mesh tunnels."""
     return generate_wireguard_keypair()
 
+def _rewrite_mesh_conf(mesh_conf_path: Path, wg_privkey: str,
+                        listen_port: int, my_mesh_ip: str,
+                        existing_peers: dict) -> None:
+    """Write the full wg_mesh.conf from current peer state."""
+    config = (
+        "[Interface]\n"
+        f"PrivateKey = {wg_privkey}\n"
+        f"ListenPort = {listen_port}\n"
+    )
+    if my_mesh_ip:
+        config += f"Address = {my_mesh_ip}/32\n"
+
+    for pubkey, peer_info in existing_peers.items():
+        allowed_ip = peer_info.get("allowed_ip", peer_info.get("vpn_address", ""))
+        config += (
+            "\n[Peer]\n"
+            f"PublicKey = {pubkey}\n"
+            f"PresharedKey = {peer_info['psk']}\n"
+            f"Endpoint = {peer_info['endpoint']}\n"
+            f"AllowedIPs = {allowed_ip}/32\n"
+            "PersistentKeepalive = 25\n"
+        )
+    mesh_conf_path.write_text(config)
+    try:
+        os.chmod(mesh_conf_path, 0o600)
+    except Exception:
+        pass
+
 
 def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
                      peer_vpn_address: str, psk: str,
@@ -1615,17 +1743,14 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
                      my_mesh_ip: str = "", peer_mesh_ip: str = "",
                      peer_candidates: list[dict] = None) -> bool:
     """
-    Add a mesh peer to the mesh WireGuard interface.
+    Add or update a mesh peer on the mesh WireGuard interface.
 
     Uses separate mesh IPs (10.200.0.x) for Address and AllowedIPs to avoid
     routing conflicts with the main wg_quantum tunnel (10.100.0.0/24).
-    The endpoint still uses the peer's VPN IP or LAN IP for transport.
 
-    If peer_candidates is provided, performs hole punching before WG config.
-
-    On Linux: uses 'wg set' to add peers dynamically.
-    On Windows: rewrites the config file with all peers and reinstalls the tunnel service,
-    because wg.exe set doesn't work reliably with Windows tunnel services.
+    On Windows: uses 'wg set' for live PSK updates (no service restart needed),
+    and only reinstalls the tunnel service for initial peer setup.
+    On Linux: uses 'wg set' to add/update peers dynamically.
     """
     # Phase 1: Multi-candidate hole punching
     if peer_candidates:
@@ -1633,11 +1758,11 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
         if all_endpoints:
             log.info(f"Hole punching {len(all_endpoints)} candidate endpoints before WG config...")
             send_holepunch_burst(all_endpoints, listen_port)
-            time.sleep(2)  # Let NAT mappings establish
+            time.sleep(2)
 
     iface = "wg_mesh"
-    mesh_conf_path = CLIENT_DIR / "wg_mesh.conf"
-    mesh_peers_path = CLIENT_DIR / "mesh_peers.json"
+    mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
+    mesh_peers_path = DATA_DIR / "mesh_peers.json"
 
     # Determine the AllowedIPs — use mesh IP if available, fall back to VPN address
     peer_allowed_ip = peer_mesh_ip or peer_vpn_address
@@ -1650,7 +1775,24 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
         except Exception:
             pass
 
-    # Add the new peer
+    # Check if this is a rekey of an existing peer or a brand new peer.
+    # Match by mesh_ip or vpn_address — pubkey changes on every rekey so
+    # we can't use it as the identity key here.
+    is_existing_peer = peer_wg_pubkey in existing_peers
+    old_pubkey = None
+    if not is_existing_peer:
+        for pk, info in existing_peers.items():
+            if (peer_mesh_ip and info.get("mesh_ip") == peer_mesh_ip) or \
+               (peer_vpn_address and info.get("vpn_address") == peer_vpn_address):
+                # Same peer, new pubkey — rekey detected, remove stale entry
+                old_pubkey = pk
+                is_existing_peer = True
+                break
+
+    if old_pubkey:
+        del existing_peers[old_pubkey]
+
+    # Add/update the peer under the current pubkey
     existing_peers[peer_wg_pubkey] = {
         "endpoint": peer_endpoint,
         "vpn_address": peer_vpn_address,
@@ -1663,55 +1805,66 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
     mesh_peers_path.write_text(json.dumps(existing_peers, indent=2))
 
     if platform.system() == "Windows":
-        # Windows: write full config with all peers, then reinstall tunnel service
-        # Use mesh IP for Address so routes don't conflict with wg_quantum
-        my_address = my_mesh_ip
-        if not my_address:
-            try:
-                state = load_state()
-                my_address = state.get("mesh_ip", "") or state.get("vpn_address", "")
-            except Exception:
-                pass
-
-        config = (
-            "[Interface]\n"
-            f"PrivateKey = {wg_privkey}\n"
-            f"ListenPort = {listen_port}\n"
-        )
-        if my_address:
-            config += f"Address = {my_address}/32\n"
-
-        for pubkey, peer_info in existing_peers.items():
-            allowed_ip = peer_info.get("allowed_ip", peer_info.get("vpn_address", ""))
-            config += (
-                "\n[Peer]\n"
-                f"PublicKey = {pubkey}\n"
-                f"PresharedKey = {peer_info['psk']}\n"
-                f"Endpoint = {peer_info['endpoint']}\n"
-                f"AllowedIPs = {allowed_ip}/32\n"
-                "PersistentKeepalive = 25\n"
-            )
-
-        mesh_conf_path.write_text(config)
-        os.chmod(mesh_conf_path, 0o600)
-
         wg_dir = r"C:\Program Files\WireGuard"
+        wg_exe = os.path.join(wg_dir, "wg.exe")
+        if not os.path.exists(wg_exe):
+            wg_exe = "wg"
         wireguard_exe = os.path.join(wg_dir, "wireguard.exe")
         if not os.path.exists(wireguard_exe):
             wireguard_exe = "wireguard.exe"
 
+        # Check if the tunnel service is already running
+        check = subprocess.run(
+            ["sc", "query", f"WireGuardTunnel${iface}"],
+            capture_output=True, text=True,
+        )
+        tunnel_running = "RUNNING" in check.stdout
+
+        if tunnel_running and is_existing_peer:
+            # PSK rekey on existing peer — use 'wg set' for live update,
+            # no service restart needed, no admin required for set operation
+            import tempfile
+            psk_file = Path(tempfile.gettempdir()) / "cobratail_psk.tmp"
+            try:
+                psk_file.write_text(psk)
+                # If this is a rekey, remove the old pubkey from WireGuard first
+                if old_pubkey:
+                    subprocess.run(
+                        [wg_exe, "set", iface, "peer", old_pubkey, "remove"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                result = subprocess.run(
+                    [wg_exe, "set", iface,
+                     "peer", peer_wg_pubkey,
+                     "preshared-key", str(psk_file),
+                     "endpoint", peer_endpoint,
+                     "allowed-ips", f"{peer_allowed_ip}/32",
+                     "persistent-keepalive", "25"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
+                                       my_mesh_ip, existing_peers)
+                    log.info(f"Mesh peer updated via wg set: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+                    return True
+                else:
+                    log.warning(f"wg set failed ({result.stderr.strip()}), falling back to tunnel reinstall")
+            except Exception as e:
+                log.warning(f"wg set failed ({e}), falling back to tunnel reinstall")
+            finally:
+                psk_file.unlink(missing_ok=True)
+
+        # Full tunnel reinstall — for new peers or if wg set failed
+        _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
+                           my_mesh_ip, existing_peers)
+
         try:
-            # Tear down existing mesh tunnel if running
             subprocess.run(
                 [wireguard_exe, "/uninstalltunnelservice", iface],
                 capture_output=True, timeout=10,
             )
-            # Windows needs time to fully release the service handle.
-            # 1 second is not enough — the service manager may still
-            # hold a lock, causing "Tunnel already installed" errors.
             time.sleep(3)
 
-            # Verify the service is actually gone before proceeding
             for _ in range(5):
                 check = subprocess.run(
                     [wireguard_exe, "/uninstalltunnelservice", iface],
@@ -1734,13 +1887,9 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
             return True
         except subprocess.CalledProcessError as e:
             stderr = e.stderr.decode() if e.stderr else str(e)
-            # "Already installed and running" means the uninstall didn't finish in time
-            # but the config file was already updated, so the OLD service is still running
-            # with the OLD config. We need to force a restart.
             if "already" in stderr.lower():
-                log.warning(f"Tunnel service still running — forcing restart...")
+                log.warning("Tunnel service still running — forcing restart...")
                 try:
-                    # Force stop via taskkill as a last resort
                     subprocess.run(
                         ["taskkill", "/F", "/FI", f"SERVICES eq WireGuardTunnel$wg_mesh"],
                         capture_output=True, timeout=10,
@@ -1764,69 +1913,9 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
                 log.error(f"Failed to install mesh tunnel service: {stderr}")
                 return False
         except FileNotFoundError:
-            log.error("wireguard.exe not found -- install WireGuard from https://www.wireguard.com/install/")
+            log.error("wireguard.exe not found — install WireGuard from https://www.wireguard.com/install/")
             return False
 
-    else:
-        # Linux: bring up interface if needed, then add peer dynamically with wg set
-        if not _mesh_interface_is_up(iface):
-            config = (
-                "[Interface]\n"
-                f"PrivateKey = {wg_privkey}\n"
-                f"ListenPort = {listen_port}\n"
-            )
-            # Add our mesh address so the interface has an IP for receiving traffic
-            linux_address = my_mesh_ip
-            if not linux_address:
-                try:
-                    state = load_state()
-                    linux_address = state.get("mesh_ip", "")
-                except Exception:
-                    pass
-            if linux_address:
-                config += f"Address = {linux_address}/24\n"
-
-            mesh_conf_path.write_text(config)
-            os.chmod(mesh_conf_path, 0o600)
-
-            try:
-                subprocess.run(
-                    ["sudo", "wg-quick", "up", str(mesh_conf_path)],
-                    check=True, capture_output=True, timeout=15,
-                )
-                log.info(f"Mesh WireGuard interface {iface} is up on port {listen_port}")
-            except subprocess.CalledProcessError as e:
-                log.error(f"Failed to bring up mesh interface: {e.stderr.decode() if e.stderr else e}")
-                return False
-            except FileNotFoundError:
-                log.error("wg-quick not found -- install wireguard-tools")
-                return False
-
-        try:
-            subprocess.run(
-                ["sudo", "wg", "set", iface, "peer", peer_wg_pubkey,
-                 "preshared-key", "/dev/stdin",
-                 "endpoint", peer_endpoint,
-                 "allowed-ips", f"{peer_allowed_ip}/32",
-                 "persistent-keepalive", "25"],
-                input=psk.encode(), check=True, capture_output=True, timeout=10,
-            )
-
-            # Add route for the peer's mesh address through the mesh interface
-            try:
-                subprocess.run(
-                    ["sudo", "ip", "route", "add", f"{peer_allowed_ip}/32", "dev", iface],
-                    capture_output=True, timeout=5,
-                )
-            except Exception:
-                pass  # Route may already exist
-
-            log.info(f"Mesh peer added: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
-            return True
-        except Exception as e:
-            log.error(f"Failed to add mesh peer: {e}")
-            return False
-        
 def _mesh_interface_is_up(iface: str = "wg_mesh") -> bool:
     """Check if the mesh WireGuard interface is running."""
     try:
@@ -2466,10 +2555,10 @@ class PeerKEMExchange:
                 time.sleep(3)
             else:
                 log.error(f"Peer KEM: failed to apply new PSK for {peer_mesh_ip or peer_vpn_address}")
-                
+
     def _find_peer_info(self, device_id: str) -> dict | None:
         """Look up a mesh peer's WG info from our tracked peers."""
-        mesh_peers_path = CLIENT_DIR / "mesh_peers.json"
+        mesh_peers_path = DATA_DIR / "mesh_peers.json"
         if not mesh_peers_path.exists():
             return None
 
@@ -2590,16 +2679,18 @@ def _wireguard_up(config_path):
     log.info(f"Bringing up WireGuard tunnel using {config_path}...")
     try:
         if platform.system() == "Windows":
-            cmd = ["wireguard.exe", "/installtunnelservice", str(config_path)]
+            wireguard_exe = _find_wireguard_windows()
+            if not os.path.exists(wireguard_exe):
+                log.error("wireguard.exe not found — install WireGuard from https://www.wireguard.com/install/")
+                return False
+            cmd = [wireguard_exe, "/installtunnelservice", str(config_path)]
             result = subprocess.run(cmd, capture_output=True, text=True)
 
             if result.returncode != 0:
-                # Standardize the error check for different Windows versions/locales
                 err = result.stderr.lower()
                 if "already" in err and ("installed" in err or "running" in err or "exists" in err):
                     log.info("WireGuard service is already installed and running.")
-                    return True  # This is a success state for us
-
+                    return True
                 log.error(f"WG install failed: {result.stderr}")
                 return False
         else:
@@ -2617,17 +2708,16 @@ def _wireguard_down():
     interface_name = "wg_quantum"
     try:
         if platform.system() == "Windows":
-            # 1. Ask Windows to uninstall the tunnel service
-            subprocess.run(["wireguard.exe", "/uninstalltunnelservice", interface_name],
+            wireguard_exe = _find_wireguard_windows()
+            subprocess.run([wireguard_exe, "/uninstalltunnelservice", interface_name],
                            capture_output=True)
-            # 2. WAIT for the OS to release the service lock
             time.sleep(2)
-            # 3. Clean up the interface if it's still hanging around
-            subprocess.run(["wg", "setconf", interface_name, "NUL"], capture_output=True)
+            wg_path = _find_wg_windows()
+            subprocess.run([wg_path, "setconf", interface_name, "NUL"], capture_output=True)
         else:
             subprocess.run(["wg-quick", "down", interface_name], capture_output=True)
     except Exception:
-        pass # Ignore errors if it's already down
+        pass  # Ignore errors if it's already down
 
 def update_wireguard_endpoint(new_endpoint: str) -> bool:
     """Update the WireGuard peer endpoint without tearing down the tunnel."""
@@ -2795,6 +2885,9 @@ class QuantumVPNService:
         """Main service entry point."""
         self._running = True
         CLIENT_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
 
         log.info("=" * 60)
         log.info("QUANTUM VPN CLIENT — Service Mode")
@@ -3192,7 +3285,7 @@ class QuantumVPNService:
                     capture_output=True, timeout=10,
                 )
             else:
-                mesh_conf = CLIENT_DIR / "wg_mesh.conf"
+                mesh_conf = CONFIG_DIR / "wg_mesh.conf"
                 if mesh_conf.exists():
                     subprocess.run(
                         ["sudo", "wg-quick", "down", str(mesh_conf)],
@@ -3837,6 +3930,9 @@ class QuantumVPNService:
 def connect(lighthouse_url: str) -> None:
     """One-shot connection flow for manual use."""
     CLIENT_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info("=" * 50)
     log.info("QUANTUM VPN CLIENT — One-Shot Connect")
@@ -3945,6 +4041,9 @@ def _do_enroll(args) -> None:
 
     # Save enrollment data permanently
     CLIENT_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     enrollment_data = {
         "device_id": device_id,

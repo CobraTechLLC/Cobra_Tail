@@ -2655,21 +2655,33 @@ def main():
             )
 
         public_url = CONFIG.get("server_url", "https://<lighthouse-ip>:9443")
+        local_url = CONFIG.get("local_server_url", "")
         mins = ENROLLMENT_TOKEN_TTL // 60
+
+        # Build smart enrollment key — base64-encoded JSON with ct_ prefix
+        import base64
+        key_data = {"t": token, "p": public_url}
+        if local_url:
+            key_data["l"] = local_url
+        enrollment_key = "ct_" + base64.urlsafe_b64encode(
+            json.dumps(key_data, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
 
         print()
         print(f"  Node '{node_name}' authorized for enrollment")
         print(f"  Token expires in {mins} minutes")
         print()
-        print(f"  Run this on the new device:")
+        print(f"  ── Enrollment Key (send this to the user) ──")
+        print()
+        print(f"    {enrollment_key}")
+        print()
+        print(f"  The user pastes this single key into CobraTail and it")
+        print(f"  auto-connects from any network (LAN or remote).")
+        print()
+        print(f"  ── Manual enrollment (advanced) ──")
         print()
         print(f"    python client.py enroll \\")
         print(f"      --token {token} \\")
-        print(f"      --lighthouse-public {public_url}")
-        print()
-        print(f"  After enrollment, start the client with:")
-        print()
-        print(f"    python client.py service \\")
         print(f"      --lighthouse-public {public_url}")
         print()
         return

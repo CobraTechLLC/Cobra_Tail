@@ -13,8 +13,8 @@ Spoofing layers:
   Layer 3 (Application):  /etc/machine-id, DHCP Client ID, Vendor Class, Parameter Request List
   Layer 4 (Kernel):       IP TTL / IPv6 Hop Limit
 
-Config file:  ~/.quantum_vpn/node_identity.json  (same dir as client.py state)
-Backup file:  ~/.quantum_vpn/identity_backup.json (originals saved on first run)
+Config file:  <CobraTail install>/data/node_identity.json
+Backup file:  <CobraTail install>/data/identity_backup.json
 
 Platform:     Linux (ARM/x86) and Windows 10/11
 Dependencies:
@@ -65,12 +65,59 @@ from datetime import datetime, timezone
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 
-# ─── Paths ───────────────────────────────────────────────────────────────────
-# Store in the SAME directory as client.py so both read from one place
-COBRA_DIR = Path.home() / ".quantum_vpn"
-IDENTITY_PATH = COBRA_DIR / "node_identity.json"
-BACKUP_PATH = COBRA_DIR / "identity_backup.json"
-ENROLLMENT_PATH = COBRA_DIR / "enrollment.json"
+# ─── Windows Subprocess Window Suppression ───────────────────────────────────
+if IS_WINDOWS:
+    _CREATE_NO_WINDOW = 0x08000000
+    _STARTUPINFO = subprocess.STARTUPINFO()
+    _STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    _STARTUPINFO.wShowWindow = 0  # SW_HIDE
+    _ORIG_RUN = subprocess.run
+
+    def _quiet_run(*args, **kwargs):
+        if "creationflags" not in kwargs:
+            kwargs["creationflags"] = _CREATE_NO_WINDOW
+        if "startupinfo" not in kwargs:
+            kwargs["startupinfo"] = _STARTUPINFO
+        return _ORIG_RUN(*args, **kwargs)
+
+    subprocess.run = _quiet_run
+
+# ─── CobraTail Directory Detection ───────────────────────────────────────────
+def _detect_cobratail_dir() -> Path:
+    """Detect the CobraTail install directory."""
+    if IS_WINDOWS:
+        installed = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "CobraTail"
+    else:
+        installed = Path("/opt/cobratail")
+
+    if (installed / ".cobratail").exists():
+        return installed
+
+    # Dev mode
+    script_dir = Path(__file__).parent.resolve()
+    if (script_dir / "enrollment.json").exists() or (script_dir / "config" / "enrollment.json").exists():
+        return script_dir
+
+    # Legacy
+    legacy = Path.home() / ".quantum_vpn"
+    if legacy.exists():
+        return legacy
+
+    return installed
+
+COBRATAIL_DIR = _detect_cobratail_dir()
+
+# Subdirectory layout vs flat layout
+if (COBRATAIL_DIR / "config").is_dir() or (COBRATAIL_DIR / ".cobratail").exists():
+    CONFIG_DIR = COBRATAIL_DIR / "config"
+    DATA_DIR = COBRATAIL_DIR / "data"
+else:
+    CONFIG_DIR = COBRATAIL_DIR
+    DATA_DIR = COBRATAIL_DIR
+
+IDENTITY_PATH = DATA_DIR / "node_identity.json"
+BACKUP_PATH = DATA_DIR / "identity_backup.json"
+ENROLLMENT_PATH = CONFIG_DIR / "enrollment.json"
 
 # ─── Apple OUI Prefixes ─────────────────────────────────────────────────────
 APPLE_OUIS = [
@@ -352,7 +399,7 @@ def _save_backup(interface: str) -> None:
         except Exception:
             backup["original_ttl"] = "64"
 
-    COBRA_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_PATH.write_text(json.dumps(backup, indent=2))
     log.info(f"Original identity backed up to {BACKUP_PATH}")
 
@@ -1472,7 +1519,7 @@ def main():
     parser.add_argument("--interface", default=None,
                         help="Network interface override")
     parser.add_argument("--config", default=None,
-                        help="Path to node_identity.json (default: ~/.quantum_vpn/node_identity.json)")
+                        help="Path to node_identity.json (default: auto-detected CobraTail dir)")
     args = parser.parse_args()
 
     if args.status:
@@ -1484,7 +1531,7 @@ def main():
             device_id=args.device_id,
             interface=args.interface,
         )
-        COBRA_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         IDENTITY_PATH.write_text(json.dumps(config, indent=2))
         print(f"\n  Identity config generated: {IDENTITY_PATH}")
         print(f"  Device ID:  {config['device_id']}")
