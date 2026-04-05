@@ -2630,7 +2630,7 @@ def build_wireguard_config(handshake_result: dict, wg_privkey: str,
     # funneling all internet traffic through the Lighthouse's bandwidth.
     # Full-tunnel exit-node routing (0.0.0.0/0) will be a future opt-in
     # feature where users select a specific peer to route traffic through.
-    allowed_ips = "10.100.0.0/24, 10.200.0.0/24"
+    allowed_ips = "10.100.0.0/24"
 
     # Build config as bytearray so we can wipe the PSK from memory after use
     config = (

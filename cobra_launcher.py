@@ -400,27 +400,24 @@ def stop_service() -> bool:
                 run_cmd(["taskkill", "/F", "/PID", str(pid)])
             else:
                 os.kill(pid, signal.SIGTERM)
-                # Give it a moment, then force if needed
-                time.sleep(2)
-                try:
-                    os.kill(pid, 0)  # Check if still alive
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
             print(f"  {GREEN}Client stopped (PID {pid}){RESET}")
-
-            # Clean up PID file
-            pid_path = DATA_DIR / "client.pid"
-            if pid_path.exists():
-                pid_path.unlink()
-            return True
         except (ProcessLookupError, PermissionError) as e:
-            print(f"  {RED}Could not stop process {pid}: {e}{RESET}")
-            return False
-    else:
-        print(f"  {YELLOW}No running client process found{RESET}")
-        return True
+            print(f"  {YELLOW}Process {pid} already gone or access denied: {e}{RESET}")
 
+        # Clean up PID file — try directly, fall back to shell for admin-owned files
+        pid_path = DATA_DIR / "client.pid"
+        if pid_path.exists():
+            try:
+                pid_path.unlink()
+            except PermissionError:
+                if IS_WINDOWS:
+                    run_cmd(["cmd", "/c", "del", "/f", str(pid_path)])
+                else:
+                    run_cmd(["sudo", "rm", "-f", str(pid_path)])
+        return True
+    else:
+        print(f"  {YELLOW}No running client found{RESET}")
+        return False
 
 def restart_service() -> bool:
     """Restart the client service."""
@@ -472,34 +469,51 @@ def enable_startup() -> bool:
             print(f"  {RED}Failed: {result.stderr.strip()}{RESET}")
             return False
     else:
-        # Windows: create Scheduled Task
+        # Windows: create Scheduled Task with admin elevation
+        # Use pythonw.exe for windowless background execution
         python = get_python()
+        if IS_WINDOWS:
+            pythonw = Path(python).parent / "pythonw.exe"
+            if pythonw.exists():
+                python = str(pythonw)
+
         args = f'"{CLIENT_SCRIPT}" service --lighthouse-public {public_url}'
         if local_url:
             args += f" --lighthouse-local {local_url}"
+
+        # Get current username for the task principal
+        username = os.environ.get("USERNAME", "")
+        userdomain = os.environ.get("USERDOMAIN", "")
+        if userdomain and username:
+            principal_user = f"{userdomain}\\{username}"
+        else:
+            principal_user = username
 
         ps_commands = [
             f'$action = New-ScheduledTaskAction -Execute "{python}" '
             f'-Argument \'{args}\' '
             f'-WorkingDirectory "{CLIENT_SCRIPT.parent}"',
             '$trigger = New-ScheduledTaskTrigger -AtLogon',
+            f'$principal = New-ScheduledTaskPrincipal -UserId "{principal_user}" '
+            f'-RunLevel Highest',
             '$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries '
             '-DontStopIfGoingOnBatteries -StartWhenAvailable '
-            '-ExecutionTimeLimit (New-TimeSpan -Hours 0)',
+            '-ExecutionTimeLimit (New-TimeSpan -Hours 0) '
+            '-RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)',
             f'Register-ScheduledTask -TaskName "{TASK_NAME}" '
-            f'-Action $action -Trigger $trigger -Settings $settings '
+            f'-Action $action -Trigger $trigger -Principal $principal '
+            f'-Settings $settings '
             f'-Description "CobraTail VPN Client" -Force',
         ]
         result = run_cmd([
             "powershell", "-Command", "; ".join(ps_commands)
         ])
         if result.returncode == 0:
-            print(f"  {GREEN}Startup enabled (Scheduled Task at logon){RESET}")
+            print(f"  {GREEN}Startup enabled (Scheduled Task at logon, elevated){RESET}")
             return True
         else:
             print(f"  {RED}Failed: {result.stderr.strip()}{RESET}")
             return False
-
 
 def disable_startup() -> bool:
     """Disable client from starting on boot."""
