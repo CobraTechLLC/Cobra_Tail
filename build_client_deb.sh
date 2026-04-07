@@ -152,7 +152,7 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${ARCH}
-Depends: python3 (>= 3.9), python3-pip, wireguard-tools, cmake, ninja-build, build-essential, git, libssl-dev
+Depends: python3 (>= 3.9), python3-pip, wireguard-tools, openresolv, python3-cryptography, cmake, ninja-build, build-essential, git, libssl-dev
 Recommends: wireguard
 Maintainer: CobraTechLLC <admin@cobratechllc.com>
 Homepage: https://github.com/CobraTechLLC/Cobra_Tail
