@@ -104,7 +104,7 @@ pqc:
 
   # How often to rotate the quantum PSK (hours)
   # 0 = never rotate automatically
-  key_rotation_hours: 24
+  key_rotation_hours: 4
 
 # ─── Persistence ─────────────────────────────────────────────
 # Peer directory and handshake state are stored in SQLite

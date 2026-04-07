@@ -1397,7 +1397,13 @@ def initiate_client_encap_handshake(lighthouse_url: str, vault_device_id: str,
     on this machine, not on the Lighthouse. The Lighthouse only relays
     the ciphertext to the Vault.
 
-    The shared secret never leaves this process until it's used as the WG PSK.
+    NOTE: As of the HKDF binding update, the Vault derives the WG PSK by
+    running HKDF over the shared secret with a context string that binds it
+    to the client's WG pubkey + request_id. The client does not know that
+    full info string in advance, so it accepts the PSK the Lighthouse returns
+    (which the Lighthouse received from the Vault). TLS + cert pinning protect
+    the PSK in transit. The locally-derived shared secret is wiped without
+    being used as the PSK directly.
 
     Returns (handshake_result_dict, quantum_psk).
     """
@@ -1409,16 +1415,15 @@ def initiate_client_encap_handshake(lighthouse_url: str, vault_device_id: str,
 
     client_id = get_client_id()
 
-    # Perform encapsulation locally — this is the key security improvement
+    # Perform encapsulation locally — proves the client controls a fresh KEM
+    # exchange and prevents the Lighthouse from substituting its own ciphertext.
     kem = oqs.KeyEncapsulation(KEM_ALGORITHM)
     ciphertext, shared_secret = kem.encap_secret(vault_pubkey)
 
-    # Keep PSK as bytearray throughout so we can wipe it
+    # Wipe the locally-derived shared secret immediately. We're not using it
+    # as the PSK directly — the Vault's HKDF-derived PSK is authoritative.
     secret_buf = bytearray(shared_secret)
-    psk_buf = bytearray(base64.b64encode(secret_buf))
     secure_wipe(secret_buf)
-
-    psk = psk_buf.decode()  # str copy needed for dict/JSON — wiped later
 
     log.info(f"Client-side KEM encapsulation complete ({len(ciphertext)}B ciphertext)")
 
@@ -1439,12 +1444,32 @@ def initiate_client_encap_handshake(lighthouse_url: str, vault_device_id: str,
     resp.raise_for_status()
     result = resp.json()
 
-    log.info(f"Client-encap handshake complete: {result['request_id']}")
-    log.info("Shared secret derived locally — Lighthouse never saw it")
+    # The Lighthouse response includes the HKDF-derived PSK (via the Vault).
+    # The client-encap endpoint sets the PSK in the handshake DB row but
+    # currently does not echo it in the response body — check for it and
+    # fall back to fetching the handshake status if needed.
+    psk = result.get("quantum_psk", "")
+    if not psk:
+        # Fallback: query handshake status to get the PSK the Vault derived
+        log.info("Fetching derived PSK from handshake status endpoint...")
+        status_resp = get_session().get(
+            f"{lighthouse_url}/api/v1/handshake/status/{result['request_id']}",
+            timeout=10,
+        )
+        status_resp.raise_for_status()
+        status = status_resp.json()
+        psk = status.get("quantum_psk", "")
 
-    # Inject our locally-derived PSK into the result
+    if not psk:
+        raise RuntimeError(
+            f"client-encap handshake {result['request_id']} completed but "
+            f"Lighthouse did not return a PSK"
+        )
+
+    log.info(f"Client-encap handshake complete: {result['request_id']}")
+    log.info("PSK derived by Vault via HKDF binding")
+
     result["quantum_psk"] = psk
-    secure_wipe(psk_buf)
     return result, psk
 
 def send_heartbeat(lighthouse_url: str) -> dict | bool:

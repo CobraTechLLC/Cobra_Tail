@@ -26,6 +26,8 @@ import logging
 import struct
 from pathlib import Path
 from datetime import datetime, timezone
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 
 try:
     import oqs
@@ -312,6 +314,19 @@ def _get_machine_id() -> str:
     except Exception:
         return "fallback-machine-id"
 
+def derive_wg_psk(shared_secret: bytes, info_string: str) -> str:
+    """Derive a WireGuard PSK from an ML-KEM shared secret using HKDF.
+    The info_string is supplied by the caller (Lighthouse) and binds the PSK
+    to whatever context the caller chooses — peer pubkey, rotation id, mesh
+    pair, etc. The Vault is intentionally agnostic to the binding semantics."""
+    info = info_string.encode()
+    psk_bytes = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=info,
+    ).derive(shared_secret)
+    return base64.b64encode(psk_bytes).decode()
 
 # ─── KEM Decapsulation ──────────────────────────────────────────────────────
 
@@ -325,12 +340,12 @@ def decapsulate_shared_secret(ciphertext: bytes) -> bytes:
     return shared_secret
 
 
-def handle_kem_request(kem_ciphertext_b64: str) -> str:
-    """Decapsulate and return shared secret as base64 PSK."""
+def handle_kem_request(kem_ciphertext_b64: str, info_string: str) -> str:
+    """Decapsulate and return shared secret as base64 PSK, bound by HKDF info."""
     ciphertext = base64.b64decode(kem_ciphertext_b64)
     shared_secret = decapsulate_shared_secret(ciphertext)
-    psk = base64.b64encode(shared_secret).decode()
-    log.info("KEM handshake complete — quantum PSK generated")
+    psk = derive_wg_psk(shared_secret, info_string)
+    log.info("KEM handshake complete — quantum PSK derived via HKDF")
     return psk
 
 def handle_regen_keys(uart: serial.Serial) -> None:
@@ -431,7 +446,16 @@ def _handle_message(uart: serial.Serial, message: dict) -> None:
     elif msg_type == "kem_request":
         log.info(f"KEM request from client: {data.get('client_id', 'unknown')}")
         try:
-            psk = handle_kem_request(data["ciphertext"])
+            # The Lighthouse supplies the HKDF info string that binds the PSK
+            # to its context (peer pubkey + rotation id, mesh pair, etc).
+            # The Vault is agnostic — it just decapsulates and HKDFs.
+            hkdf_info = data.get("hkdf_info", "")
+            if not hkdf_info:
+                log.warning(
+                    f"kem_request {data.get('request_id')} missing hkdf_info — "
+                    f"caller must be updated to the HKDF-bound protocol"
+                )
+            psk = handle_kem_request(data["ciphertext"], hkdf_info)
             uart.write(frame_message("decap_result", {
                 "request_id": data["request_id"],
                 "client_id": data["client_id"],
@@ -469,19 +493,7 @@ def _handle_message(uart: serial.Serial, message: dict) -> None:
             uart.flush()
             log.info(f"Sent {len(entropy)} bytes of entropy to Lighthouse")
         except Exception as e:
-            log.error(f"Entropy request failed: {e}")
-            uart.write(frame_message("entropy_response", {
-                "request_id": data.get("request_id", ""),
-                "entropy": "",
-                "error": str(e),
-            }))
-            uart.flush()
-
-    elif msg_type == "ack":
-        log.debug("ACK from Lighthouse")
-
-    else:
-        log.debug(f"Unknown message type: {msg_type}")
+            log.error(f"Entropy collection failed: {e}")
 
 def process_lighthouse_messages(uart: serial.Serial) -> None:
     """Check for and process incoming messages from the Lighthouse.

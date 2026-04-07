@@ -659,7 +659,10 @@ def reset_peer_status_on_startup() -> None:
 
 
 def rotate_peer_psk(device_id: str, wg_pubkey: str, vpn_address: str) -> bool:
-    """Perform a fresh KEM encap/decap cycle and update a single peer's PSK."""
+    """Perform a fresh KEM encap/decap cycle and update a single peer's PSK.
+    Uses HKDF to derive the WireGuard PSK from the ML-KEM shared secret,
+    binding it to the peer pubkey and rotation id. The Vault is sent the
+    full HKDF info string and re-derives the same PSK independently."""
     if oqs is None:
         log.error("liboqs not available — cannot rotate PSK")
         return False
@@ -674,28 +677,41 @@ def rotate_peer_psk(device_id: str, wg_pubkey: str, vpn_address: str) -> bool:
         return False
 
     try:
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+
         vault_public_key = base64.b64decode(vault["public_key"])
         kem = oqs.KeyEncapsulation(CONFIG["pqc"]["algorithm"])
         ciphertext, shared_secret = kem.encap_secret(vault_public_key)
-        new_psk = base64.b64encode(shared_secret).decode()
 
-        # Send ciphertext to Vault for decapsulation
+        rotation_id = f"{device_id}-{int(time.time())}"
+        info_string = f"cobratail-wg-psk-v1|{wg_pubkey}|{rotation_id}"
+        psk_bytes = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=info_string.encode(),
+        ).derive(shared_secret)
+        new_psk = base64.b64encode(psk_bytes).decode()
+
+        # Send ciphertext + HKDF info to Vault for decapsulation.
+        # Vault re-derives the same PSK from the same shared secret.
         send_to_vault("kem_request", {
-            "request_id": f"rotate-{device_id}-{int(time.time())}",
+            "request_id": f"rotate-{rotation_id}",
             "client_id": device_id,
+            "hkdf_info": info_string,
             "ciphertext": base64.b64encode(ciphertext).decode(),
         })
 
         # Update WireGuard interface with new PSK
         add_wireguard_peer(wg_pubkey, vpn_address, new_psk)
 
-        log.info(f"Rotated PSK for {device_id} ({vpn_address})")
+        log.info(f"Rotated PSK for {device_id} ({vpn_address}) [HKDF-bound]")
         return True
 
     except Exception as e:
         log.error(f"PSK rotation failed for {device_id}: {e}")
         return False
-
 
 def rotate_all_peers() -> dict:
     """Rotate PSKs for all connected client peers."""
@@ -1560,8 +1576,13 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
 
     The client has already run encap_secret() locally and sends the ciphertext.
     The Lighthouse forwards ciphertext to the Vault over UART for decapsulation.
-    The Vault returns the shared secret over UART so WireGuard can be configured.
+    The Vault returns the HKDF-derived PSK over UART so WireGuard can be configured.
     The Lighthouse NEVER performs encapsulation — it cannot fabricate a PSK.
+
+    NOTE: For this flow the client also needs to derive the same HKDF-bound PSK
+    on its own side using the same info string. Until the client is updated to
+    do that, the binding is enforced only on the Vault side and the client will
+    use whatever PSK the Vault returns.
     """
     with get_db() as conn:
         client = conn.execute(
@@ -1591,14 +1612,18 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
         """, (request_id, req.client_device_id, req.target_device_id,
               "forwarding", _now_iso()))
 
-    # Forward ciphertext to Vault over UART for decapsulation
+    # Forward ciphertext to Vault over UART for decapsulation.
+    # The Vault will HKDF-derive the PSK using this info string and return it.
+    client_wg_pubkey = client["wireguard_pubkey"] or ""
+    info_string = f"cobratail-wg-psk-v1|{client_wg_pubkey}|{request_id}"
     send_to_vault("kem_request", {
         "request_id": request_id,
         "client_id": req.client_device_id,
+        "hkdf_info": info_string,
         "ciphertext": req.ciphertext,
     })
 
-    # Wait for the Vault to return the shared secret via UART
+    # Wait for the Vault to return the derived PSK via UART
     psk = _wait_for_vault_psk(request_id, timeout=30.0)
 
     if not psk:
@@ -1627,6 +1652,7 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
     return {
         "request_id": request_id,
         "status": "complete",
+        "quantum_psk": psk,
         "vpn_address": client["vpn_address"],
         "server_public_key": server_pubkey,
         "server_endpoint": f"{CONFIG['server_url'].split('://')[1].split(':')[0]}:{wg['listen_port']}",
@@ -1638,9 +1664,10 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
 async def initiate_handshake(req: HandshakeInitRequest):
     """
     Client requests a KEM handshake with the Vault.
-    Lighthouse encapsulates against Vault's public key,
-    sends ciphertext to Vault over UART for decapsulation,
-    returns the shared secret (quantum PSK) to the client.
+    Lighthouse encapsulates against Vault's public key, derives the PSK via
+    HKDF (binding it to the client's WG pubkey + request_id), sends the
+    ciphertext + same HKDF info to the Vault over UART so the Vault re-derives
+    the identical PSK, and returns the PSK to the client over TLS.
     """
     with get_db() as conn:
         client = conn.execute(
@@ -1661,12 +1688,27 @@ async def initiate_handshake(req: HandshakeInitRequest):
     if oqs is None:
         raise HTTPException(500, "liboqs not available")
 
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+
     vault_public_key = base64.b64decode(vault["public_key"])
     kem = oqs.KeyEncapsulation(CONFIG["pqc"]["algorithm"])
     ciphertext, shared_secret = kem.encap_secret(vault_public_key)
 
     request_id = uuid.uuid4().hex[:12]
-    psk = base64.b64encode(shared_secret).decode()
+
+    # Derive the PSK via HKDF, binding it to the client's WG pubkey and the
+    # request_id. The Vault re-derives the same PSK from the same shared
+    # secret using the same info string we send below.
+    client_wg_pubkey = client["wireguard_pubkey"] or ""
+    info_string = f"cobratail-wg-psk-v1|{client_wg_pubkey}|{request_id}"
+    psk_bytes = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=info_string.encode(),
+    ).derive(shared_secret)
+    psk = base64.b64encode(psk_bytes).decode()
 
     with get_db() as conn:
         conn.execute("""
@@ -1676,10 +1718,11 @@ async def initiate_handshake(req: HandshakeInitRequest):
         """, (request_id, req.client_device_id, req.target_device_id,
               "encapsulated", psk, _now_iso()))
 
-    # Send ciphertext to Vault over UART for decapsulation
+    # Send ciphertext + HKDF info to Vault over UART for decapsulation
     send_to_vault("kem_request", {
         "request_id": request_id,
         "client_id": req.client_device_id,
+        "hkdf_info": info_string,
         "ciphertext": base64.b64encode(ciphertext).decode(),
     })
 
@@ -1690,7 +1733,7 @@ async def initiate_handshake(req: HandshakeInitRequest):
         except Exception as e:
             log.error(f"Failed to add WG peer: {e}")
 
-    log.info(f"Handshake initiated: {req.client_device_id} → {req.target_device_id}")
+    log.info(f"Handshake initiated: {req.client_device_id} → {req.target_device_id} [HKDF-bound]")
 
     wg = CONFIG["wireguard"]
     wg_pub = Path(wg["key_dir"]) / "server_public.key"
@@ -2098,19 +2141,39 @@ async def mesh_request(req: MeshHandshakeRequest):
 
     if vault and oqs is not None:
         try:
+            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+            from cryptography.hazmat.primitives import hashes
+
             vault_public_key = base64.b64decode(vault["public_key"])
             kem = oqs.KeyEncapsulation(CONFIG["pqc"]["algorithm"])
             ciphertext, shared_secret = kem.encap_secret(vault_public_key)
-            psk = base64.b64encode(shared_secret).decode()
 
-            # Send ciphertext to Vault for decapsulation (keeps Vault in sync)
+            # Bind the mesh PSK to BOTH peer WG pubkeys + the request_id.
+            # Sort the pubkeys so initiator and target derive the same info
+            # string regardless of which side asked first. The Vault re-derives
+            # the same PSK from the same shared secret using the same info.
+            initiator_wg = req.initiator_wg_pubkey or ""
+            target_wg = target["wireguard_pubkey"] or ""
+            pair_label = "|".join(sorted([initiator_wg, target_wg]))
+            info_string = f"cobratail-mesh-psk-v1|{pair_label}|{request_id}"
+            psk_bytes = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=info_string.encode(),
+            ).derive(shared_secret)
+            psk = base64.b64encode(psk_bytes).decode()
+
+            # Send ciphertext + HKDF info to Vault for decapsulation.
+            # Vault re-derives the identical PSK from the same shared secret.
             send_to_vault("kem_request", {
                 "request_id": request_id,
                 "client_id": f"{req.initiator_device_id}<>{req.target_device_id}",
+                "hkdf_info": info_string,
                 "ciphertext": base64.b64encode(ciphertext).decode(),
             })
 
-            log.info(f"Mesh PSK generated for {req.initiator_device_id} <> {req.target_device_id}")
+            log.info(f"Mesh PSK generated for {req.initiator_device_id} <> {req.target_device_id} [HKDF-bound]")
         except Exception as e:
             log.error(f"Mesh PSK generation failed: {e}")
             raise HTTPException(500, "Failed to generate quantum PSK for mesh tunnel")
