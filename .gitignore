@@ -1,0 +1,50 @@
+# Build artifacts
+*.deb
+*.exe
+*.msi
+*.tar.gz
+*.zip
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+# Secrets and runtime state
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+.env
+.env.local
+secrets/
+credentials/
+
+# Cobra Tail runtime files
+enrollment.json
+client_state.json
+node_identity.json
+mesh_peers.json
+wg_quantum.conf
+config/certs/
+config/keys/
+# Logs
+*.log
+logs/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
