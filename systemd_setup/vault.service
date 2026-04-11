@@ -1,15 +1,18 @@
 [Unit]
 Description=The Vault — Post-Quantum Key Manager
-After=dev-ttyACM0.device
-Wants=dev-ttyACM0.device
+After=network-online.target dev-ttyACM0.device dev-ttyAMA0.device
+Wants=network-online.target dev-ttyACM0.device dev-ttyAMA0.device
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
+User=vault
+Group=vault
+SupplementaryGroups=dialout
 ExecStartPre=/bin/sleep 5
-ExecStart=/usr/bin/python3 /home/cryptkeeper/cript_keeper.py serve
-WorkingDirectory=/home/cryptkeeper
+ExecStart=/usr/bin/python3 /opt/cobratail/bin/cript_keeper.py serve
+WorkingDirectory=/home/vault
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
