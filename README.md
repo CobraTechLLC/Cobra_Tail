@@ -39,6 +39,15 @@ Cobra Tail does **not** invent any new cryptography. It composes well-understood
 
 **Client-side encapsulation.** This is the "zero-trust" part. When a client wants to establish a tunnel, the Lighthouse forwards it the Vault's public key. The client performs ML-KEM encapsulation **on its own machine**, generates the shared secret locally, and sends the ciphertext back to the Lighthouse, which relays it to the Vault for decapsulation. The Lighthouse never learns the shared secret — it only sees ciphertext in transit. A compromised Lighthouse cannot decrypt tunnel traffic because it never had the key material in the first place.
 
+### Network layout
+
+Cobra Tail uses two WireGuard interfaces on each client, with distinct purposes:
+
+- **`wg_quantum` (10.100.0.0/24)** — The post-quantum coordination tunnel established with the Lighthouse during enrollment. This subnet is used only for negotiating mesh connections and exchanging KEM ciphertext. The Lighthouse itself is **not** a WireGuard endpoint — it runs only the HTTPS coordination API. Pings to addresses in 10.100.0.0/24 will not respond, and this is by design.
+- **`wg_mesh` (10.200.0.0/24)** — The peer-to-peer data plane. All real traffic between Cobra Tail clients flows over this interface. Each peer holds a WireGuard tunnel directly to every other peer, with a fresh ML-KEM-derived preshared key bound via HKDF-SHA256. This is the subnet you actually `ping`, `ssh`, and `curl` over.
+
+If you're testing connectivity between two Cobra Tail clients, use their `wg_mesh` addresses (10.200.0.x), not their `wg_quantum` addresses (10.100.0.x).
+
 ### Trust but verify
 
 All the code is in this repo. All the build scripts are in this repo. You can (and should) build your own `.deb` and `.exe` from source rather than trusting the pre-built binaries in the Releases page:
@@ -51,6 +60,9 @@ sudo ./build_lighthouse_deb.sh 1.0.0 arm64
 
 # Build the client .deb yourself
 sudo ./build_client_deb.sh 1.0.0 arm64   # or amd64
+
+# Build the Vault .deb yourself (run on the Pi Zero 2 W itself)
+./build_vault_deb.sh 1.0.0 arm64
 ```
 
 The pre-built binaries in GitHub Releases are provided as a convenience. If you have any reason to distrust them, build from source. `SHA256SUMS` files are published alongside each release so you can verify the binaries you download match what the build scripts would produce.
@@ -126,12 +138,12 @@ sudo cobra
 ```
 
 **Windows:**
-Download `CobraTailSetup.exe` from the [Releases page](https://github.com/CobraTechLLC/Cobra_Tail/releases), run it, and accept the UAC prompt. The installer handles WireGuard, oqs.dll, and everything else automatically.
+Download `CobraTail.exe` from the [Releases page](https://github.com/CobraTechLLC/Cobra_Tail/releases), run it, and accept the UAC prompt. The installer handles WireGuard, oqs.dll, and everything else automatically.
 
 After install, running `cobra` (Linux) or launching from the Start Menu (Windows) starts the enrollment wizard. You'll need:
 
 - Your Lighthouse URL (e.g. `https://lighthouse.example.com:8443`)
-- The Lighthouse's TLS certificate fingerprint (ask whoever runs the Lighthouse)
+- The Lighthouse's TLS certificate fingerprint — a SHA-256 hex string, ask whoever runs the Lighthouse
 - A unique node name for your device
 
 ### Lighthouse installation (operators only)
@@ -149,9 +161,37 @@ sudo lighthouse
 
 The `sudo lighthouse` command launches the interactive setup wizard on first run, then drops into the management menu on subsequent runs. From there you can start/stop the service, add nodes, view logs, manage certificates, and check for updates from GitHub.
 
-### Vault and Tongue installation
+### Vault installation (Pi Zero 2 W)
 
-See [`setup.sh`](setup.sh) for the Pi Zero 2 W Vault bootstrap and [`main.py`](main.py) for the ESP32-S3 Tongue firmware. A dedicated Vault `.deb` package is planned but not yet required — the shell-based setup on Pi Zero 2 W works fine for now.
+The Vault now ships as a `.deb` package. On a fresh Raspberry Pi OS install on a Pi Zero 2 W, with the ESP32-S3 Tongue connected via USB and the Lighthouse wired to GPIO 14/15:
+
+```bash
+git clone https://github.com/CobraTechLLC/Cobra_Tail.git
+cd Cobra_Tail
+chmod +x build_vault_deb.sh
+./build_vault_deb.sh 1.0.0 arm64
+sudo apt install ./cobra-vault_1.0.0_arm64.deb
+```
+
+The postinst handles everything: creates the `vault` system user, builds **liboqs** from source (10–20 minutes on a Pi Zero 2 W — do not interrupt), installs Python bindings, enables the PL011 UART on GPIO 14/15, disables the serial console and Bluetooth UART, installs a udev rule for the ESP32 (`/dev/cobra-tongue`), and enables the `cobra-vault` systemd service.
+
+After install, **reboot** to activate the UART changes:
+
+```bash
+sudo reboot
+```
+
+After reboot, the service starts automatically. Verify with:
+
+```bash
+sudo systemctl status cobra-vault
+sudo journalctl -u cobra-vault -f
+ls -l /dev/cobra-tongue   # should symlink to ttyACM0
+```
+
+### Tongue firmware (ESP32-S3)
+
+Flash [`firmware/main.py`](firmware/main.py) to the ESP32-S3 using Thonny or `ampy`. The script auto-starts on boot and streams hardware TRNG entropy over USB serial to the Vault in framed 32-byte chunks. No additional configuration needed.
 
 ---
 
@@ -169,7 +209,8 @@ See [`setup.sh`](setup.sh) for the Pi Zero 2 W Vault bootstrap and [`main.py`](m
 | `installer.py` | Windows installer entry point |
 | `build_windows_exe.py` | PyInstaller build script for `CobraTailSetup.exe` |
 | `cript_keeper.py` | Runs on the Pi Zero Vault — ML-KEM key management |
-| `main.py` | Runs on the ESP32 Tongue — entropy streaming |
+| `build_vault_deb.sh` | Builds `cobra-vault_*.deb` |
+| `firmware/main.py` | Runs on the ESP32 Tongue — entropy streaming |
 | `config.yaml` | Lighthouse configuration template |
 | `systemd_setup/` | systemd service unit files |
 
@@ -181,17 +222,18 @@ See [`setup.sh`](setup.sh) for the Pi Zero 2 W Vault bootstrap and [`main.py`](m
 - ✅ Full post-quantum tunnel stack with ML-KEM-1024
 - ✅ HKDF-SHA256 PSK derivation with domain separation
 - ✅ Zero-trust mesh networking with peer-to-peer KEM exchange
+- ✅ Multi-client mesh validated end-to-end with hardware confirmation
 - ✅ Full NAT traversal (STUN, UPnP, IPv6, self-healing)
-- ✅ Deterministic IPv6 identity (Cobra)
+- ✅ Deterministic IPv6 identity (Cobra-Dicyanin)
 - ✅ Lighthouse .deb (arm64)
 - ✅ Client .deb (arm64 + amd64)
+- ✅ Vault .deb (arm64, Pi Zero 2 W)
 - ✅ Windows .exe installer
 
 **Planned**
 - 🔲 Full-tunnel exit node support
 - 🔲 GUI client (currently CLI/TUI only)
 - 🔲 Android client
-- 🔲 Vault .deb package for Pi Zero 2 W
 - 🔲 TURN-style relay for the most restrictive NATs
 - 🔲 Signed Windows binaries via SignPath Foundation
 
