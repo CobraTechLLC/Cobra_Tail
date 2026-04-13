@@ -645,9 +645,12 @@ def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[
 
     Logging dedupe: the "NAT type", "IPv6 candidate added", "IPv6 token
     candidate added", and "Collected N endpoint candidates" lines are emitted
-    at INFO only when the result meaningfully changes (NAT type, candidate
-    count, or endpoint set). Unchanged repeat calls (e.g. the 45s cache-warm
-    loop) log at DEBUG instead — avoids thousands of identical log lines per day.
+    at INFO only when the result meaningfully changes. The fingerprint excludes
+    per-query-volatile fields (STUN ports, predicted ports, public IP endpoint)
+    because symmetric NATs hand out fresh ports per query, which would otherwise
+    force an INFO log every cycle. Stable fields (NAT type, candidate type
+    counts, IPv6/LAN/UPnP/VPN-routed endpoints) drive the fingerprint — these
+    only change when the network state genuinely changes.
     """
     global _last_candidate_log_fingerprint
 
@@ -763,11 +766,25 @@ def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[
     except Exception:
         pass
 
-    # ── Dedupe: build a fingerprint and only log loudly when it changes ──
-    # Fingerprint captures NAT type + count + sorted (type, endpoint) pairs.
-    # Any meaningful network change flips it; identical repeat calls don't.
-    endpoint_set = sorted((c["type"], c["endpoint"]) for c in candidates)
-    fingerprint = f"{nat_type}|{len(candidates)}|{endpoint_set}"
+    # ── Dedupe: fingerprint only the STABLE parts of the result ──
+    # Symmetric NATs hand out fresh STUN ports on every query, which makes
+    # the raw (type, endpoint) set unstable across cycles even when the
+    # network hasn't meaningfully changed. So we fingerprint on:
+    #   - NAT type (changes rarely, and we want to hear about it)
+    #   - counts of each candidate type (e.g. "4 stun, 20 predicted, 1 lan")
+    #   - actual endpoints for types that DON'T drift per query
+    # STUN, predicted, and public candidates are excluded from the endpoint
+    # portion because their ports rotate on symmetric NATs.
+    STABLE_TYPES = {"ipv6_token", "ipv6", "lan", "upnp", "vpn_routed"}
+    type_counts = {}
+    for c in candidates:
+        t = c.get("type", "unknown")
+        type_counts[t] = type_counts.get(t, 0) + 1
+    stable_endpoints = sorted(
+        (c["type"], c["endpoint"]) for c in candidates
+        if c.get("type") in STABLE_TYPES and c.get("endpoint")
+    )
+    fingerprint = f"{nat_type}|{sorted(type_counts.items())}|{stable_endpoints}"
     changed = (fingerprint != _last_candidate_log_fingerprint)
 
     if changed:
