@@ -601,26 +601,45 @@ def get_or_allocate_mesh_address(device_id: str, exclude: set = None) -> str:
     return addr
 
 def add_wireguard_peer(wg_pubkey: str, vpn_address: str, psk: str = None) -> None:
-    """Add a peer to the live WireGuard interface and persist it."""
+    """Add a peer to the live WireGuard interface and persist it.
+
+    If the WireGuard interface is not up (e.g. wg-quick failed at startup,
+    or we're running on a host without kernel WireGuard), this function
+    persists the PSK to the database and returns silently. The peer will
+    be added when the interface comes up and restore_wireguard_peers()
+    runs, or on the next lighthouse restart.
+    """
     iface = CONFIG["wireguard"]["interface"]
 
-    cmd = ["wg", "set", iface, "peer", wg_pubkey, "allowed-ips", f"{vpn_address}/32"]
-    if psk:
-        cmd.extend(["preshared-key", "/dev/stdin"])
-        subprocess.run(cmd, input=psk.encode(), check=True, capture_output=True)
+    # Guard: only attempt `wg set` if the interface actually exists.
+    # `wg show <iface>` exits 0 if up, non-zero otherwise. Quiet either way.
+    iface_up = subprocess.run(
+        ["wg", "show", iface],
+        capture_output=True,
+    ).returncode == 0
+
+    if iface_up:
+        cmd = ["wg", "set", iface, "peer", wg_pubkey, "allowed-ips", f"{vpn_address}/32"]
+        if psk:
+            cmd.extend(["preshared-key", "/dev/stdin"])
+            subprocess.run(cmd, input=psk.encode(), check=True, capture_output=True)
+        else:
+            subprocess.run(cmd, check=True, capture_output=True)
+        log.info(f"Added WireGuard peer {wg_pubkey[:20]}... → {vpn_address}")
     else:
-        subprocess.run(cmd, check=True, capture_output=True)
+        log.debug(
+            f"WireGuard interface {iface} not up — skipping live peer add for "
+            f"{wg_pubkey[:20]}... (PSK will persist to DB)"
+        )
 
     # Persist the PSK in the database so we can restore on reboot
+    # (or when the interface comes up later).
     if psk:
         with get_db() as conn:
             conn.execute(
                 "UPDATE peers SET wg_psk = ? WHERE wireguard_pubkey = ? OR vpn_address = ?",
                 (psk, wg_pubkey, vpn_address),
             )
-
-    log.info(f"Added WireGuard peer {wg_pubkey[:20]}... → {vpn_address}")
-
 
 def restore_wireguard_peers() -> None:
     """Restore previously connected WireGuard peers from the database."""
@@ -728,10 +747,14 @@ def rotate_all_peers() -> dict:
 
     if not clients:
         log.info("No clients to rotate")
+        log.info("=" * 40)
+        log.info("KEY ROTATION — Cycle complete (no eligible clients)")
+        log.info("=" * 40)
         return {"rotated": 0, "failed": 0, "total": 0}
 
     rotated = 0
     failed = 0
+    start_time = time.time()
 
     for client in clients:
         success = rotate_peer_psk(
@@ -746,10 +769,17 @@ def rotate_all_peers() -> dict:
         # Small delay between rotations to avoid overwhelming UART
         time.sleep(0.5)
 
-    log.info(f"Rotation complete: {rotated} rotated, {failed} failed out of {len(clients)}")
+    elapsed = time.time() - start_time
+
+    # Closing banner — mirrors the opening banner so it's visible in log scrollback
+    log.info("=" * 40)
+    if failed == 0:
+        log.info(f"KEY ROTATION — Cycle complete: {rotated}/{len(clients)} rotated in {elapsed:.1f}s")
+    else:
+        log.info(f"KEY ROTATION — Cycle complete: {rotated} rotated, {failed} FAILED out of {len(clients)} in {elapsed:.1f}s")
+    log.info("=" * 40)
 
     return {"rotated": rotated, "failed": failed, "total": len(clients)}
-
 
 def request_vault_rekeygen() -> bool:
     """Ask the Vault to regenerate its ML-KEM keypair from fresh entropy."""

@@ -629,6 +629,11 @@ def classify_nat_type(quiet: bool = False) -> tuple[str, list[dict]]:
 
     return nat_type, endpoints
 
+# Module-level dedupe tracker for collect_endpoint_candidates log spam.
+# Stores a fingerprint of the last result so we only log loudly on change.
+_last_candidate_log_fingerprint: "str | None" = None
+
+
 def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[dict]:
     """
     Gather ALL ways a peer might be reachable: IPv6 token, IPv6, UPnP, LAN, STUN, public IP,
@@ -637,9 +642,20 @@ def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[
     Uses physical interface IP to avoid reporting WireGuard tunnel IPs as candidates.
     IPv6 token candidates get the absolute highest priority when available —
     deterministic address, no NAT traversal needed.
+
+    Logging dedupe: the "NAT type", "IPv6 candidate added", "IPv6 token
+    candidate added", and "Collected N endpoint candidates" lines are emitted
+    at INFO only when the result meaningfully changes (NAT type, candidate
+    count, or endpoint set). Unchanged repeat calls (e.g. the 45s cache-warm
+    loop) log at DEBUG instead — avoids thousands of identical log lines per day.
     """
+    global _last_candidate_log_fingerprint
+
     candidates = []
     priority = 0
+
+    # Defer INFO-level messages so we can decide loud vs quiet after seeing the full result
+    pending_info_logs = []
 
     # 0. IPv6 token candidate (Phase 5B — deterministic, HIGHEST priority)
     identity = _load_ipv6_token_identity()
@@ -652,7 +668,9 @@ def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[
             "ipv6_token": identity.get("ipv6_token", ""),
         })
         priority += 1
-        log.info(f"IPv6 token candidate added: [{token_addr}]:{listen_port} (deterministic)")
+        pending_info_logs.append(
+            f"IPv6 token candidate added: [{token_addr}]:{listen_port} (deterministic)"
+        )
 
     # 1. UPnP candidate (Phase 2 — guaranteed open port)
     if UPNP_ENABLED:
@@ -678,7 +696,7 @@ def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[
                 "priority": priority,
             })
             priority += 1
-            log.info(f"IPv6 candidate added: [{ipv6_addr}]:{listen_port}")
+            pending_info_logs.append(f"IPv6 candidate added: [{ipv6_addr}]:{listen_port}")
 
     # 3. LAN candidate — use physical IP, not WireGuard IP
     lan_ip = get_physical_ip()
@@ -690,9 +708,10 @@ def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[
         })
         priority += 1
 
-    # 4. STUN candidates + NAT classification
-    #    stun_query() already binds to physical interface
-    nat_type, stun_endpoints = classify_nat_type()
+    # 4. STUN candidates + NAT classification.
+    #    Pass quiet=True so the NAT type line doesn't independently spam —
+    #    the dedupe block below emits the summary on change.
+    nat_type, stun_endpoints = classify_nat_type(quiet=True)
     for ep in stun_endpoints:
         candidates.append({
             "type": "stun",
@@ -744,7 +763,30 @@ def collect_endpoint_candidates(listen_port: int = MESH_WG_LISTEN_PORT) -> list[
     except Exception:
         pass
 
-    log.info(f"Collected {len(candidates)} endpoint candidates (NAT: {nat_type})")
+    # ── Dedupe: build a fingerprint and only log loudly when it changes ──
+    # Fingerprint captures NAT type + count + sorted (type, endpoint) pairs.
+    # Any meaningful network change flips it; identical repeat calls don't.
+    endpoint_set = sorted((c["type"], c["endpoint"]) for c in candidates)
+    fingerprint = f"{nat_type}|{len(candidates)}|{endpoint_set}"
+    changed = (fingerprint != _last_candidate_log_fingerprint)
+
+    if changed:
+        # First call, or network state changed — log at INFO so operators see it
+        _last_candidate_log_fingerprint = fingerprint
+        # Re-emit the NAT type line at INFO here (since classify_nat_type was silenced above)
+        if nat_type != NAT_TYPE_UNKNOWN and stun_endpoints:
+            log.info(f"NAT type: {nat_type} ({len(stun_endpoints)} STUN responses)")
+        for msg in pending_info_logs:
+            log.info(msg)
+        log.info(f"Collected {len(candidates)} endpoint candidates (NAT: {nat_type})")
+    else:
+        # Unchanged since last call — demote to DEBUG to keep the log file clean
+        if nat_type != NAT_TYPE_UNKNOWN and stun_endpoints:
+            log.debug(f"NAT type: {nat_type} ({len(stun_endpoints)} STUN responses) [unchanged]")
+        for msg in pending_info_logs:
+            log.debug(msg)
+        log.debug(f"Collected {len(candidates)} endpoint candidates (NAT: {nat_type}) [unchanged]")
+
     for c in candidates:
         log.debug(f"  candidate: {c['type']} {c['endpoint']} (pri={c['priority']})")
 
