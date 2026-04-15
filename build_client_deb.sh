@@ -16,7 +16,7 @@
 
 set -e
 
-VERSION="${1:-1.0.0}"
+VERSION=$(cat version.txt)
 ARCH="${2:-$(dpkg --print-architecture 2>/dev/null || echo amd64)}"
 PKG_NAME="cobra-client"
 PKG_DIR="${PKG_NAME}_${VERSION}_${ARCH}"
