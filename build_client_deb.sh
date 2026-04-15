@@ -154,8 +154,8 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: CobraTechLLC <admin@cobratechllc.com>
 Homepage: https://github.com/CobraTechLLC/Cobra_Tail
-Depends: python3 (>= 3.9), python3-requests, wireguard-tools, systemd-resolved | openresolv | resolvconf, libssl-dev, ninja-build
-Recommends: wireguard
+Depends: python3 (>= 3.9), python3-requests, python3-cryptography, python3-pip, wireguard-tools, libssl-dev, ninja-build, cmake, build-essential, git
+Recommends: systemd-resolved | openresolv | resolvconf, wireguard
 Description: CobraTail VPN Client — Quantum-Resistant Mesh Network
  A self-hosted post-quantum VPN client with automatic mesh networking,
  NAT traversal, direct peer-to-peer connectivity, and deterministic
