@@ -1834,7 +1834,8 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
 
     On Windows: uses 'wg set' for live PSK updates (no service restart needed),
     and only reinstalls the tunnel service for initial peer setup.
-    On Linux: uses 'wg set' to add/update peers dynamically.
+    On Linux: uses 'wg set' for live updates if wg_mesh is up, otherwise
+    brings up the interface fresh via wg-quick.
     """
     # Phase 1: Multi-candidate hole punching
     if peer_candidates:
@@ -1999,6 +2000,90 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
         except FileNotFoundError:
             log.error("wireguard.exe not found — install WireGuard from https://www.wireguard.com/install/")
             return False
+
+    # ─── Linux branch ────────────────────────────────────────────────
+    # Check if wg_mesh interface is already up
+    check = subprocess.run(
+        ["sudo", "wg", "show", iface],
+        capture_output=True, text=True,
+    )
+    iface_up = (check.returncode == 0)
+
+    if iface_up and is_existing_peer:
+        # PSK rekey on existing peer — use 'wg set' for live update,
+        # no interface teardown needed
+        import tempfile
+        psk_file = Path(tempfile.gettempdir()) / "cobratail_mesh_psk.tmp"
+        try:
+            psk_file.write_text(psk)
+            os.chmod(psk_file, 0o600)
+
+            # If this is a rekey, remove the old pubkey first
+            if old_pubkey:
+                subprocess.run(
+                    ["sudo", "wg", "set", iface, "peer", old_pubkey, "remove"],
+                    capture_output=True, text=True, timeout=10,
+                )
+
+            result = subprocess.run(
+                ["sudo", "wg", "set", iface,
+                 "peer", peer_wg_pubkey,
+                 "preshared-key", str(psk_file),
+                 "endpoint", peer_endpoint,
+                 "allowed-ips", f"{peer_allowed_ip}/32",
+                 "persistent-keepalive", "25"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
+                                   my_mesh_ip, existing_peers)
+                log.info(f"Mesh peer updated via wg set: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+                return True
+            else:
+                log.warning(f"wg set failed ({result.stderr.strip()}), falling back to interface reinstall")
+        except Exception as e:
+            log.warning(f"wg set failed ({e}), falling back to interface reinstall")
+        finally:
+            psk_file.unlink(missing_ok=True)
+
+    # Full interface reinstall — for new peers or if wg set failed.
+    # wg-quick down may fail if the interface is in a weird state, so we
+    # use the same hardened teardown approach as _wireguard_down() for the
+    # main tunnel: try wg-quick down, then forcibly delete the interface,
+    # then clean orphaned DNS entries.
+    _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
+                       my_mesh_ip, existing_peers)
+
+    subprocess.run(
+        ["sudo", "wg-quick", "down", str(mesh_conf_path)],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["sudo", "ip", "link", "delete", "dev", iface],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["sudo", "resolvconf", "-d", iface, "-f"],
+        capture_output=True,
+    )
+
+    try:
+        result = subprocess.run(
+            ["sudo", "wg-quick", "up", str(mesh_conf_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            log.info(f"Mesh peer added: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+            return True
+        else:
+            log.error(f"Failed to bring up mesh interface: {result.stderr.strip()}")
+            return False
+    except FileNotFoundError:
+        log.error("wg-quick not found — install wireguard-tools (apt install wireguard-tools)")
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("wg-quick up timed out")
+        return False
 
 def _mesh_interface_is_up(iface: str = "wg_mesh") -> bool:
     """Check if the mesh WireGuard interface is running."""
@@ -2787,19 +2872,50 @@ def _wireguard_up(config_path):
         return False
 
 def _wireguard_down():
-    """Bring down the WireGuard tunnel."""
+    """Bring down the WireGuard tunnel.
+
+    Hardened teardown: tries the clean path first, then aggressively cleans
+    up any ghost interface state so the next _wireguard_up() doesn't crash
+    with 'interface already exists' or similar.
+    """
     log.info("Bringing down WireGuard tunnel...")
     interface_name = "wg_quantum"
     try:
         if platform.system() == "Windows":
             wireguard_exe = _find_wireguard_windows()
-            subprocess.run([wireguard_exe, "/uninstalltunnelservice", interface_name],
-                           capture_output=True)
+            subprocess.run(
+                [wireguard_exe, "/uninstalltunnelservice", interface_name],
+                capture_output=True,
+            )
             time.sleep(2)
             wg_path = _find_wg_windows()
-            subprocess.run([wg_path, "setconf", interface_name, "NUL"], capture_output=True)
+            subprocess.run(
+                [wg_path, "setconf", interface_name, "NUL"],
+                capture_output=True,
+            )
         else:
-            subprocess.run(["wg-quick", "down", interface_name], capture_output=True)
+            # Linux: hardened three-step teardown.
+            # 1. Clean path — wg-quick down handles routes, DNS, and the interface
+            #    itself when state is consistent.
+            subprocess.run(
+                ["wg-quick", "down", interface_name],
+                capture_output=True,
+            )
+            # 2. Nuke any ghost interface left behind if wg-quick failed
+            #    partway through (e.g., crashed mid-teardown, or interface
+            #    exists but wg-quick's state file is gone). Silent if the
+            #    interface doesn't exist.
+            subprocess.run(
+                ["ip", "link", "delete", "dev", interface_name],
+                capture_output=True,
+            )
+            # 3. Clean orphaned resolvconf entries that wg-quick may have
+            #    left behind. Silent if resolvconf isn't installed or there's
+            #    nothing to clean.
+            subprocess.run(
+                ["resolvconf", "-d", interface_name, "-f"],
+                capture_output=True,
+            )
     except Exception:
         pass  # Ignore errors if it's already down
 

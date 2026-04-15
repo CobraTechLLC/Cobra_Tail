@@ -88,10 +88,26 @@ if not CLIENT_SCRIPT.exists():
 if not IDENTITY_SCRIPT.exists():
     IDENTITY_SCRIPT = _SCRIPT_DIR / "identity_manager.py"
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SERVICE_NAME = "cobratail"              # systemd service name (Linux)
 TASK_NAME = "CobraTailClient"           # Scheduled Task name (Windows)
 IDENTITY_TASK_NAME = "CobraTailIdentity"  # Identity scheduled task (Windows)
+
+# ─── GitHub Auto-Update ──────────────────────────────────────────────────────
+GITHUB_REPO = "CobraTechLLC/Cobra_Tail"
+GITHUB_BRANCH = "main"
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}"
+
+# Files the updater pulls from GitHub. Keys are filenames in the repo,
+# values are absolute install paths on this machine.
+UPDATABLE_FILES = {
+    "client.py":            BIN_DIR / "client.py",
+    "cobra_launcher.py":    BIN_DIR / "cobra_launcher.py",
+    "identity_manager.py":  BIN_DIR / "identity_manager.py",
+}
+
+VERSION_FILE = COBRATAIL_DIR / "version.txt"
+
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 # ANSI codes — Windows Terminal and modern terminals support these
@@ -1181,59 +1197,188 @@ def settings_menu():
 # UPDATE FROM GITHUB
 # =============================================================================
 
+def get_local_version() -> str:
+    """Read the locally installed version from disk, fall back to the
+    hardcoded VERSION constant if no version.txt exists."""
+    if VERSION_FILE.exists():
+        try:
+            return VERSION_FILE.read_text().strip()
+        except Exception:
+            pass
+    return VERSION
+
+
+def get_remote_version() -> str | None:
+    """Fetch the latest version string from GitHub. Returns None on failure."""
+    url = f"{GITHUB_RAW_BASE}/version.txt"
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(url, timeout=10)
+        return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
+def download_github_file(filename: str, dest: Path) -> bool:
+    """Download a single file from the GitHub repo to the destination path.
+    Atomic-ish: downloads to .tmp, validates Python syntax, backs up the old
+    file with a timestamped suffix, then moves into place. Returns True on
+    success, False on any failure (including syntax errors in downloaded code).
+    """
+    url = f"{GITHUB_RAW_BASE}/{filename}"
+    tmp_path = dest.with_suffix(dest.suffix + ".tmp")
+    try:
+        import urllib.request
+        # Make sure parent directory exists (handles fresh installs)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        urllib.request.urlretrieve(url, str(tmp_path))
+
+        # Validate Python files by parsing them — never install broken code
+        if filename.endswith(".py"):
+            import ast
+            try:
+                ast.parse(tmp_path.read_text())
+            except SyntaxError as e:
+                print(f"    {RED}Downloaded {filename} has syntax errors: {e}{RESET}")
+                tmp_path.unlink(missing_ok=True)
+                return False
+
+        # Backup existing file with a timestamp so we can roll back manually
+        if dest.exists():
+            backup = dest.with_suffix(dest.suffix + f".bak.{int(time.time())}")
+            try:
+                shutil.copy2(dest, backup)
+            except Exception:
+                pass  # Best effort; not fatal if backup fails
+
+        # Atomic-ish replace
+        shutil.move(str(tmp_path), str(dest))
+        try:
+            os.chmod(dest, 0o755)
+        except Exception:
+            pass  # chmod is a no-op on Windows
+        return True
+
+    except Exception as e:
+        print(f"    {RED}Failed to download {filename}: {e}{RESET}")
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        return False
+
 def check_for_updates():
-    """Check GitHub for newer version and update if available."""
+    """Check GitHub for newer files and pull them in place.
+
+    Works for any install layout (.deb, .exe, manual install) by pulling
+    raw files directly from the GitHub repo instead of relying on `git pull`.
+    Each Python file is validated by parsing before it replaces the installed
+    copy, and the old file is backed up with a timestamped suffix.
+
+    Note: only updates Python source files. liboqs, WireGuard, and other
+    system dependencies still require a full reinstall via the .deb / .exe.
+    """
     print_header("Check for Updates")
 
-    print(f"  Current version: {VERSION}")
-    print(f"  {DIM}Checking GitHub...{RESET}")
+    local_version = get_local_version()
+    print(f"  Current version: {local_version}")
+    print(f"  {DIM}Checking GitHub ({GITHUB_REPO}, {GITHUB_BRANCH} branch)...{RESET}")
 
-    # Try to read version from installed location
-    version_path = COBRATAIL_DIR / "version.txt"
-    if not version_path.exists():
-        version_path = _SCRIPT_DIR / "version.txt"
-
-    # Check GitHub (requires git)
-    if not shutil.which("git"):
-        print(f"\n  {YELLOW}git not installed — cannot check for updates{RESET}")
+    remote_version = get_remote_version()
+    if remote_version is None:
+        print(f"\n  {RED}Could not reach GitHub. Check your internet connection.{RESET}")
         pause()
         return
 
-    # Try to pull updates
-    repo_dir = _SCRIPT_DIR
-    if (repo_dir / ".git").exists():
-        print(f"  Repository: {repo_dir}")
-        result = run_cmd(["git", "-C", str(repo_dir), "remote", "update"])
-        if result.returncode != 0:
-            print(f"  {RED}Failed to contact GitHub{RESET}")
-            pause()
-            return
+    print(f"  Latest version:  {remote_version}")
+    print()
 
-        # Check if behind
-        result = run_cmd([
-            "git", "-C", str(repo_dir), "status", "-uno"
-        ])
-        output = result.stdout
-        if "behind" in output.lower():
-            print(f"\n  {GREEN}Update available!{RESET}")
-            update = input(f"  Pull latest? [Y/n]: ").strip().lower()
-            if update in ("", "y", "yes"):
-                result = run_cmd(["git", "-C", str(repo_dir), "pull"])
-                if result.returncode == 0:
-                    print(f"  {GREEN}Updated successfully!{RESET}")
-                    print(f"  {DIM}Restart the client service for changes to take effect.{RESET}")
-                else:
-                    print(f"  {RED}Update failed: {result.stderr.strip()}{RESET}")
-        elif "up to date" in output.lower() or "up-to-date" in output.lower():
-            print(f"  {GREEN}Already up to date{RESET}")
+    if remote_version == local_version:
+        print(f"  {GREEN}Already up to date.{RESET}")
+        pause()
+        return
+
+    print(f"  {GREEN}Update available: {local_version} → {remote_version}{RESET}")
+    print()
+    print(f"  {DIM}This will update the following files:{RESET}")
+    for filename in UPDATABLE_FILES:
+        print(f"    • {filename}")
+    print()
+    print(f"  {DIM}Note: only Python source files are updated. System packages")
+    print(f"  (liboqs, wireguard-tools, etc.) still require a full .deb / .exe")
+    print(f"  reinstall when they change.{RESET}")
+    print()
+
+    # Permission check — writing to /opt/cobratail/bin or Program Files
+    # requires elevation. Bail early with a helpful message rather than
+    # half-updating and failing partway through.
+    if not is_admin():
+        if IS_WINDOWS:
+            print(f"  {YELLOW}Updates require Administrator privileges.{RESET}")
+            print(f"  {DIM}Right-click the terminal and 'Run as Administrator', then re-run.{RESET}")
         else:
-            print(f"  {DIM}{output.strip()}{RESET}")
+            print(f"  {YELLOW}Updates require root privileges.{RESET}")
+            print(f"  {DIM}Re-run with: sudo cobra{RESET}")
+        pause()
+        return
+
+    confirm = input(f"  Download and install? [Y/n]: ").strip().lower()
+    if confirm not in ("", "y", "yes"):
+        print(f"  {DIM}Update cancelled.{RESET}")
+        pause()
+        return
+
+    print()
+    updated = 0
+    failed = 0
+    for filename, dest_path in UPDATABLE_FILES.items():
+        print(f"  Updating {filename}...", end=" ", flush=True)
+        if download_github_file(filename, dest_path):
+            print(f"{GREEN}OK{RESET}")
+            updated += 1
+        else:
+            print(f"{RED}FAILED{RESET}")
+            failed += 1
+
+    # Update version.txt last so it only bumps if everything else succeeded
+    if failed == 0:
+        try:
+            VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            VERSION_FILE.write_text(remote_version)
+            print(f"  Updating version.txt... {GREEN}OK{RESET} (v{remote_version})")
+        except Exception as e:
+            print(f"  {YELLOW}Could not write version.txt: {e}{RESET}")
+
+    print()
+    if failed == 0:
+        print(f"  {GREEN}Updated {updated} file(s) successfully.{RESET}")
+        print()
+
+        # Offer to restart the service so changes take effect immediately
+        if get_service_status() == "running":
+            print(f"  {DIM}The client service is currently running.{RESET}")
+            print(f"  {DIM}Updated code won't take effect until the service is restarted.{RESET}")
+            if IS_LINUX:
+                print(f"  {YELLOW}Note: if you're SSH'd in over the VPN, restarting may disconnect you.{RESET}")
+            print()
+            confirm = input(f"  Restart the client service now? [Y/n]: ").strip().lower()
+            if confirm in ("", "y", "yes"):
+                restart_service()
+            else:
+                print(f"  {DIM}Service not restarted. Restart manually when ready:{RESET}")
+                if IS_WINDOWS:
+                    print(f"    {DIM}cobra --restart{RESET}")
+                else:
+                    print(f"    {DIM}sudo systemctl restart cobratail   # (or 'cobra --restart'){RESET}")
+        else:
+            print(f"  {DIM}Service is currently stopped — start it normally to use the new code.{RESET}")
     else:
-        print(f"  {YELLOW}Not a git repository — cannot auto-update{RESET}")
-        print(f"  {DIM}Download the latest from GitHub manually{RESET}")
+        print(f"  {YELLOW}Updated {updated}, {failed} failed.{RESET}")
+        print(f"  {DIM}Old files are backed up with .bak.<timestamp> suffix in {BIN_DIR}.{RESET}")
 
     pause()
-
 
 # =============================================================================
 # MAIN MENU

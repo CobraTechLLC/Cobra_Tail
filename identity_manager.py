@@ -220,7 +220,7 @@ def _detect_primary_interface() -> str:
         try:
             result = subprocess.run(
                 ["powershell", "-Command",
-                 "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
+                 "Get-NetAdapter | Where-Object {$PSItem.Status -eq 'Up'} | "
                  "Select-Object -First 1 -ExpandProperty Name"],
                 capture_output=True, text=True, timeout=10,
             )
@@ -249,7 +249,6 @@ def _detect_primary_interface() -> str:
 
     return "wlan0"
 
-
 # =============================================================================
 # WINDOWS HELPERS
 # =============================================================================
@@ -274,7 +273,7 @@ def _win_get_adapter_name(interface: str) -> str:
     try:
         result = subprocess.run(
             ["powershell", "-Command",
-             "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
+             "Get-NetAdapter | Where-Object {$PSItem.Status -eq 'Up'} | "
              "Select-Object -First 1 -ExpandProperty Name"],
             capture_output=True, text=True, timeout=10,
         )
@@ -285,7 +284,6 @@ def _win_get_adapter_name(interface: str) -> str:
         pass
 
     return "Wi-Fi"
-
 
 def _win_get_current_mac(adapter_name: str) -> str:
     """Get the current MAC address of a Windows adapter."""
@@ -554,7 +552,7 @@ def apply_mac(interface: str, mac_address: str) -> bool:
             result = subprocess.run(
                 ["powershell", "-Command",
                  f"Get-ChildItem 'Registry::{reg_path}' | "
-                 f"Where-Object {{ (Get-ItemProperty $_.PSPath -Name NetCfgInstanceId "
+                 f"Where-Object {{ (Get-ItemProperty $PSItem.PSPath -Name NetCfgInstanceId "
                  f"-ErrorAction SilentlyContinue).NetCfgInstanceId -eq '{guid}' }} | "
                  f"Select-Object -ExpandProperty PSPath"],
                 capture_output=True, text=True, timeout=10,
@@ -1066,9 +1064,9 @@ def wait_for_global_v6(interface: str, token: str, timeout: int = 60) -> str:
                     ["powershell", "-Command",
                      f"Get-NetIPAddress -InterfaceAlias '{adapter}' "
                      f"-AddressFamily IPv6 -ErrorAction SilentlyContinue | "
-                     f"Where-Object {{ $_.PrefixOrigin -ne 'WellKnown' -and "
-                     f"$_.SuffixOrigin -ne 'WellKnown' -and "
-                     f"$_.IPAddress -notlike 'fe80*' }} | "
+                     f"Where-Object {{ $PSItem.PrefixOrigin -ne 'WellKnown' -and "
+                     f"$PSItem.SuffixOrigin -ne 'WellKnown' -and "
+                     f"$PSItem.IPAddress -notlike 'fe80*' }} | "
                      f"Select-Object -ExpandProperty IPAddress"],
                     capture_output=True, text=True, timeout=10,
                 )
