@@ -1330,10 +1330,19 @@ async def register_device(req: RegisterRequest):
         )
 
     # Check if this device already has a VPN address (and mesh address)
+    # AND whether this is a re-registration (key change → genuine restart)
     with get_db() as conn:
         existing = conn.execute(
-            "SELECT vpn_address, mesh_address FROM peers WHERE device_id = ?", (req.device_id,)
+            "SELECT vpn_address, mesh_address, wireguard_pubkey FROM peers WHERE device_id = ?",
+            (req.device_id,),
         ).fetchone()
+
+    is_first_registration = existing is None
+    wg_pubkey_changed = (
+        existing is not None
+        and existing["wireguard_pubkey"]
+        and existing["wireguard_pubkey"] != req.wireguard_public_key
+    )
 
     vpn_addr = existing["vpn_address"] if existing and existing["vpn_address"] else allocate_vpn_address()
     mesh_addr = existing["mesh_address"] if existing and existing["mesh_address"] else None
@@ -1358,17 +1367,42 @@ async def register_device(req: RegisterRequest):
     log.info(f"Registered client: {req.device_id} → VPN {vpn_addr} (public: {req.public_ip or 'unknown'}"
              f", ipv6_token: {req.ipv6_token or 'none'})")
 
-    # Clear any stale mesh tunnels involving this device (client restarted)
+    # Only clear mesh tunnels when this is a genuine fresh start:
+    #   - first time we've ever seen this device, OR
+    #   - the WireGuard pubkey changed (which means the client lost its keys
+    #     and any previous mesh PSKs are useless)
+    # A simple re-register from a still-running client (heartbeat hiccup,
+    # network blip, reconnect loop) preserves all active mesh tunnels.
+    # Pending tunnels are always safe to clear since they haven't been
+    # accepted by the other side yet.
     try:
         with get_db() as conn:
-            cleared = conn.execute(
-                "DELETE FROM mesh_tunnels WHERE initiator_id = ? OR target_id = ?",
+            # Always clear pending — they're stuck and the client will re-request if needed
+            pending_cleared = conn.execute(
+                "DELETE FROM mesh_tunnels WHERE (initiator_id = ? OR target_id = ?) "
+                "AND status = 'pending'",
                 (req.device_id, req.device_id),
             ).rowcount
-            if cleared > 0:
-                log.info(f"Cleared {cleared} stale mesh tunnel(s) for re-registering client {req.device_id}")
-    except Exception:
-        pass
+
+            # Only clear ACTIVE tunnels when key changed or first registration
+            active_cleared = 0
+            if is_first_registration or wg_pubkey_changed:
+                active_cleared = conn.execute(
+                    "DELETE FROM mesh_tunnels WHERE (initiator_id = ? OR target_id = ?) "
+                    "AND status = 'active'",
+                    (req.device_id, req.device_id),
+                ).rowcount
+
+            if pending_cleared > 0 or active_cleared > 0:
+                reason = "first registration" if is_first_registration else (
+                    "WG pubkey changed (genuine restart)" if wg_pubkey_changed else "pending only"
+                )
+                log.info(
+                    f"Cleared {pending_cleared} pending + {active_cleared} active mesh tunnel(s) "
+                    f"for {req.device_id} ({reason})"
+                )
+    except Exception as e:
+        log.warning(f"Mesh tunnel cleanup failed: {e}")
 
     wg_pub = Path(CONFIG["wireguard"]["key_dir"]) / "server_public.key"
     server_pubkey = wg_pub.read_text().strip() if wg_pub.exists() else "NOT_GENERATED"

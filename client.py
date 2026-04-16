@@ -3241,9 +3241,27 @@ class QuantumVPNService:
             self._shutdown()
 
     def _full_connect(self) -> bool:
-        """Complete connection flow: select endpoint → register + fetch vault key (parallel) → handshake → tunnel."""
+        """Complete connection flow: select endpoint → register + fetch vault key (parallel) → handshake → tunnel.
+
+        Idempotent: if we're already connected and the WG tunnel is healthy,
+        just send a heartbeat to refresh state instead of re-registering. This
+        prevents the lighthouse from clearing our active mesh tunnels every
+        time a single heartbeat hiccups."""
         try:
             from concurrent.futures import ThreadPoolExecutor
+
+            # Idempotency check: if we already have an active tunnel and saved
+            # state, attempt a heartbeat-only refresh first. Only fall through
+            # to full re-registration if the heartbeat fails (truly disconnected)
+            # or if we've never connected before.
+            if self.connected and self.lighthouse_url and self.vpn_address:
+                log.debug("_full_connect called while already connected — trying heartbeat refresh")
+                hb = send_heartbeat(self.lighthouse_url)
+                if hb:
+                    log.info("Already connected — heartbeat refresh succeeded, skipping re-register")
+                    return True
+                log.info("Heartbeat refresh failed — proceeding with full reconnect")
+                self.connected = False
 
             # If WireGuard tunnel is currently up with full-tunnel routing (0.0.0.0/0),
             # skip the LAN probe — it would succeed falsely because traffic routes
