@@ -52,7 +52,7 @@ DB_PATH = DATA_DIR / "lighthouse.db"
 SERVICE_NAME = "lighthouse"
 SERVICE_PATH = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 VERSION_FILE = LIGHTHOUSE_DIR / "version.txt"
 
 # ─── GitHub Update Config ────────────────────────────────────────────────────

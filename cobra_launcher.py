@@ -88,7 +88,7 @@ if not CLIENT_SCRIPT.exists():
 if not IDENTITY_SCRIPT.exists():
     IDENTITY_SCRIPT = _SCRIPT_DIR / "identity_manager.py"
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 SERVICE_NAME = "cobratail"              # systemd service name (Linux)
 TASK_NAME = "CobraTailClient"           # Scheduled Task name (Windows)
 IDENTITY_TASK_NAME = "CobraTailIdentity"  # Identity scheduled task (Windows)
@@ -1238,7 +1238,7 @@ def download_github_file(filename: str, dest: Path) -> bool:
         if filename.endswith(".py"):
             import ast
             try:
-                ast.parse(tmp_path.read_text())
+                ast.parse(tmp_path.read_text(encoding="utf-8"))
             except SyntaxError as e:
                 print(f"    {RED}Downloaded {filename} has syntax errors: {e}{RESET}")
                 tmp_path.unlink(missing_ok=True)
