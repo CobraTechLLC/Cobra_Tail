@@ -2602,6 +2602,41 @@ async def mesh_update_candidates(req: MeshUpdateCandidatesRequest):
         "updated_endpoint": new_endpoint,
     }
 
+@app.post("/api/v1/mesh/cleanup-orphan")
+async def mesh_cleanup_orphan(request: Request):
+    """Allow a client to request deletion of a tunnel it doesn't have locally.
+    This prevents phantom 'active' records from blocking auto-mesh forever.
+    Only the initiator or target of a tunnel can request its deletion.
+    """
+    body = await request.json()
+    device_id = body.get("device_id", "")
+    request_id = body.get("request_id", "")
+
+    if not device_id or not request_id:
+        raise HTTPException(400, "device_id and request_id required")
+
+    with get_db() as conn:
+        tunnel = conn.execute(
+            "SELECT initiator_id, target_id FROM mesh_tunnels WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+
+    if not tunnel:
+        return {"status": "not_found"}
+
+    # Only allow deletion by a peer that's part of this tunnel
+    if device_id not in (tunnel["initiator_id"], tunnel["target_id"]):
+        raise HTTPException(403, "You are not part of this tunnel")
+
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM mesh_tunnels WHERE request_id = ?",
+            (request_id,),
+        )
+
+    log.info(f"Orphan tunnel cleanup: {request_id} deleted by {device_id}")
+    return {"status": "deleted", "request_id": request_id}
+
 def _get_peer_vpn_address(device_id: str) -> str:
     """Look up a peer's VPN address."""
     with get_db() as conn:

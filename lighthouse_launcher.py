@@ -52,8 +52,26 @@ DB_PATH = DATA_DIR / "lighthouse.db"
 SERVICE_NAME = "lighthouse"
 SERVICE_PATH = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 
-VERSION = "1.0.2"
 VERSION_FILE = LIGHTHOUSE_DIR / "version.txt"
+
+def _load_version() -> str:
+    """Load version from local version.txt; fall back to default if missing."""
+    try:
+        if VERSION_FILE.exists():
+            v = VERSION_FILE.read_text().strip()
+            if v:
+                return v
+        # Fallback: alongside this script (dev / source runs)
+        local_vf = Path(__file__).parent / "version.txt"
+        if local_vf.exists():
+            v = local_vf.read_text().strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return "0.0.0"
+
+VERSION = _load_version()
 
 # ─── GitHub Update Config ────────────────────────────────────────────────────
 

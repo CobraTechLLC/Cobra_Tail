@@ -6,10 +6,11 @@ CobraTailSetup.exe — a single-file installer that bundles:
   - installer.py (the install wizard)
   - client.py, cobra_launcher.py, identity_manager.py
   - oqs.dll (if present)
+  - version.txt (offline fallback for the installer)
   - Icon and version info
 
 The resulting .exe is what you distribute. Users double-click it,
-it installs CobraTail to C:\Program Files\CobraTail, registers in
+it installs CobraTail to C:\\Program Files\\CobraTail, registers in
 Apps & Features, creates shortcuts, and launches the cobra menu.
 
 Requirements (on the build machine):
@@ -19,6 +20,11 @@ Usage:
     python build_windows_exe.py
     python build_windows_exe.py --skip-oqs       # don't bundle oqs.dll
     python build_windows_exe.py --output-dir dist # custom output folder
+
+Version management:
+    Edit version.txt (single source of truth). This script reads it at build
+    time and bakes the value into the .exe's Windows metadata AND bundles the
+    file itself so the installer has an offline fallback.
 """
 
 import argparse
@@ -32,7 +38,22 @@ from pathlib import Path
 # ─── Build Configuration ─────────────────────────────────────────────────────
 
 APP_NAME = "CobraTail"
-VERSION = "1.0.0"
+
+def _load_build_version() -> str:
+    """Read version from version.txt next to this build script.
+    This is the single source of truth — edit version.txt to bump the release."""
+    vf = Path(__file__).parent / "version.txt"
+    if not vf.exists():
+        print(f"  ERROR: version.txt not found at {vf}")
+        print(f"  Create it with a single line containing the version (e.g., '1.0.3')")
+        sys.exit(1)
+    v = vf.read_text().strip()
+    if not v:
+        print(f"  ERROR: version.txt is empty")
+        sys.exit(1)
+    return v
+
+VERSION = _load_build_version()
 DESCRIPTION = "CobraTail VPN - Quantum-Resistant Mesh Network"
 COMPANY = "CobraTail"
 COPYRIGHT = "Copyright (c) 2025 CobraTail Project"
@@ -122,6 +143,13 @@ def build(args):
         print("  Make sure installer.py is in the same folder as this script.")
         sys.exit(1)
 
+    # Verify version.txt exists (it's required — _load_build_version already
+    # checked, but the bundling step below needs it to still be there)
+    version_txt = script_dir / "version.txt"
+    if not version_txt.exists():
+        print(f"ERROR: version.txt not found in {script_dir}")
+        sys.exit(1)
+
     # Verify payload files exist
     missing = []
     for f in PAYLOAD_FILES:
@@ -156,6 +184,16 @@ def build(args):
         for f in PAYLOAD_FILES:
             src = script_dir / f
             add_data_args.extend(["--add-data", f"{src}{sep}payload"])
+
+        # Bundle version.txt at the root of the extracted payload so
+        # installer.py's _fetch_version() can fall back to it when
+        # GitHub is unreachable at install time.
+        add_data_args.extend(["--add-data", f"{version_txt}{sep}."])
+
+        # Also bundle version.txt inside the payload/ dir so it gets installed
+        # alongside the launcher scripts into C:\Program Files\CobraTail\bin
+        # (the launcher's _load_version() can find it there too)
+        add_data_args.extend(["--add-data", f"{version_txt}{sep}payload"])
 
         # Bundle oqs.dll if found
         if oqs_dll:
@@ -202,7 +240,7 @@ def build(args):
         print()
         print("=" * 60)
         print(f"  Building {APP_NAME}.exe")
-        print(f"  Version: {VERSION}")
+        print(f"  Version: {VERSION}  (from version.txt)")
         print(f"  Payload: {', '.join(PAYLOAD_FILES)}")
         print(f"  OQS DLL: {'bundled' if oqs_dll else 'not bundled (will build on target)'}")
         print(f"  Output:  {output_dir}")
@@ -224,6 +262,7 @@ def build(args):
             print(f"  BUILD SUCCESSFUL")
             print(f"  {exe_path}")
             print(f"  Size: {size_mb:.1f} MB")
+            print(f"  Version: {VERSION}")
             print("=" * 60)
         else:
             print("BUILD FAILED — .exe not found in output directory")

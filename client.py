@@ -3607,11 +3607,15 @@ class QuantumVPNService:
     def _reconcile_mesh_state(self) -> None:
         """
         Reconcile local mesh state with the Lighthouse.
-        If the Lighthouse has no record of an active tunnel (e.g., peer restarted
-        and re-registered, which clears stale tunnels), remove local state so
-        auto-mesh can re-establish the connection.
+
+        Two-way reconciliation:
+        1. If the Lighthouse has no record of a local tunnel → clear local state
+           so auto-mesh can re-establish.
+        2. If the Lighthouse has an 'active' tunnel that we don't have locally
+           (e.g., stale record from a previous session) → ask the Lighthouse to
+           delete it so auto-mesh isn't blocked by a phantom 409 conflict.
         """
-        if not self.mesh_peers or not self.lighthouse_url:
+        if not self.lighthouse_url:
             return
 
         try:
@@ -3623,23 +3627,60 @@ class QuantumVPNService:
             if resp.status_code != 200:
                 return
 
-            active_request_ids = {t["request_id"] for t in resp.json().get("tunnels", [])}
+            lighthouse_tunnels = resp.json().get("tunnels", [])
+            active_request_ids = {t["request_id"] for t in lighthouse_tunnels}
 
-            stale = []
-            for request_id, info in self.mesh_peers.items():
-                if request_id not in active_request_ids:
-                    stale.append(request_id)
+            # Direction 1: local tunnels not on lighthouse → clear local state
+            if self.mesh_peers:
+                stale_local = []
+                for request_id, info in self.mesh_peers.items():
+                    if request_id not in active_request_ids:
+                        stale_local.append(request_id)
 
-            for request_id in stale:
-                peer_id = self.mesh_peers[request_id].get("peer_id", "unknown")
-                log.info(f"Mesh tunnel {request_id} with {peer_id} no longer on Lighthouse — clearing local state")
-                del self.mesh_peers[request_id]
+                for request_id in stale_local:
+                    peer_id = self.mesh_peers[request_id].get("peer_id", "unknown")
+                    log.info(f"Mesh tunnel {request_id} with {peer_id} no longer on Lighthouse — clearing local state")
+                    del self.mesh_peers[request_id]
 
-            # Also clean up pending initiations that reference gone peers
-            gone_peers = {info["peer_id"] for rid, info in [(r, self.mesh_peers.get(r, {})) for r in stale] if info}
-            for device_id in list(self._mesh_pending_initiations.keys()):
-                if device_id in gone_peers:
-                    del self._mesh_pending_initiations[device_id]
+                # Clean up pending initiations that reference gone peers
+                gone_peers = {
+                    self.mesh_peers.get(r, {}).get("peer_id")
+                    for r in stale_local
+                    if self.mesh_peers.get(r, {}).get("peer_id")
+                }
+                for device_id in list(self._mesh_pending_initiations.keys()):
+                    if device_id in gone_peers:
+                        del self._mesh_pending_initiations[device_id]
+
+            # Direction 2: lighthouse tunnels not applied locally → tell lighthouse
+            # to delete them. This prevents phantom "active" records from blocking
+            # auto-mesh with a 409 conflict forever.
+            local_request_ids = set(self.mesh_peers.keys())
+            # Also count pending initiations as "known" — don't delete tunnels
+            # we're actively polling for acceptance on
+            pending_request_ids = set(self._mesh_pending_initiations.values())
+            known_ids = local_request_ids | pending_request_ids
+
+            for tunnel in lighthouse_tunnels:
+                request_id = tunnel["request_id"]
+                if request_id not in known_ids:
+                    peer_id = tunnel.get("peer_id", "unknown")
+                    log.info(
+                        f"Lighthouse has active tunnel {request_id} with {peer_id} "
+                        f"but we don't have it locally — requesting cleanup"
+                    )
+                    # Ask lighthouse to delete this orphaned tunnel
+                    try:
+                        get_session().post(
+                            f"{self.lighthouse_url}/api/v1/mesh/cleanup-orphan",
+                            json={
+                                "device_id": my_device_id,
+                                "request_id": request_id,
+                            },
+                            timeout=5,
+                        )
+                    except Exception as e:
+                        log.debug(f"Orphan cleanup request failed: {e}")
 
         except Exception as e:
             log.debug(f"Mesh state reconciliation failed: {e}")

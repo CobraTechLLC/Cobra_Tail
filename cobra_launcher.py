@@ -88,7 +88,36 @@ if not CLIENT_SCRIPT.exists():
 if not IDENTITY_SCRIPT.exists():
     IDENTITY_SCRIPT = _SCRIPT_DIR / "identity_manager.py"
 
-VERSION = "1.0.2"
+def _load_version() -> str:
+    """Load version from local version.txt; fall back to default if missing.
+    Checks Windows install dir, Linux install dir, then alongside this script."""
+    try:
+        # Windows install location
+        if platform.system() == "Windows":
+            installed_vf = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "CobraTail" / "version.txt"
+            if installed_vf.exists():
+                v = installed_vf.read_text().strip()
+                if v:
+                    return v
+        else:
+            # Linux install location
+            installed_vf = Path("/opt/cobratail/version.txt")
+            if installed_vf.exists():
+                v = installed_vf.read_text().strip()
+                if v:
+                    return v
+        # Fallback: alongside this script (dev / source runs)
+        local_vf = Path(__file__).parent / "version.txt"
+        if local_vf.exists():
+            v = local_vf.read_text().strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return "0.0.0"
+
+VERSION = _load_version()
+
 SERVICE_NAME = "cobratail"              # systemd service name (Linux)
 TASK_NAME = "CobraTailClient"           # Scheduled Task name (Windows)
 IDENTITY_TASK_NAME = "CobraTailIdentity"  # Identity scheduled task (Windows)

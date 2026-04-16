@@ -31,11 +31,45 @@ from pathlib import Path
 
 APP_NAME = "CobraTail"
 DISPLAY_NAME = "CobraTail VPN"
-VERSION = "1.0.0"
 PUBLISHER = "CobraTail Project"
 DESCRIPTION = "Quantum-Resistant Mesh VPN"
 HELP_URL = "https://github.com/your-org/cobratail"
 UPDATE_URL = "https://github.com/your-org/cobratail/releases"
+
+# Single source of truth: fetch version from GitHub at runtime.
+GITHUB_REPO = "CobraTechLLC/Cobra_Tail"
+GITHUB_BRANCH = "main"
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}"
+
+def _fetch_version() -> str:
+    """Fetch the latest version from GitHub's version.txt.
+    Falls back to the bundled version.txt (baked into the .exe at build time)
+    if GitHub is unreachable. Final fallback is '0.0.0'."""
+    import urllib.request
+    # Try GitHub first
+    try:
+        url = f"{GITHUB_RAW_BASE}/version.txt"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            v = resp.read().decode("utf-8").strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    # Fall back to bundled version.txt
+    try:
+        if hasattr(sys, "_MEIPASS"):
+            bundled = Path(sys._MEIPASS) / "version.txt"
+        else:
+            bundled = Path(__file__).parent / "version.txt"
+        if bundled.exists():
+            v = bundled.read_text().strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return "0.0.0"
+
+VERSION = _fetch_version()
 
 # Installation paths
 INSTALL_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / APP_NAME
