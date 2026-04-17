@@ -4065,14 +4065,33 @@ class QuantumVPNService:
 
     def _pick_best_candidate_endpoint(self, candidates: list[dict]) -> str | None:
         """Pick the best endpoint from a candidate list.
-        Priority: IPv6 > UPnP > STUN > public > LAN > VPN-routed.
+        Priority: ipv6_token > LAN (if we're on same LAN) > IPv6 > UPnP > STUN > public > VPN-routed.
+        LAN is promoted above non-token IPv6 because SLAAC privacy addresses
+        rotate, while LAN IPs are stable.
         """
-        priority_order = ["ipv6", "upnp", "stun", "public", "lan", "vpn_routed"]
-        for ptype in priority_order:
+        # ipv6_token is always first — deterministic and stable
+        for c in candidates:
+            if c.get("type") == "ipv6_token" and c.get("endpoint"):
+                return c["endpoint"]
+
+        # If there's a LAN candidate and we're also on a LAN, prefer it
+        # over rotating IPv6 privacy addresses
+        my_lan = get_physical_ip() or ""
+        for c in candidates:
+            if c.get("type") == "lan" and c.get("endpoint"):
+                peer_lan = c["endpoint"].rsplit(":", 1)[0]
+                if my_lan and peer_lan:
+                    my_prefix = ".".join(my_lan.split(".")[:3])
+                    peer_prefix = ".".join(peer_lan.split(".")[:3])
+                    if my_prefix == peer_prefix:
+                        return c["endpoint"]
+
+        # Standard priority for everything else
+        for ptype in ["ipv6", "upnp", "stun", "public", "lan", "vpn_routed"]:
             for c in candidates:
                 if c.get("type") == ptype and c.get("endpoint"):
                     return c["endpoint"]
-        # Fallback: return first candidate with an endpoint
+
         for c in candidates:
             if c.get("endpoint"):
                 return c["endpoint"]

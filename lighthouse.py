@@ -1537,8 +1537,16 @@ async def heartbeat(req: HeartbeatRequest):
             current = tunnel[f"{peer_side}_candidates"] or ""
             if current and current != last_known:
                 _candidate_versions[tunnel_key] = current
-                if last_known:  # Only flag if there WAS a previous version (not first sync)
-                    peer_candidates_updated = True
+                if last_known:
+                    # Compare endpoint sets, not raw JSON — avoids false positives
+                    # from STUN port churn, candidate reordering, or timestamp diffs
+                    try:
+                        old_eps = {c.get("endpoint") for c in json.loads(last_known) if c.get("endpoint")}
+                        new_eps = {c.get("endpoint") for c in json.loads(current) if c.get("endpoint")}
+                        if new_eps != old_eps:
+                            peer_candidates_updated = True
+                    except (json.JSONDecodeError, TypeError):
+                        peer_candidates_updated = True
 
     # DEDENTED: The 'with' block is closed, and the database lock is released.
     # Now it is safe to call cleanup functions that open their own connections.
@@ -1910,10 +1918,13 @@ async def trigger_rotation():
 
     return {"status": "rotation_triggered", "message": "Rotation cycle started in background"}
 
-def _select_best_endpoint(candidates_json: str | None, fallback_endpoint: str) -> str:
+def _select_best_endpoint(candidates_json: str | None, fallback_endpoint: str,
+                          same_lan: bool = False) -> str:
     """
     Pick the best single endpoint from a JSON candidate list.
     Priority: ipv6_token > IPv6 > UPnP > STUN full_cone/restricted > any STUN > public > LAN > VPN-routed > fallback.
+    When same_lan is True, LAN candidates are promoted above non-token IPv6
+    because LAN IPs are stable while SLAAC privacy addresses rotate.
     """
     if not candidates_json:
         return fallback_endpoint
@@ -1929,11 +1940,19 @@ def _select_best_endpoint(candidates_json: str | None, fallback_endpoint: str) -
     # Sort by priority field
     candidates.sort(key=lambda c: c.get("priority", 999))
 
-    # 0. IPv6 token candidate (Phase 5B — deterministic, highest priority)
+    # 0. IPv6 token candidate (Phase 5B — deterministic, highest priority always)
     for c in candidates:
         if c.get("type") == "ipv6_token":
             log.info(f"  Best endpoint: IPv6 token {c['endpoint']} (deterministic, no NAT)")
             return c["endpoint"]
+
+    # 0.5. Same-LAN shortcut: if both peers share a subnet, prefer LAN
+    # over non-token IPv6 because SLAAC privacy addresses rotate
+    if same_lan:
+        for c in candidates:
+            if c.get("type") == "lan":
+                log.info(f"  Best endpoint: LAN {c['endpoint']} (same subnet, stable)")
+                return c["endpoint"]
 
     # 1. IPv6 candidate (Phase 3 — no NAT involved, direct connection)
     for c in candidates:
@@ -2276,9 +2295,8 @@ async def mesh_request(req: MeshHandshakeRequest):
     else:
         initiator_endpoint = ""
 
-    # Phase 1: Use _select_best_endpoint if candidates provided
     if req.initiator_candidates:
-        initiator_endpoint = _select_best_endpoint(req.initiator_candidates, initiator_endpoint)
+        initiator_endpoint = _select_best_endpoint(req.initiator_candidates, initiator_endpoint, same_lan=same_lan)
 
     # Store the mesh tunnel record
     with get_db() as conn:
@@ -2582,8 +2600,21 @@ async def mesh_update_candidates(req: MeshUpdateCandidatesRequest):
     else:
         raise HTTPException(403, "You are not part of this mesh tunnel")
 
-    # Pick the best endpoint from the fresh candidates
-    new_endpoint = _select_best_endpoint(req.candidates, tunnel[col_endpoint] or "")
+    # Detect same-LAN from the candidate list — if a LAN candidate exists
+    # and the current best is also a LAN IP, preserve LAN preference
+    has_lan_candidate = False
+    try:
+        cands = json.loads(req.candidates) if isinstance(req.candidates, str) else req.candidates
+        has_lan_candidate = any(c.get("type") == "lan" for c in (cands or []))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Check if the OTHER side's endpoint is also a LAN IP
+    other_col = "target_endpoint" if col_endpoint == "initiator_endpoint" else "initiator_endpoint"
+    other_ep = tunnel[other_col] or ""
+    other_is_lan = any(other_ep.startswith(p) for p in (
+        "192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31."))
+    same_lan_hint = has_lan_candidate and other_is_lan
+    new_endpoint = _select_best_endpoint(req.candidates, tunnel[col_endpoint] or "", same_lan=same_lan_hint)
 
     with get_db() as conn:
         conn.execute(
