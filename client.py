@@ -3595,6 +3595,8 @@ class QuantumVPNService:
         Only tries the local URL (same-LAN trust) to limit MITM exposure.
         Falls back to public URL only if local is not configured.
         """
+        global CERT_FINGERPRINT, _session
+
         check_url = self.local_url or self.public_url
         if not check_url:
             return
@@ -3640,7 +3642,6 @@ class QuantumVPNService:
                 f"  Updating pinned fingerprint and recreating TLS session."
             )
 
-            global CERT_FINGERPRINT, _session
             CERT_FINGERPRINT = new_fp
             save_fingerprint(new_fp)
 
