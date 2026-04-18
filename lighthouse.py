@@ -186,11 +186,15 @@ def request_entropy_from_vault(nbytes: int = 64, timeout: float = 10.0) -> bytes
     return None
 
 
-def generate_self_signed_cert(config: dict) -> tuple[str, str]:
+def generate_self_signed_cert(config: dict, force: bool = False) -> tuple[str, str]:
     """
     Generate a self-signed TLS certificate.
     Uses ESP32 entropy via Vault UART if available, falls back to OS entropy.
     Returns (cert_path, fingerprint).
+
+    If a valid cert already exists and force=False, returns the existing cert's
+    fingerprint without regenerating. This prevents accidental cert rotation
+    that would break all enrolled clients' pinned fingerprints.
     """
     from cryptography import x509
     from cryptography.x509.oid import NameOID
@@ -207,6 +211,24 @@ def generate_self_signed_cert(config: dict) -> tuple[str, str]:
     subject_name = tls_cfg.get("cert_subject", "The Lighthouse")
 
     Path(cert_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Check if a valid cert already exists — don't overwrite unless forced
+    if not force and Path(cert_path).exists() and Path(key_path).exists():
+        try:
+            cert_pem = Path(cert_path).read_bytes()
+            existing_cert = x509.load_pem_x509_certificate(cert_pem)
+            # Check if cert is still valid (not expired)
+            now = dt.datetime.now(dt.timezone.utc)
+            if existing_cert.not_valid_after_utc > now:
+                days_remaining = (existing_cert.not_valid_after_utc - now).days
+                der_bytes = existing_cert.public_bytes(serialization.Encoding.DER)
+                fingerprint = hashlib.sha256(der_bytes).hexdigest()
+                log.info(f"TLS certificate already exists and is valid ({days_remaining}d remaining)")
+                log.info(f"Fingerprint: {fingerprint}")
+                log.info(f"Use --force or force=True to regenerate (will break enrolled clients!)")
+                return cert_path, fingerprint
+        except Exception as e:
+            log.warning(f"Existing cert is invalid or unreadable ({e}) — regenerating")
 
     # Try to get ESP32 entropy from the Vault
     esp32_entropy = None
@@ -291,7 +313,6 @@ def generate_self_signed_cert(config: dict) -> tuple[str, str]:
     log.info(f"    --lighthouse-local {config.get('local_server_url', '')}")
 
     return cert_path, fingerprint
-
 
 def display_cert_fingerprint(config: dict) -> str | None:
     """Display the current cert fingerprint on startup. Returns fingerprint or None."""

@@ -1196,31 +1196,51 @@ def settings_menu():
                 enrollment_wizard()
 
         elif choice == "5":
-            print(f"\n  {RED}WARNING: This will delete ALL Cobra data:{RESET}")
+            print(f"\n  {RED}WARNING: This will delete ALL Cobra user data:{RESET}")
             print(f"    - Enrollment credentials")
             print(f"    - WireGuard keys and configs")
             print(f"    - Client state and mesh peers")
             print(f"    - Identity config and backup")
+            print(f"    - Log files")
+            print(f"\n  {DIM}(Program files in bin/ will not be removed){RESET}")
             confirm = input(f"\n  Type 'DELETE' to confirm: ").strip()
             if confirm == "DELETE":
                 # Stop service
                 if get_service_status() == "running":
                     stop_service()
-                # Remove data
-                if COBRATAIL_DIR.exists():
-                    shutil.rmtree(COBRATAIL_DIR, ignore_errors=True)
+                # Remove only user data directories, NOT bin/ or install markers
+                # This preserves the launcher, client scripts, and .deb package state
+                for data_subdir in [CONFIG_DIR, DATA_DIR, LOG_DIR]:
+                    if data_subdir.exists() and data_subdir != COBRATAIL_DIR and data_subdir != BIN_DIR:
+                        shutil.rmtree(data_subdir, ignore_errors=True)
+                        print(f"    Removed {data_subdir}")
+                # If using flat layout (all dirs are COBRATAIL_DIR), selectively
+                # delete known data files instead of the whole directory
+                if CONFIG_DIR == COBRATAIL_DIR:
+                    for data_file in [
+                        ENROLLMENT_PATH, STATE_PATH, IDENTITY_PATH,
+                        IDENTITY_BACKUP_PATH, MESH_PEERS_PATH,
+                        CERT_FINGERPRINT_PATH,
+                        COBRATAIL_DIR / "client_id",
+                        COBRATAIL_DIR / "wg_quantum.conf",
+                        COBRATAIL_DIR / "wg_mesh.conf",
+                        COBRATAIL_DIR / "client_state.json",
+                    ]:
+                        if data_file.exists():
+                            data_file.unlink(missing_ok=True)
+                            print(f"    Removed {data_file.name}")
                 # Also clean up legacy dir
                 legacy = Path.home() / ".quantum_vpn"
                 if legacy.exists():
                     shutil.rmtree(legacy, ignore_errors=True)
-                print(f"  {GREEN}All data removed. Run 'cobra' to re-enroll.{RESET}")
+                    print(f"    Removed legacy dir {legacy}")
+                print(f"\n  {GREEN}All user data removed. Run 'cobra' to re-enroll.{RESET}")
             else:
                 print(f"  {DIM}Cancelled{RESET}")
             pause()
 
         elif choice == "0":
             break
-
 
 # =============================================================================
 # UPDATE FROM GITHUB

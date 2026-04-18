@@ -1315,19 +1315,40 @@ def load_state() -> dict:
 
 
 def probe_lighthouse(url: str) -> bool:
-    """Check if a Lighthouse URL is reachable."""
+    """Check if a Lighthouse URL is reachable.
+    Distinguishes between network failures and TLS cert pin mismatches
+    so operators can diagnose cert rotation issues from logs.
+    """
     try:
         resp = get_session().get(f"{url}/api/v1/health", timeout=ENDPOINT_PROBE_TIMEOUT)
         return resp.status_code == 200
-    except Exception:
+    except ssl.SSLError as e:
+        err_msg = str(e)
+        if "FINGERPRINT MISMATCH" in err_msg:
+            log.error(
+                f"Probe {url} — CERT FINGERPRINT MISMATCH. "
+                f"The Lighthouse TLS certificate has changed (was it restarted/regenerated?). "
+                f"Will attempt auto-heal on next reconnect cycle."
+            )
+        else:
+            log.warning(f"Probe {url} — TLS error: {e}")
         return False
-
+    except requests.ConnectionError as e:
+        log.debug(f"Probe {url} — connection refused or unreachable")
+        return False
+    except Exception as e:
+        log.debug(f"Probe {url} — failed: {type(e).__name__}: {e}")
+        return False
 
 def select_lighthouse(public_url: str, local_url: str = None) -> tuple[str, bool]:
     """
     Pick the best Lighthouse endpoint.
     Returns (url, is_local).
     Tries local first — if it responds, we're on the home LAN.
+
+    Hairpin NAT detection: if our public IP matches the Lighthouse's
+    public host, the public URL will almost certainly fail. Retry local
+    with an extended timeout before giving up.
     """
     if local_url:
         log.info(f"Probing local Lighthouse at {local_url}...")
@@ -1336,9 +1357,53 @@ def select_lighthouse(public_url: str, local_url: str = None) -> tuple[str, bool
             return local_url, True
         log.info("Local Lighthouse not reachable — falling back to public")
 
+    # Hairpin NAT detection: if our public IP matches the Lighthouse's
+    # public host, we're behind the same router. The public URL will
+    # almost certainly fail, so retry local with a longer timeout.
+    if local_url:
+        try:
+            public_host = public_url.split("://")[1].split(":")[0]
+            our_public_ip = get_public_ip()
+            if our_public_ip and our_public_ip == public_host:
+                log.warning(
+                    f"Hairpin NAT detected — our public IP ({our_public_ip}) "
+                    f"matches Lighthouse host. Public endpoint will likely fail. "
+                    f"Retrying local with extended timeout..."
+                )
+                for attempt in range(3):
+                    try:
+                        resp = get_session().get(
+                            f"{local_url}/api/v1/health",
+                            timeout=ENDPOINT_PROBE_TIMEOUT * 3,
+                        )
+                        if resp.status_code == 200:
+                            log.info(f"Local Lighthouse reached on extended probe (attempt {attempt + 1})")
+                            return local_url, True
+                    except ssl.SSLError as e:
+                        if "FINGERPRINT MISMATCH" in str(e):
+                            log.error(
+                                f"Hairpin NAT + CERT MISMATCH: Lighthouse is reachable on LAN "
+                                f"but cert fingerprint changed. Auto-heal will fix this."
+                            )
+                            break  # Don't retry — cert mismatch won't fix itself with retries
+                        log.debug(f"Extended local probe attempt {attempt + 1} TLS error: {e}")
+                    except Exception as e:
+                        log.debug(f"Extended local probe attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(2)
+
+                log.error(
+                    f"Hairpin NAT: local Lighthouse at {local_url} unreachable after retries. "
+                    f"Public fallback will also fail. Check: "
+                    f"1) Is the Lighthouse process running? "
+                    f"2) Has the TLS cert been regenerated? (fingerprint mismatch) "
+                    f"3) Is port 8443 open in the firewall?"
+                )
+        except Exception as e:
+            log.debug(f"Hairpin NAT check error: {e}")
+
     log.info(f"Using public Lighthouse at {public_url}")
     return public_url, False
-
 
 def get_wireguard_endpoint(is_local: bool, public_url: str, local_url: str,
                            wg_port: int) -> str:
@@ -2895,23 +2960,29 @@ def _wireguard_down():
             )
         else:
             # Linux: hardened three-step teardown.
-            # 1. Clean path — wg-quick down handles routes, DNS, and the interface
-            #    itself when state is consistent.
+            # 1. Try wg-quick down with the config file path first (most reliable
+            #    when wg-quick created the interface and has its state file).
+            conf_path = CONFIG_DIR / "wg_quantum.conf"
+            if conf_path.exists():
+                subprocess.run(
+                    ["wg-quick", "down", str(conf_path)],
+                    capture_output=True,
+                )
+            # 2. Also try by interface name (catches cases where the config
+            #    path doesn't match what wg-quick expects).
             subprocess.run(
                 ["wg-quick", "down", interface_name],
                 capture_output=True,
             )
-            # 2. Nuke any ghost interface left behind if wg-quick failed
+            # 3. Nuke any ghost interface left behind if wg-quick failed
             #    partway through (e.g., crashed mid-teardown, or interface
-            #    exists but wg-quick's state file is gone). Silent if the
-            #    interface doesn't exist.
+            #    exists but wg-quick's state file is gone).
             subprocess.run(
                 ["ip", "link", "delete", "dev", interface_name],
                 capture_output=True,
             )
-            # 3. Clean orphaned resolvconf entries that wg-quick may have
-            #    left behind. Silent if resolvconf isn't installed or there's
-            #    nothing to clean.
+            # 4. Clean orphaned resolvconf entries that wg-quick may have
+            #    left behind.
             subprocess.run(
                 ["resolvconf", "-d", interface_name, "-f"],
                 capture_output=True,
@@ -3119,7 +3190,12 @@ class QuantumVPNService:
 
         # Initial connection with retry — don't enter service loop dead
         startup_delay = RECONNECT_DELAY
+        startup_attempts = 0
         while self._running and not self._full_connect():
+            startup_attempts += 1
+            # Every 3 failures, try to auto-heal cert fingerprint mismatch
+            if startup_attempts % 3 == 0:
+                self._try_auto_heal_fingerprint()
             log.warning(f"Initial connection failed — retrying in {startup_delay:.0f}s...")
             time.sleep(startup_delay)
             startup_delay = min(startup_delay * RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_DELAY)
@@ -3389,7 +3465,13 @@ class QuantumVPNService:
                 return False
 
         except Exception as e:
-            log.error(f"Connection failed: {e}")
+            msg = str(e)
+            if msg:
+                log.error(f"Connection failed: {e}")
+            else:
+                log.error(f"Connection failed: {type(e).__name__} (no message)")
+            import traceback
+            log.debug(traceback.format_exc())
             return False
 
     def _check_network_change(self) -> None:
@@ -3453,9 +3535,32 @@ class QuantumVPNService:
         """Handle a lost connection to the Lighthouse with exponential backoff.
         Escalates: 10s → 20s → 40s → 60s → 120s (capped).
         Resets to base delay on successful reconnect.
+
+        On persistent failures, attempts to auto-heal cert fingerprint mismatches
+        by fetching the new fingerprint from the Lighthouse (trusted on LAN).
+        Also resets VPN-internal URLs that are unreachable when tunnel is down.
         """
         self.connected = False
         self._consecutive_failures += 1
+
+        # If the lighthouse_url was switched to VPN-internal (10.x.x.x) after
+        # connect, it's unreachable now that the tunnel is down. Reset so
+        # _full_connect will re-probe local vs public.
+        if self.lighthouse_url and "://" in self.lighthouse_url:
+            lh_host = self.lighthouse_url.split("://")[1].split(":")[0]
+            if lh_host.startswith("10.") or lh_host.startswith("100."):
+                log.info(
+                    f"Connection lost — VPN-internal URL ({self.lighthouse_url}) "
+                    f"unreachable without tunnel. Resetting to public/local."
+                )
+                self.lighthouse_url = self.public_url
+                self.is_local = False
+
+        # Every 3 failures, try to auto-heal cert fingerprint mismatch.
+        # If the Lighthouse regenerated its TLS cert, our pinned fingerprint is
+        # stale and EVERY request fails silently. This detects and fixes that.
+        if self._consecutive_failures > 0 and self._consecutive_failures % 3 == 0:
+            self._try_auto_heal_fingerprint()
 
         delay = self._reconnect_delay
         log.info(f"Attempting reconnect in {delay:.0f}s (attempt #{self._consecutive_failures})...")
@@ -3476,6 +3581,86 @@ class QuantumVPNService:
                 f"Reconnect failed — next attempt in {self._reconnect_delay:.0f}s "
                 f"(will retry on next heartbeat cycle)"
             )
+
+    def _try_auto_heal_fingerprint(self) -> None:
+        """Attempt to detect and fix a stale TLS cert fingerprint.
+
+        If the Lighthouse regenerated its certificate, our pinned fingerprint
+        won't match and every HTTPS request fails silently with SSLError.
+        This method:
+          1. Connects to the Lighthouse WITHOUT pinning to check reachability
+          2. Fetches the new fingerprint from /api/v1/tls/fingerprint
+          3. Updates the pin, saves to disk, and recreates the TLS session
+
+        Only tries the local URL (same-LAN trust) to limit MITM exposure.
+        Falls back to public URL only if local is not configured.
+        """
+        check_url = self.local_url or self.public_url
+        if not check_url:
+            return
+
+        log.info(f"Auto-heal: checking if cert fingerprint has changed on {check_url}...")
+
+        try:
+            # Create an unpinned session to test raw connectivity
+            import urllib3 as _urllib3
+            _urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
+            test_session = requests.Session()
+            test_session.verify = False
+
+            # Step 1: Can we reach the Lighthouse at all without cert pinning?
+            resp = test_session.get(f"{check_url}/api/v1/health", timeout=8)
+            if resp.status_code != 200:
+                log.debug("Auto-heal: Lighthouse not reachable even without pinning")
+                return
+
+            log.info("Auto-heal: Lighthouse reachable without cert pin — checking fingerprint...")
+
+            # Step 2: Fetch the current cert fingerprint from the Lighthouse
+            resp_fp = test_session.get(f"{check_url}/api/v1/tls/fingerprint", timeout=5)
+            if resp_fp.status_code != 200:
+                log.debug("Auto-heal: /api/v1/tls/fingerprint endpoint not available")
+                return
+
+            new_fp = resp_fp.json().get("fingerprint", "")
+            if not new_fp:
+                log.debug("Auto-heal: empty fingerprint returned")
+                return
+
+            current_fp = CERT_FINGERPRINT
+            if new_fp == current_fp:
+                log.debug("Auto-heal: fingerprint unchanged — connection problem is elsewhere")
+                return
+
+            # Fingerprint HAS changed — update everything
+            log.warning(
+                f"Auto-heal: CERT FINGERPRINT CHANGED on Lighthouse.\n"
+                f"  Old: {current_fp[:16]}...\n"
+                f"  New: {new_fp[:16]}...\n"
+                f"  Updating pinned fingerprint and recreating TLS session."
+            )
+
+            global CERT_FINGERPRINT, _session
+            CERT_FINGERPRINT = new_fp
+            save_fingerprint(new_fp)
+
+            # Update enrollment file so the new fingerprint persists across restarts
+            if ENROLLMENT_PATH.exists():
+                try:
+                    enrollment = json.loads(ENROLLMENT_PATH.read_text())
+                    enrollment["cert_fingerprint"] = new_fp
+                    enrollment["fingerprint_updated_at"] = datetime.now(timezone.utc).isoformat()
+                    ENROLLMENT_PATH.write_text(json.dumps(enrollment, indent=2))
+                    log.info("Auto-heal: enrollment file updated with new fingerprint")
+                except Exception as e:
+                    log.warning(f"Auto-heal: could not update enrollment file: {e}")
+
+            # Recreate the pinned session with the new fingerprint
+            _session = create_pinned_session(new_fp)
+            log.info("Auto-heal: TLS session recreated with new fingerprint — next connect should succeed")
+
+        except Exception as e:
+            log.debug(f"Auto-heal: failed — {type(e).__name__}: {e}")
 
     def _shutdown(self) -> None:
         """Clean shutdown."""
