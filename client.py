@@ -1424,14 +1424,25 @@ def get_wireguard_endpoint(is_local: bool, public_url: str, local_url: str,
 # ─── Lighthouse Communication ────────────────────────────────────────────────
 
 
-def register(lighthouse_url: str, wg_pubkey: str, lan_ip: str = None) -> dict:
+def register(lighthouse_url: str, wg_pubkey: str, lan_ip: str = None, is_local: bool = False) -> dict:
     """Register this client with the Lighthouse."""
     client_id = get_client_id()
 
     # Detect public IP for cross-network mesh endpoint resolution
-    public_ip = get_public_ip()
-    if public_ip:
-        log.info(f"Detected public IP: {public_ip}")
+    # Skip on LAN connections — STUN/DNS can hang on machines with flaky networking
+    public_ip = None
+    if not is_local:
+        public_ip = get_public_ip()
+        if public_ip:
+            log.info(f"Detected public IP: {public_ip}")
+    else:
+        # Use cached value if available, but don't block on it
+        global _cached_public_ip
+        public_ip = _cached_public_ip
+        if public_ip:
+            log.info(f"Using cached public IP: {public_ip}")
+        else:
+            log.info("LAN connection — skipping public IP detection")
 
     # Phase 5C CL2: Load IPv6 token identity
     identity = _load_ipv6_token_identity()
@@ -3364,7 +3375,7 @@ class QuantumVPNService:
             vault_error = None
 
             def _do_register():
-                return register(self.lighthouse_url, self.wg_pubkey, lan_ip)
+                return register(self.lighthouse_url, self.wg_pubkey, lan_ip, is_local=self.is_local)
 
             def _do_fetch_vault_key():
                 return fetch_vault_public_key(self.lighthouse_url)
@@ -3465,13 +3476,13 @@ class QuantumVPNService:
                 return False
 
         except Exception as e:
-            msg = str(e)
+            msg = str(e).strip()
             if msg:
-                log.error(f"Connection failed: {e}")
+                log.error(f"Connection failed: {type(e).__name__}: {e}")
             else:
                 log.error(f"Connection failed: {type(e).__name__} (no message)")
             import traceback
-            log.debug(traceback.format_exc())
+            log.error(f"Traceback:\n{traceback.format_exc()}")
             return False
 
     def _check_network_change(self) -> None:
