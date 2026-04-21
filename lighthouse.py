@@ -63,6 +63,49 @@ logging.basicConfig(
 )
 log = logging.getLogger("lighthouse")
 
+
+# ─── Sentinel Notification ───────────────────────────────────────────────────
+# Fire-and-forget: pushes error events to the Cobra Sentinel for AI diagnosis.
+# Does nothing if the Sentinel service isn't running.
+
+import socket as _socket
+
+SENTINEL_SOCKET_PATH = "/tmp/cobra-sentinel.sock"
+SENTINEL_TCP_PORT = 9877
+
+def notify_sentinel(error_msg: str, component: str = "general", **extra_context) -> None:
+    """
+    Push an error event to the Cobra Sentinel for AI diagnosis.
+    Non-blocking, fire-and-forget. Does nothing if Sentinel isn't running.
+    """
+    event = json.dumps({
+        "source": "lighthouse",
+        "severity": "error",
+        "error": error_msg,
+        "context": {
+            "component": component,
+            **extra_context,
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }) + "\n"
+
+    def _send():
+        try:
+            if sys.platform == "win32":
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect(("127.0.0.1", SENTINEL_TCP_PORT))
+            else:
+                sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect(SENTINEL_SOCKET_PATH)
+            sock.sendall(event.encode("utf-8"))
+            sock.close()
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            pass  # Sentinel not running — that's fine
+
+    threading.Thread(target=_send, daemon=True, name="sentinel-notify").start()
+
 # ─── Global Config ───────────────────────────────────────────────────────────
 
 CONFIG: dict = {}
@@ -705,6 +748,11 @@ def rotate_peer_psk(device_id: str, wg_pubkey: str, vpn_address: str) -> bool:
     full HKDF info string and re-derives the same PSK independently."""
     if oqs is None:
         log.error("liboqs not available — cannot rotate PSK")
+        notify_sentinel(
+            "liboqs not available — cannot rotate PSK",
+            component="psk_rotation",
+            device_id=device_id,
+        )
         return False
 
     with get_db() as conn:
@@ -714,6 +762,11 @@ def rotate_peer_psk(device_id: str, wg_pubkey: str, vpn_address: str) -> bool:
 
     if not vault:
         log.error("No online vault — cannot rotate PSK")
+        notify_sentinel(
+            "No online vault — cannot rotate PSK",
+            component="vault",
+            device_id=device_id,
+        )
         return False
 
     try:
@@ -751,6 +804,12 @@ def rotate_peer_psk(device_id: str, wg_pubkey: str, vpn_address: str) -> bool:
 
     except Exception as e:
         log.error(f"PSK rotation failed for {device_id}: {e}")
+        notify_sentinel(
+            f"PSK rotation failed for {device_id}: {e}",
+            component="psk_rotation",
+            device_id=device_id,
+            vpn_address=vpn_address,
+        )
         return False
 
 def rotate_all_peers() -> dict:
@@ -839,9 +898,12 @@ def key_rotation_thread() -> None:
 
         except Exception as e:
             log.error(f"Key rotation cycle failed: {e}")
+            notify_sentinel(
+                f"Key rotation cycle failed: {e}",
+                component="key_rotation",
+            )
 
         time.sleep(rotation_seconds)
-
 
 # ─── Vault UART Thread ──────────────────────────────────────────────────────
 
@@ -939,6 +1001,11 @@ def vault_uart_thread() -> None:
 
         except Exception as e:
             log.error(f"Vault UART error: {e} — reconnecting in 5s")
+            notify_sentinel(
+                f"Vault UART link lost: {e}",
+                component="uart",
+                uart_device=device,
+            )
             if vault_uart:
                 try:
                     vault_uart.close()
@@ -1023,6 +1090,11 @@ def send_to_vault(msg_type: str, data: dict) -> bool:
         return True
     except Exception as e:
         log.error(f"Failed to queue message for Vault: {e}")
+        notify_sentinel(
+            f"Failed to queue message for Vault: {e}",
+            component="vault",
+            msg_type=msg_type,
+        )
         return False
 
 # ─── Pending PSK Store (for client-side encap) ──────────────────────────────
@@ -2915,18 +2987,21 @@ def main():
             print("\n  No nodes enrolled or pending.\n")
             return
 
-        # Look up VPN and mesh addresses from the peers table
-        peer_addrs = {}
+        # Look up VPN and mesh addresses + last_seen from the peers table
+        peer_info = {}
         with get_db() as conn:
             for prow in conn.execute(
-                "SELECT device_id, vpn_address, mesh_address FROM peers"
+                "SELECT device_id, vpn_address, mesh_address, last_seen FROM peers"
             ).fetchall():
-                peer_addrs[prow["device_id"]] = {
+                peer_info[prow["device_id"]] = {
                     "vpn": prow["vpn_address"] or "—",
                     "mesh": prow["mesh_address"] or "—",
+                    "last_seen": prow["last_seen"] or 0,
                 }
 
         now = time.time()
+        peer_timeout = CONFIG.get("peer_timeout", 120)
+
         print()
         print(f"  {'Name':<18} {'Status':<12} {'Device ID':<18} {'VPN IP':<16} {'Mesh IP':<16} {'Info'}")
         print(f"  {'─'*18} {'─'*12} {'─'*18} {'─'*16} {'─'*16} {'─'*30}")
@@ -2935,14 +3010,33 @@ def main():
             status = row["status"]
             device_id = row["device_id"] or "—"
 
-            addrs = peer_addrs.get(device_id, {"vpn": "—", "mesh": "—"})
+            info_entry = peer_info.get(device_id, {"vpn": "—", "mesh": "—", "last_seen": 0})
 
             if status == "pending" and now > row["expires_at"]:
                 status = "expired"
 
             if status == "used":
-                icon = "●"
-                info = f"enrolled {row['used_at'] or ''}"
+                last_seen = info_entry["last_seen"]
+                is_online = (now - last_seen) < peer_timeout if last_seen else False
+                if is_online:
+                    icon = "\033[92m●\033[0m"  # green
+                    ago = int(now - last_seen)
+                    if ago < 60:
+                        seen_str = f"{ago}s ago"
+                    else:
+                        seen_str = f"{ago // 60}m ago"
+                    info = f"online (seen {seen_str})"
+                else:
+                    icon = "\033[91m●\033[0m"  # red
+                    if last_seen:
+                        ago = int(now - last_seen)
+                        if ago < 3600:
+                            seen_str = f"{ago // 60}m ago"
+                        else:
+                            seen_str = f"{ago // 3600}h ago"
+                        info = f"offline (last seen {seen_str})"
+                    else:
+                        info = f"offline (never connected)"
             elif status == "pending":
                 remaining = int(row["expires_at"] - now)
                 mins = remaining // 60
@@ -2956,7 +3050,7 @@ def main():
                 icon = "?"
                 info = status
 
-            print(f"  {icon} {name:<16} {status:<12} {device_id:<18} {addrs['vpn']:<16} {addrs['mesh']:<16} {info}")
+            print(f"  {icon} {name:<16} {status:<12} {device_id:<18} {info_entry['vpn']:<16} {info_entry['mesh']:<16} {info}")
         print()
         return
 
@@ -3104,6 +3198,10 @@ def main():
     except Exception as e:
         log.error(f"WireGuard setup failed: {e}")
         log.info("Continuing without WireGuard — tunnel management disabled")
+        notify_sentinel(
+            f"WireGuard setup failed on startup: {e}",
+            component="wireguard",
+        )
 
     uart_thread = threading.Thread(target=vault_uart_thread, daemon=True)
     uart_thread.start()

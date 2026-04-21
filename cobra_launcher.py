@@ -133,6 +133,9 @@ UPDATABLE_FILES = {
     "client.py":            BIN_DIR / "client.py",
     "cobra_launcher.py":    BIN_DIR / "cobra_launcher.py",
     "identity_manager.py":  BIN_DIR / "identity_manager.py",
+    "cobra_sentinel.py":    BIN_DIR / "cobra_sentinel.py",
+    "version.txt":          COBRATAIL_DIR / "version.txt",
+    "troubleshooting.md":   CONFIG_DIR / "troubleshooting.md",
 }
 
 VERSION_FILE = COBRATAIL_DIR / "version.txt"

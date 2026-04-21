@@ -5,7 +5,7 @@ This script is bundled into CobraTailSetup.exe by PyInstaller.
 When the user runs the .exe, this script:
   1. Checks for admin privileges
   2. Installs program files to C:\Program Files\CobraTail\
-  3. Creates config/data/logs directories
+  3. Creates config/data/logs/models directories
   4. Installs dependencies (Python packages, WireGuard, oqs.dll)
   5. Creates Start Menu + Desktop shortcuts
   6. Registers in Apps & Features (Add/Remove Programs)
@@ -78,6 +78,7 @@ CONFIG_DIR = INSTALL_DIR / "config"
 DATA_DIR = INSTALL_DIR / "data"
 LOG_DIR = INSTALL_DIR / "logs"
 LIB_DIR = BIN_DIR / "lib"
+MODELS_DIR = INSTALL_DIR / "models"
 
 # Registry keys
 UNINSTALL_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\CobraTail"
@@ -88,7 +89,7 @@ START_MENU_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Micro
 DESKTOP_SHORTCUT = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "Desktop" / f"{APP_NAME}.lnk"
 
 # What we're installing
-PAYLOAD_PY_FILES = ["client.py", "cobra_launcher.py", "identity_manager.py"]
+PAYLOAD_PY_FILES = ["client.py", "cobra_launcher.py", "identity_manager.py", "cobra_sentinel.py"]
 PAYLOAD_DEPS_SCRIPT = "setup_deps.ps1"
 
 # WireGuard
@@ -227,7 +228,7 @@ def migrate_old_installation():
 
 def install_directories():
     """Create the CobraTail directory structure."""
-    for d in [INSTALL_DIR, BIN_DIR, LIB_DIR, CONFIG_DIR, DATA_DIR, LOG_DIR]:
+    for d in [INSTALL_DIR, BIN_DIR, LIB_DIR, CONFIG_DIR, DATA_DIR, LOG_DIR, MODELS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Write a marker so we know this is a managed install
@@ -243,10 +244,11 @@ def install_directories():
     ok(f"  config/  — enrollment, certs, keys")
     ok(f"  data/    — runtime state")
     ok(f"  logs/    — client logs")
+    ok(f"  models/  — LLM model for AI diagnostics")
 
 
 def install_program_files():
-    """Copy Python scripts and oqs.dll from the payload."""
+    """Copy Python scripts, oqs.dll, and LLM model from the payload."""
     payload = get_payload_dir()
 
     for filename in PAYLOAD_PY_FILES:
@@ -266,6 +268,26 @@ def install_program_files():
         ok("Installed oqs.dll")
     else:
         warn("oqs.dll not bundled — will attempt to build during dependency setup")
+
+    # Copy .gguf model if bundled
+    model_src = payload / "models"
+    if model_src.exists():
+        for gguf in model_src.glob("*.gguf"):
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(gguf), str(MODELS_DIR / gguf.name))
+            ok(f"Installed LLM model: {gguf.name}")
+            # Write model path into sentinel config
+            sentinel_cfg = CONFIG_DIR / "sentinel_config.json"
+            cfg = {}
+            if sentinel_cfg.exists():
+                try:
+                    cfg = json.loads(sentinel_cfg.read_text())
+                except Exception:
+                    pass
+            cfg["llm_model_path"] = str(MODELS_DIR / gguf.name)
+            sentinel_cfg.write_text(json.dumps(cfg, indent=2))
+            ok("Configured LLM model path in sentinel_config.json")
+            break  # only install one model
 
     # Write version file
     version_file = INSTALL_DIR / "version.txt"
@@ -707,9 +729,11 @@ def uninstall(quiet: bool = False):
     # Remove install directory
     info("Removing program files...")
     if keep_data:
-        # Remove only bin/ and leave config/data/logs
+        # Remove only bin/ and models/, leave config/data/logs
         if BIN_DIR.exists():
             shutil.rmtree(str(BIN_DIR), ignore_errors=True)
+        if MODELS_DIR.exists():
+            shutil.rmtree(str(MODELS_DIR), ignore_errors=True)
         # Remove non-data files
         for f in INSTALL_DIR.glob("*"):
             if f.is_file():

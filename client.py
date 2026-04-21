@@ -285,6 +285,48 @@ log = logging.getLogger("client")
 _physical_ip_cache = {"ip": "", "timestamp": 0.0}
 _PHYSICAL_IP_CACHE_TTL = 30.0  # Re-check every 30 seconds
 
+# ─── Sentinel Notification ───────────────────────────────────────────────────
+# Fire-and-forget: if the Sentinel is running, it gets the event instantly.
+# If it's not running, the connection fails silently and we move on.
+
+SENTINEL_SOCKET_PATH = "/tmp/cobra-sentinel.sock"
+SENTINEL_TCP_PORT = 9877
+
+def notify_sentinel(error_msg: str, component: str = "general", **extra_context) -> None:
+    """
+    Push an error event to the Cobra Sentinel for AI diagnosis.
+    Non-blocking, fire-and-forget. Does nothing if Sentinel isn't running.
+    """
+    event = json.dumps({
+        "source": "client",
+        "severity": "error",
+        "error": error_msg,
+        "context": {
+            "component": component,
+            "device_id": get_client_id() if CLIENT_ID_PATH.exists() else "unknown",
+            **extra_context,
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }) + "\n"
+
+    def _send():
+        try:
+            if platform.system() == "Windows":
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect(("127.0.0.1", SENTINEL_TCP_PORT))
+            else:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect(SENTINEL_SOCKET_PATH)
+            sock.sendall(event.encode("utf-8"))
+            sock.close()
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            pass  # Sentinel not running — that's fine
+
+    # Don't block the client's main loop
+    threading.Thread(target=_send, daemon=True, name="sentinel-notify").start()
+
 # ─── TLS Certificate Pinning ────────────────────────────────────────────────
 
 CERT_FINGERPRINT = ""
@@ -3208,11 +3250,21 @@ class QuantumVPNService:
             if startup_attempts % 3 == 0:
                 self._try_auto_heal_fingerprint()
             log.warning(f"Initial connection failed — retrying in {startup_delay:.0f}s...")
+            notify_sentinel(
+                f"Initial connection failed (attempt #{startup_attempts}) — retrying in {startup_delay:.0f}s",
+                component="startup",
+                startup_attempts=startup_attempts,
+                lighthouse_public=self.public_url or "",
+                lighthouse_local=self.local_url or "",
+            )
             time.sleep(startup_delay)
             startup_delay = min(startup_delay * RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_DELAY)
 
         if not self._running:
             return
+
+        # Rehydrate mesh peer state from disk + Lighthouse
+        self._rehydrate_mesh_state()
 
         # Start LAN discovery if we have a VPN address
         if self.vpn_address:
@@ -3253,6 +3305,11 @@ class QuantumVPNService:
                         hb_result = send_heartbeat(self.lighthouse_url)
                         if not hb_result:
                             log.warning("Heartbeat failed — connection may be lost")
+                            notify_sentinel(
+                                "Heartbeat failed — connection may be lost",
+                                component="heartbeat",
+                                lighthouse_url=self.lighthouse_url or "",
+                            )
                             self._handle_connection_loss()
                         else:
                             # Heartbeat succeeded — reset backoff state
@@ -3424,6 +3481,11 @@ class QuantumVPNService:
                 vault = discover_vault(self.lighthouse_url)
                 if not vault:
                     log.error("No vault available — will retry")
+                    notify_sentinel(
+                        "No vault available for KEM handshake",
+                        component="vault",
+                        lighthouse_url=self.lighthouse_url or "",
+                    )
                     return False
                 handshake = initiate_handshake(self.lighthouse_url, vault["device_id"])
 
@@ -3473,6 +3535,11 @@ class QuantumVPNService:
                 return True
             else:
                 log.error("Tunnel failed to come up")
+                notify_sentinel(
+                    "WireGuard tunnel failed to come up",
+                    component="wireguard",
+                    lighthouse_url=self.lighthouse_url or "",
+                )
                 return False
 
         except Exception as e:
@@ -3483,6 +3550,11 @@ class QuantumVPNService:
                 log.error(f"Connection failed: {type(e).__name__} (no message)")
             import traceback
             log.error(f"Traceback:\n{traceback.format_exc()}")
+            notify_sentinel(
+                f"Connection failed: {type(e).__name__}: {msg or 'no details'}",
+                component="tunnel",
+                lighthouse_url=self.lighthouse_url or "",
+            )
             return False
 
     def _check_network_change(self) -> None:
@@ -3553,6 +3625,15 @@ class QuantumVPNService:
         """
         self.connected = False
         self._consecutive_failures += 1
+
+        # Notify Sentinel for AI-assisted diagnosis
+        notify_sentinel(
+            f"Connection lost to Lighthouse (attempt #{self._consecutive_failures})",
+            component="connection",
+            consecutive_failures=self._consecutive_failures,
+            lighthouse_url=self.lighthouse_url or "",
+            reconnect_delay=self._reconnect_delay,
+        )
 
         # If the lighthouse_url was switched to VPN-internal (10.x.x.x) after
         # connect, it's unreachable now that the tunnel is down. Reset so
@@ -3709,6 +3790,95 @@ class QuantumVPNService:
         except Exception:
             pass
         log.info("VPN service stopped")
+
+    def _rehydrate_mesh_state(self) -> None:
+        """Reload mesh peer state from disk after a service restart.
+
+        mesh_peers.json persists across restarts (it's what wg_mesh.conf is
+        built from), but self.mesh_peers starts empty every launch. Without
+        rehydration, the path monitor doesn't know about existing tunnels,
+        reconciliation deletes them as orphans, and auto-mesh re-creates
+        them from scratch — causing unnecessary churn.
+
+        We cross-reference mesh_peers.json (has pubkeys, endpoints, IPs)
+        with the Lighthouse's active tunnel list (has request_ids and
+        device_ids) to rebuild the full in-memory state.
+        """
+        mesh_peers_path = DATA_DIR / "mesh_peers.json"
+        if not mesh_peers_path.exists():
+            return
+
+        try:
+            disk_peers = json.loads(mesh_peers_path.read_text())
+        except (json.JSONDecodeError, IOError):
+            return
+
+        if not disk_peers:
+            return
+
+        # We need request_ids from the Lighthouse to properly key self.mesh_peers.
+        # If we can't reach the Lighthouse yet, skip — reconciliation will handle it later.
+        if not self.lighthouse_url:
+            log.info(f"Mesh rehydrate: {len(disk_peers)} peers on disk but no Lighthouse URL yet — deferring")
+            return
+
+        try:
+            my_device_id = get_client_id()
+            resp = get_session().get(
+                f"{self.lighthouse_url}/api/v1/mesh/tunnels/{my_device_id}",
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                log.debug("Mesh rehydrate: could not fetch tunnel list from Lighthouse")
+                return
+
+            lighthouse_tunnels = resp.json().get("tunnels", [])
+        except Exception as e:
+            log.debug(f"Mesh rehydrate: Lighthouse query failed: {e}")
+            return
+
+        # Build a lookup: peer_vpn_address → tunnel info (from Lighthouse)
+        tunnel_by_vpn = {}
+        tunnel_by_mesh = {}
+        for t in lighthouse_tunnels:
+            vpn = t.get("peer_vpn_address", "")
+            mesh = t.get("peer_mesh_ip", "")
+            if vpn:
+                tunnel_by_vpn[vpn] = t
+            if mesh:
+                tunnel_by_mesh[mesh] = t
+
+        rehydrated = 0
+        for pubkey, info in disk_peers.items():
+            vpn_addr = info.get("vpn_address", "")
+            mesh_ip = info.get("mesh_ip", "")
+
+            # Match this disk peer to a Lighthouse tunnel record
+            tunnel = tunnel_by_mesh.get(mesh_ip) or tunnel_by_vpn.get(vpn_addr)
+            if not tunnel:
+                log.debug(f"Mesh rehydrate: no Lighthouse tunnel for {mesh_ip or vpn_addr} — skipping")
+                continue
+
+            request_id = tunnel["request_id"]
+            peer_id = tunnel.get("peer_id", "")
+
+            # Skip if already tracked (shouldn't happen on fresh start, but be safe)
+            if request_id in self.mesh_peers:
+                continue
+
+            self.mesh_peers[request_id] = {
+                "peer_id": peer_id,
+                "vpn_address": vpn_addr,
+                "mesh_ip": mesh_ip,
+                "endpoint": info.get("endpoint", ""),
+                "peer_wg_pubkey": pubkey,
+            }
+            rehydrated += 1
+
+        if rehydrated:
+            log.info(f"Mesh rehydrate: restored {rehydrated} peer(s) from disk + Lighthouse")
+        else:
+            log.debug("Mesh rehydrate: no peers matched between disk and Lighthouse")
 
     def _process_pending_mesh(self) -> None:
         """Check for and auto-accept pending mesh tunnel requests."""

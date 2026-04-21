@@ -34,6 +34,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REQUIRED_FILES=(
     "lighthouse.py"
     "lighthouse_launcher.py"
+    "cobra_sentinel.py"
     "config.yaml"
 )
 
@@ -42,6 +43,17 @@ for f in "${REQUIRED_FILES[@]}"; do
         echo "ERROR: Missing required file: ${f}"
         echo "Run this script from the repo root directory."
         exit 1
+    fi
+done
+
+# Check for optional sentinel model file
+GGUF_FILE=""
+for f in "${SCRIPT_DIR}"/*.gguf; do
+    if [ -f "$f" ]; then
+        GGUF_FILE="$f"
+        GGUF_NAME=$(basename "$f")
+        echo "  Found LLM model: ${GGUF_NAME}"
+        break
     fi
 done
 
@@ -55,6 +67,7 @@ echo "[1/5] Creating package structure..."
 
 mkdir -p "${PKG_DIR}/DEBIAN"
 mkdir -p "${PKG_DIR}/opt/lighthouse"
+mkdir -p "${PKG_DIR}/opt/lighthouse/models"
 mkdir -p "${PKG_DIR}/etc/lighthouse"
 mkdir -p "${PKG_DIR}/etc/systemd/system"
 mkdir -p "${PKG_DIR}/usr/local/bin"
@@ -65,6 +78,7 @@ echo "[2/5] Copying application files..."
 
 cp "${SCRIPT_DIR}/lighthouse.py"          "${PKG_DIR}/opt/lighthouse/"
 cp "${SCRIPT_DIR}/lighthouse_launcher.py" "${PKG_DIR}/opt/lighthouse/"
+cp "${SCRIPT_DIR}/cobra_sentinel.py"      "${PKG_DIR}/opt/lighthouse/"
 cp "${SCRIPT_DIR}/config.yaml"            "${PKG_DIR}/opt/lighthouse/config.yaml.template"
 
 # Write version file
@@ -73,8 +87,30 @@ echo "${VERSION}" > "${PKG_DIR}/opt/lighthouse/version.txt"
 # Set permissions on application files
 chmod 755 "${PKG_DIR}/opt/lighthouse/lighthouse.py"
 chmod 755 "${PKG_DIR}/opt/lighthouse/lighthouse_launcher.py"
+chmod 755 "${PKG_DIR}/opt/lighthouse/cobra_sentinel.py"
 chmod 644 "${PKG_DIR}/opt/lighthouse/config.yaml.template"
 chmod 644 "${PKG_DIR}/opt/lighthouse/version.txt"
+
+# Copy LLM model if found (for Sentinel AI diagnostics)
+if [ -n "$GGUF_FILE" ]; then
+    echo "  Copying LLM model: ${GGUF_NAME} (this may take a moment)..."
+    cp "${GGUF_FILE}" "${PKG_DIR}/opt/lighthouse/models/"
+    chmod 644 "${PKG_DIR}/opt/lighthouse/models/${GGUF_NAME}"
+
+    # Ship the Apache 2.0 license alongside the model (required for redistribution)
+    if [ -f "${SCRIPT_DIR}/APACHE-2.0.txt" ]; then
+        cp "${SCRIPT_DIR}/APACHE-2.0.txt" "${PKG_DIR}/opt/lighthouse/models/LICENSE"
+        chmod 644 "${PKG_DIR}/opt/lighthouse/models/LICENSE"
+    else
+        echo "  WARNING: APACHE-2.0.txt not found — model license will not be bundled"
+    fi
+fi
+
+# Ship default troubleshooting reference
+if [ -f "${SCRIPT_DIR}/troubleshooting.md" ]; then
+    cp "${SCRIPT_DIR}/troubleshooting.md" "${PKG_DIR}/etc/lighthouse/"
+    chmod 644 "${PKG_DIR}/etc/lighthouse/troubleshooting.md"
+fi
 
 # ── Generate systemd service ─────────────────────────────────
 
@@ -107,6 +143,33 @@ EOF
 
 chmod 644 "${PKG_DIR}/etc/systemd/system/lighthouse.service"
 
+# Sentinel service — AI diagnostic agent
+
+cat > "${PKG_DIR}/etc/systemd/system/cobra-sentinel.service" << 'EOF'
+[Unit]
+Description=Cobra Sentinel — AI Network Diagnostic Agent
+Documentation=https://github.com/CobraTechLLC/Cobra_Tail
+After=network-online.target lighthouse.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/lighthouse/cobra_sentinel.py --config /etc/lighthouse/sentinel_config.json
+WorkingDirectory=/opt/lighthouse
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cobra-sentinel
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+chmod 644 "${PKG_DIR}/etc/systemd/system/cobra-sentinel.service"
+
 # ── Create command wrapper ────────────────────────────────────
 
 cat > "${PKG_DIR}/usr/local/bin/lighthouse" << 'EOF'
@@ -117,6 +180,16 @@ exec /usr/bin/python3 /opt/lighthouse/lighthouse_launcher.py "$@"
 EOF
 
 chmod 755 "${PKG_DIR}/usr/local/bin/lighthouse"
+
+# Sentinel command wrapper
+cat > "${PKG_DIR}/usr/local/bin/cobra-sentinel" << 'EOF'
+#!/bin/bash
+# Cobra Sentinel — AI Network Diagnostic Agent
+# Installed by cobra-lighthouse package
+exec /usr/bin/python3 /opt/lighthouse/cobra_sentinel.py "$@"
+EOF
+
+chmod 755 "${PKG_DIR}/usr/local/bin/cobra-sentinel"
 
 # ── Create DEBIAN control files ───────────────────────────────
 
@@ -290,9 +363,9 @@ echo "[4/5] Installing Python dependencies..."
 
 # Install core pip packages
 pip3 install --break-system-packages \
-    fastapi uvicorn pyserial pyyaml cryptography 2>/dev/null || \
+    fastapi uvicorn pyserial pyyaml cryptography psutil 2>/dev/null || \
 pip3 install \
-    fastapi uvicorn pyserial pyyaml cryptography 2>/dev/null || \
+    fastapi uvicorn pyserial pyyaml cryptography psutil 2>/dev/null || \
 echo "  WARNING: pip install failed for core packages"
 
 # Install liboqs-python separately (depends on liboqs.so being present)
@@ -309,6 +382,47 @@ echo "[5/5] Configuring systemd..."
 systemctl daemon-reload
 echo "  systemd reloaded"
 
+# ── Sentinel auto-detection ──────────────────────────────────
+
+echo ""
+echo "  Detecting hardware for Cobra Sentinel..."
+python3 /opt/lighthouse/cobra_sentinel.py --detect 2>/dev/null || \
+echo "  Sentinel detection skipped (non-fatal)"
+
+# Move generated config to /etc/lighthouse if it landed in the wrong place
+if [ -f /opt/lighthouse/config/sentinel_config.json ] && [ ! -f /etc/lighthouse/sentinel_config.json ]; then
+    mv /opt/lighthouse/config/sentinel_config.json /etc/lighthouse/sentinel_config.json 2>/dev/null || true
+fi
+
+# Auto-configure model path if a .gguf model was shipped
+GGUF_MODEL=$(find /opt/lighthouse/models/ -name "*.gguf" -type f 2>/dev/null | head -1)
+SENTINEL_CFG="/etc/lighthouse/sentinel_config.json"
+if [ -n "$GGUF_MODEL" ] && [ -f "$SENTINEL_CFG" ]; then
+    python3 -c "
+import json
+with open('$SENTINEL_CFG') as f:
+    cfg = json.load(f)
+cfg['llm_model_path'] = '$GGUF_MODEL'
+cfg['troubleshooting_file'] = '/etc/lighthouse/troubleshooting.md'
+cfg['log_file'] = '/var/lib/lighthouse/lighthouse.log'
+with open('$SENTINEL_CFG', 'w') as f:
+    json.dump(cfg, f, indent=2)
+print('  LLM model path set: $GGUF_MODEL')
+" 2>/dev/null || true
+fi
+
+# Generate default troubleshooting.md if not present
+if [ ! -f /etc/lighthouse/troubleshooting.md ]; then
+    python3 -c "
+import sys, textwrap
+sys.path.insert(0, '/opt/lighthouse')
+from cobra_sentinel import _generate_default_troubleshooting
+from pathlib import Path
+Path('/etc/lighthouse/troubleshooting.md').write_text(_generate_default_troubleshooting())
+print('  Generated default troubleshooting.md')
+" 2>/dev/null || echo "  Troubleshooting file will be generated on first run"
+fi
+
 echo ""
 echo "═══════════════════════════════════════════════════"
 echo "  Installation complete!"
@@ -321,6 +435,10 @@ echo "    /opt/lighthouse/          — application code"
 echo "    /etc/lighthouse/          — configuration (created by wizard)"
 echo "    /var/lib/lighthouse/      — database"
 echo "    /usr/local/bin/lighthouse — management command"
+echo "    /usr/local/bin/cobra-sentinel — AI diagnostic agent"
+if [ -n "$GGUF_MODEL" ]; then
+echo "    /opt/lighthouse/models/   — LLM model ($(basename $GGUF_MODEL))"
+fi
 echo ""
 
 if [ "$IS_PI" = true ] && [ "${UART_CHANGED:-false}" = true ]; then
@@ -351,6 +469,16 @@ if systemctl is-enabled --quiet lighthouse 2>/dev/null; then
     echo "  Lighthouse service disabled"
 fi
 
+# Stop sentinel service
+if systemctl is-active --quiet cobra-sentinel 2>/dev/null; then
+    systemctl stop cobra-sentinel 2>/dev/null || true
+    echo "  Sentinel service stopped"
+fi
+
+if systemctl is-enabled --quiet cobra-sentinel 2>/dev/null; then
+    systemctl disable cobra-sentinel 2>/dev/null || true
+fi
+
 PRERM
 
 chmod 755 "${PKG_DIR}/DEBIAN/prerm"
@@ -369,6 +497,9 @@ if [ "$1" = "purge" ]; then
     echo "  Removed /var/lib/lighthouse/"
     rm -rf /etc/lighthouse
     echo "  Removed /etc/lighthouse/"
+    rm -f /etc/systemd/system/cobra-sentinel.service
+    rm -f /tmp/cobra-sentinel.sock
+    systemctl daemon-reload 2>/dev/null || true
     echo "  Lighthouse fully purged"
 else
     echo ""

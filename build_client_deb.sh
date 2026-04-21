@@ -35,6 +35,7 @@ REQUIRED_FILES=(
     "client.py"
     "cobra_launcher.py"
     "identity_manager.py"
+    "cobra_sentinel.py"
 )
 
 for f in "${REQUIRED_FILES[@]}"; do
@@ -42,6 +43,17 @@ for f in "${REQUIRED_FILES[@]}"; do
         echo "ERROR: Missing required file: ${f}"
         echo "Run this script from the repo root directory."
         exit 1
+    fi
+done
+
+# Check for optional sentinel model file
+GGUF_FILE=""
+for f in "${SCRIPT_DIR}"/*.gguf; do
+    if [ -f "$f" ]; then
+        GGUF_FILE="$f"
+        GGUF_NAME=$(basename "$f")
+        echo "  Found LLM model: ${GGUF_NAME}"
+        break
     fi
 done
 
@@ -58,6 +70,7 @@ mkdir -p "${PKG_DIR}/opt/cobratail/bin"
 mkdir -p "${PKG_DIR}/opt/cobratail/config"
 mkdir -p "${PKG_DIR}/opt/cobratail/data"
 mkdir -p "${PKG_DIR}/opt/cobratail/logs"
+mkdir -p "${PKG_DIR}/opt/cobratail/models"
 mkdir -p "${PKG_DIR}/etc/systemd/system"
 mkdir -p "${PKG_DIR}/usr/local/bin"
 
@@ -68,6 +81,7 @@ echo "[2/5] Copying application files..."
 cp "${SCRIPT_DIR}/client.py"           "${PKG_DIR}/opt/cobratail/bin/"
 cp "${SCRIPT_DIR}/cobra_launcher.py"   "${PKG_DIR}/opt/cobratail/bin/"
 cp "${SCRIPT_DIR}/identity_manager.py" "${PKG_DIR}/opt/cobratail/bin/"
+cp "${SCRIPT_DIR}/cobra_sentinel.py"   "${PKG_DIR}/opt/cobratail/bin/"
 
 # Write version file
 echo "${VERSION}" > "${PKG_DIR}/opt/cobratail/version.txt"
@@ -79,8 +93,30 @@ touch "${PKG_DIR}/opt/cobratail/.cobratail"
 chmod 755 "${PKG_DIR}/opt/cobratail/bin/client.py"
 chmod 755 "${PKG_DIR}/opt/cobratail/bin/cobra_launcher.py"
 chmod 755 "${PKG_DIR}/opt/cobratail/bin/identity_manager.py"
+chmod 755 "${PKG_DIR}/opt/cobratail/bin/cobra_sentinel.py"
 chmod 644 "${PKG_DIR}/opt/cobratail/version.txt"
 chmod 644 "${PKG_DIR}/opt/cobratail/.cobratail"
+
+# Copy LLM model if found (for Sentinel AI diagnostics)
+if [ -n "$GGUF_FILE" ]; then
+    echo "  Copying LLM model: ${GGUF_NAME} (this may take a moment)..."
+    cp "${GGUF_FILE}" "${PKG_DIR}/opt/cobratail/models/"
+    chmod 644 "${PKG_DIR}/opt/cobratail/models/${GGUF_NAME}"
+
+    # Ship the Apache 2.0 license alongside the model (required for redistribution)
+    if [ -f "${SCRIPT_DIR}/APACHE-2.0.txt" ]; then
+        cp "${SCRIPT_DIR}/APACHE-2.0.txt" "${PKG_DIR}/opt/cobratail/models/LICENSE"
+        chmod 644 "${PKG_DIR}/opt/cobratail/models/LICENSE"
+    else
+        echo "  WARNING: APACHE-2.0.txt not found — model license will not be bundled"
+    fi
+fi
+
+# Ship default troubleshooting reference
+if [ -f "${SCRIPT_DIR}/troubleshooting.md" ]; then
+    cp "${SCRIPT_DIR}/troubleshooting.md" "${PKG_DIR}/opt/cobratail/config/"
+    chmod 644 "${PKG_DIR}/opt/cobratail/config/troubleshooting.md"
+fi
 
 # ── Generate systemd service ─────────────────────────────────
 # Template — the launcher's _install_systemd_service() overwrites
@@ -131,6 +167,33 @@ EOF
 
 chmod 644 "${PKG_DIR}/etc/systemd/system/cobra-identity.service"
 
+# Sentinel service — AI diagnostic agent (optional, toggleable)
+
+cat > "${PKG_DIR}/etc/systemd/system/cobra-sentinel.service" << 'EOF'
+[Unit]
+Description=Cobra Sentinel — AI Network Diagnostic Agent
+Documentation=https://github.com/CobraTechLLC/Cobra_Tail
+After=network-online.target cobratail.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/cobratail/bin/cobra_sentinel.py --config /opt/cobratail/config/sentinel_config.json
+WorkingDirectory=/opt/cobratail/bin
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cobra-sentinel
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+chmod 644 "${PKG_DIR}/etc/systemd/system/cobra-sentinel.service"
+
 # ── Create command wrapper ────────────────────────────────────
 
 cat > "${PKG_DIR}/usr/local/bin/cobra" << 'EOF'
@@ -141,6 +204,16 @@ exec /usr/bin/python3 /opt/cobratail/bin/cobra_launcher.py "$@"
 EOF
 
 chmod 755 "${PKG_DIR}/usr/local/bin/cobra"
+
+# Sentinel command wrapper
+cat > "${PKG_DIR}/usr/local/bin/cobra-sentinel" << 'EOF'
+#!/bin/bash
+# Cobra Sentinel — AI Network Diagnostic Agent
+# Installed by cobra-client package
+exec /usr/bin/python3 /opt/cobratail/bin/cobra_sentinel.py "$@"
+EOF
+
+chmod 755 "${PKG_DIR}/usr/local/bin/cobra-sentinel"
 
 # ── Create DEBIAN control files ───────────────────────────────
 
@@ -258,9 +331,9 @@ echo "[3/4] Installing Python dependencies..."
 
 # Install core pip packages
 pip3 install --break-system-packages \
-    requests 2>/dev/null || \
+    requests psutil 2>/dev/null || \
 pip3 install \
-    requests 2>/dev/null || \
+    requests psutil 2>/dev/null || \
 echo "  WARNING: pip install failed for core packages"
 
 # Install liboqs-python separately (depends on liboqs.so being present)
@@ -292,6 +365,38 @@ echo "[4/4] Configuring systemd..."
 systemctl daemon-reload
 echo "  systemd reloaded"
 
+# ── Sentinel auto-detection ──────────────────────────────────
+
+echo ""
+echo "  Detecting hardware for Cobra Sentinel..."
+python3 /opt/cobratail/bin/cobra_sentinel.py --detect 2>/dev/null || \
+echo "  Sentinel detection skipped (non-fatal)"
+
+# Auto-configure model path if a .gguf model was shipped
+GGUF_MODEL=$(find /opt/cobratail/models/ -name "*.gguf" -type f 2>/dev/null | head -1)
+if [ -n "$GGUF_MODEL" ] && [ -f /opt/cobratail/config/sentinel_config.json ]; then
+    python3 -c "
+import json
+cfg_path = '/opt/cobratail/config/sentinel_config.json'
+with open(cfg_path) as f:
+    cfg = json.load(f)
+cfg['llm_model_path'] = '$GGUF_MODEL'
+with open(cfg_path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+print('  LLM model path set: $GGUF_MODEL')
+" 2>/dev/null || true
+fi
+
+# Generate default troubleshooting.md if not present
+if [ ! -f /opt/cobratail/config/troubleshooting.md ]; then
+    python3 -c "
+import sys
+sys.path.insert(0, '/opt/cobratail/bin')
+from cobra_sentinel import ensure_troubleshooting_file
+ensure_troubleshooting_file()
+" 2>/dev/null || echo "  Troubleshooting file will be generated on first run"
+fi
+
 echo ""
 echo "═══════════════════════════════════════════════════"
 echo "  Installation complete!"
@@ -305,6 +410,7 @@ echo "    /opt/cobratail/config/    — enrollment & certs (created by wizard)"
 echo "    /opt/cobratail/data/      — state & mesh peers"
 echo "    /opt/cobratail/logs/      — client logs"
 echo "    /usr/local/bin/cobra      — management command"
+echo "    /usr/local/bin/cobra-sentinel — AI diagnostic agent"
 echo ""
 echo "  Quick start:"
 echo "    cobra              — Interactive menu (enrollment on first run)"
@@ -312,6 +418,7 @@ echo "    cobra --enroll     — Enrollment wizard"
 echo "    cobra --start      — Start VPN service"
 echo "    cobra --stop       — Stop VPN service"
 echo "    cobra --status     — Connection status"
+echo "    cobra-sentinel --detect  — Check AI capability"
 echo ""
 
 POSTINST
@@ -345,6 +452,15 @@ if systemctl is-enabled --quiet cobra-identity 2>/dev/null; then
     systemctl disable cobra-identity 2>/dev/null || true
 fi
 
+# Stop sentinel service
+if systemctl is-active --quiet cobra-sentinel 2>/dev/null; then
+    systemctl stop cobra-sentinel 2>/dev/null || true
+fi
+
+if systemctl is-enabled --quiet cobra-sentinel 2>/dev/null; then
+    systemctl disable cobra-sentinel 2>/dev/null || true
+fi
+
 PRERM
 
 chmod 755 "${PKG_DIR}/DEBIAN/prerm"
@@ -375,6 +491,8 @@ if [ "$1" = "purge" ]; then
     # Remove service files (in case they were rewritten by launcher)
     rm -f /etc/systemd/system/cobratail.service
     rm -f /etc/systemd/system/cobra-identity.service
+    rm -f /etc/systemd/system/cobra-sentinel.service
+    rm -f /tmp/cobra-sentinel.sock
     systemctl daemon-reload 2>/dev/null || true
 
     echo "  CobraTail client fully purged"

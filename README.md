@@ -258,4 +258,9 @@ The cryptographic primitives Cobra Tail depends on are licensed separately:
 
 ---
 
+### Third-Party Credits
+The Cobra Sentinel diagnostic agent utilizes the **Qwen2.5-Coder-0.5B-Instruct** model developed by Alibaba Cloud. 
+- **Model License:** Apache License 2.0.
+- **Redistribution:** This model is redistributed in GGUF format as a diagnostic component. The restrictive terms of the Cobra Tail license do NOT apply to the LLM weights located in `/opt/lighthouse/models/`.
+
 *Built on custom hardware. Secured against tomorrow's computers.*

@@ -83,8 +83,10 @@ GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRAN
 UPDATABLE_FILES = {
     "lighthouse.py": LIGHTHOUSE_PY,
     "lighthouse_launcher.py": LAUNCHER_PY,
+    "cobra_sentinel.py": LIGHTHOUSE_DIR / "cobra_sentinel.py",
+    "version.txt": LIGHTHOUSE_DIR / "version.txt",
+    "troubleshooting.md": CONFIG_DIR / "troubleshooting.md",
 }
-
 
 # ─── Terminal Helpers ────────────────────────────────────────────────────────
 
@@ -1038,21 +1040,116 @@ def menu_add_node():
 
 
 def menu_list_nodes():
-    """List all enrolled and pending nodes."""
+    """List all enrolled and pending nodes with online/offline status."""
     clear_screen()
     print_banner("Node List")
 
+    if not DB_PATH.exists():
+        print_error("Database not found. Start the Lighthouse first.")
+        print()
+        wait_for_key()
+        return
+
     try:
-        result = subprocess.run(
-            ["python3", str(LIGHTHOUSE_PY), "--config", str(CONFIG_PATH), "list-nodes"],
-            capture_output=True, text=True, timeout=15,
-        )
-        for line in result.stdout.strip().split("\n"):
-            print(f"  {line}")
+        import sqlite3 as _sqlite3
+        import yaml as _yaml
+
+        # Load peer_timeout from config
+        peer_timeout = 120
+        if CONFIG_PATH.exists():
+            try:
+                cfg = _yaml.safe_load(CONFIG_PATH.read_text())
+                peer_timeout = cfg.get("peer_timeout", 120)
+            except Exception:
+                pass
+
+        conn = _sqlite3.connect(str(DB_PATH))
+        conn.row_factory = _sqlite3.Row
+
+        rows = conn.execute(
+            "SELECT node_name, device_id, status, created_at, "
+            "expires_at, used_at "
+            "FROM enrollment_tokens ORDER BY created_at"
+        ).fetchall()
+
+        if not rows:
+            print(f"  No nodes enrolled or pending.")
+            print()
+            wait_for_key()
+            conn.close()
+            return
+
+        # Look up VPN and mesh addresses + last_seen from the peers table
+        peer_info = {}
+        for prow in conn.execute(
+            "SELECT device_id, vpn_address, mesh_address, last_seen FROM peers"
+        ).fetchall():
+            peer_info[prow["device_id"]] = {
+                "vpn": prow["vpn_address"] or "—",
+                "mesh": prow["mesh_address"] or "—",
+                "last_seen": prow["last_seen"] or 0,
+            }
+
+        conn.close()
+
+        now = time.time()
+        c = Colors
+
+        print(f"  {'Name':<18} {'Status':<12} {'Device ID':<18} {'VPN IP':<16} {'Mesh IP':<16} {'Info'}")
+        print(f"  {'─'*18} {'─'*12} {'─'*18} {'─'*16} {'─'*16} {'─'*30}")
+
+        for row in rows:
+            name = row["node_name"]
+            status = row["status"]
+            device_id = row["device_id"] or "—"
+
+            info_entry = peer_info.get(device_id, {"vpn": "—", "mesh": "—", "last_seen": 0})
+
+            if status == "pending" and now > row["expires_at"]:
+                status = "expired"
+
+            if status == "used":
+                last_seen = info_entry["last_seen"]
+                is_online = (now - last_seen) < peer_timeout if last_seen else False
+                if is_online:
+                    icon = f"{c.GREEN}●{c.RESET}"
+                    ago = int(now - last_seen)
+                    if ago < 60:
+                        seen_str = f"{ago}s ago"
+                    else:
+                        seen_str = f"{ago // 60}m ago"
+                    info = f"{c.GREEN}online{c.RESET} (seen {seen_str})"
+                else:
+                    icon = f"{c.RED}●{c.RESET}"
+                    if last_seen:
+                        ago = int(now - last_seen)
+                        if ago < 3600:
+                            seen_str = f"{ago // 60}m ago"
+                        else:
+                            seen_str = f"{ago // 3600}h ago"
+                        info = f"{c.RED}offline{c.RESET} (last seen {seen_str})"
+                    else:
+                        info = f"{c.RED}offline{c.RESET} (never connected)"
+            elif status == "pending":
+                remaining = int(row["expires_at"] - now)
+                mins = remaining // 60
+                secs = remaining % 60
+                icon = f"{c.YELLOW}○{c.RESET}"
+                info = f"token valid for {mins}m {secs}s"
+            elif status == "expired":
+                icon = f"{c.RED}✗{c.RESET}"
+                info = "token expired"
+            else:
+                icon = "?"
+                info = status
+
+            print(f"  {icon} {name:<16} {status:<12} {device_id:<18} {info_entry['vpn']:<16} {info_entry['mesh']:<16} {info}")
+
+        print()
     except Exception as e:
         print_error(f"Failed to list nodes: {e}")
+        print()
 
-    print()
     wait_for_key()
 
 
