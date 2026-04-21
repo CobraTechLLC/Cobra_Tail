@@ -1,6 +1,6 @@
 # 🐍 Cobra Tail — Post-Quantum Mesh VPN
 
-**Version:** 1.0.0
+**Version:** 1.0.4
 **Developed by:** Cobra Tech LLC
 **License:** See [LICENSE](LICENSE)
 
@@ -20,6 +20,7 @@ If you're tired of trusting someone else's cloud to broker your VPN, and you wan
 - **Deterministic IPv6 identity** — The Cobra-Dicyanin layer gives every node a predictable globally-routable IPv6 address, allowing the Lighthouse to mathematically construct peer addresses and enable direct dialing without any NAT traversal at all.
 - **Full-stack identity spoofing** — MAC address, hostname, IPv6 SLAAC token, DHCP fingerprint, and OS TTL can all be spoofed to impersonate an Apple/macOS machine at every layer of the stack.
 - **Cross-platform clients** — Native support for Linux (amd64/arm64 .deb packages) and Windows (.exe installer). Android client planned.
+- **AI-assisted diagnostics** — The Cobra Sentinel is an optional on-device diagnostic agent that receives structured error events from the Lighthouse and client in real time. When running, it uses a local LLM (Qwen2.5-Coder-0.5B) to correlate failures across the stack and suggest fixes. When not running, the hooks do nothing — zero overhead.
 
 ---
 
@@ -56,13 +57,13 @@ All the code is in this repo. All the build scripts are in this repo. You can (a
 # Build the Lighthouse .deb yourself
 git clone https://github.com/CobraTechLLC/Cobra_Tail.git
 cd Cobra_Tail
-sudo ./build_lighthouse_deb.sh 1.0.0 arm64
+sudo ./build_lighthouse_deb.sh 1.0.4 arm64
 
 # Build the client .deb yourself
-sudo ./build_client_deb.sh 1.0.0 arm64   # or amd64
+sudo ./build_client_deb.sh 1.0.4 arm64   # or amd64
 
 # Build the Vault .deb yourself (run on the Pi Zero 2 W itself)
-./build_vault_deb.sh 1.0.0 arm64
+./build_vault_deb.sh 1.0.4 arm64
 ```
 
 The pre-built binaries in GitHub Releases are provided as a convenience. If you have any reason to distrust them, build from source. `SHA256SUMS` files are published alongside each release so you can verify the binaries you download match what the build scripts would produce.
@@ -125,15 +126,15 @@ If you just want to connect to an existing Cobra Tail mesh as a client, you don'
 
 **Linux (Debian/Ubuntu — amd64):**
 ```bash
-wget https://github.com/CobraTechLLC/Cobra_Tail/releases/latest/download/cobra-client_1.0.0_amd64.deb
-sudo apt install ./cobra-client_1.0.0_amd64.deb
+wget https://github.com/CobraTechLLC/Cobra_Tail/releases/latest/download/cobra-client_1.0.4_amd64.deb
+sudo apt install ./cobra-client_1.0.4_amd64.deb
 sudo cobra
 ```
 
 **Linux (Debian/Ubuntu — arm64 / Raspberry Pi):**
 ```bash
-wget https://github.com/CobraTechLLC/Cobra_Tail/releases/latest/download/cobra-client_1.0.0_arm64.deb
-sudo apt install ./cobra-client_1.0.0_arm64.deb
+wget https://github.com/CobraTechLLC/Cobra_Tail/releases/latest/download/cobra-client_1.0.4_arm64.deb
+sudo apt install ./cobra-client_1.0.4_arm64.deb
 sudo cobra
 ```
 
@@ -154,8 +155,8 @@ If you're standing up your own mesh, you need the full hardware stack described 
 git clone https://github.com/CobraTechLLC/Cobra_Tail.git
 cd Cobra_Tail
 chmod +x build_lighthouse_deb.sh
-sudo ./build_lighthouse_deb.sh 1.0.0 arm64
-sudo apt install ./cobra-lighthouse_1.0.0_arm64.deb
+sudo ./build_lighthouse_deb.sh 1.0.4 arm64
+sudo apt install ./cobra-lighthouse_1.0.4_arm64.deb
 sudo lighthouse
 ```
 
@@ -169,8 +170,8 @@ The Vault now ships as a `.deb` package. On a fresh Raspberry Pi OS install on a
 git clone https://github.com/CobraTechLLC/Cobra_Tail.git
 cd Cobra_Tail
 chmod +x build_vault_deb.sh
-./build_vault_deb.sh 1.0.0 arm64
-sudo apt install ./cobra-vault_1.0.0_arm64.deb
+./build_vault_deb.sh 1.0.4 arm64
+sudo apt install ./cobra-vault_1.0.4_arm64.deb
 ```
 
 The postinst handles everything: creates the `vault` system user, builds **liboqs** from source (10–20 minutes on a Pi Zero 2 W — do not interrupt), installs Python bindings, enables the PL011 UART on GPIO 14/15, disables the serial console and Bluetooth UART, installs a udev rule for the ESP32 (`/dev/cobra-tongue`), and enables the `cobra-vault` systemd service.
@@ -205,6 +206,7 @@ Flash [`firmware/main.py`](firmware/main.py) to the ESP32-S3 using Thonny or `am
 | `client.py` | Persistent background client service |
 | `cobra_launcher.py` | Cross-platform client launcher + menu |
 | `identity_manager.py` | Full-stack network identity spoofing |
+| `cobra_sentinel.py` | On-device AI diagnostic agent (optional) |
 | `build_client_deb.sh` | Builds `cobra-client_*.deb` |
 | `installer.py` | Windows installer entry point |
 | `build_windows_exe.py` | PyInstaller build script for `CobraTailSetup.exe` |
@@ -218,7 +220,7 @@ Flash [`firmware/main.py`](firmware/main.py) to the ESP32-S3 using Thonny or `am
 
 ## 🗺️ Roadmap
 
-**v1.0.0 — Current release**
+**v1.0.0 — Initial release**
 - ✅ Full post-quantum tunnel stack with ML-KEM-1024
 - ✅ HKDF-SHA256 PSK derivation with domain separation
 - ✅ Zero-trust mesh networking with peer-to-peer KEM exchange
@@ -229,6 +231,18 @@ Flash [`firmware/main.py`](firmware/main.py) to the ESP32-S3 using Thonny or `am
 - ✅ Client .deb (arm64 + amd64)
 - ✅ Vault .deb (arm64, Pi Zero 2 W)
 - ✅ Windows .exe installer
+
+**v1.0.3 — Mesh stability & LAN endpoint fix**
+- ✅ Same-LAN endpoint preference (stable LAN IPs over rotating SLAAC addresses)
+- ✅ Candidate update false-positive elimination (endpoint set comparison)
+- ✅ Unified endpoint priority across client and Lighthouse
+- ✅ mesh_update_candidates same-LAN detection
+
+**v1.0.4 — Current release**
+- ✅ Cobra Sentinel integration (AI-assisted diagnostics via local LLM)
+- ✅ Mesh state rehydration on service restart (fixes orphaned peer tracking)
+- ✅ Structured error reporting from Lighthouse and client to Sentinel
+- ✅ Lighthouse peer count accuracy improvements
 
 **Planned**
 - 🔲 Full-tunnel exit node support
