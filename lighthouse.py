@@ -3063,6 +3063,8 @@ def main():
         node_name = args.node_name
         init_database(CONFIG["database"]["path"])
 
+        revoked_pubkey = None
+
         with get_db() as conn:
             row = conn.execute(
                 "SELECT device_id FROM enrollment_tokens WHERE node_name = ?",
@@ -3081,6 +3083,13 @@ def main():
             )
 
             if device_id:
+                # Look up the peer's WireGuard pubkey before deleting
+                peer_row = conn.execute(
+                    "SELECT wireguard_pubkey FROM peers WHERE device_id = ?",
+                    (device_id,),
+                ).fetchone()
+                revoked_pubkey = peer_row["wireguard_pubkey"] if peer_row else None
+
                 conn.execute(
                     "DELETE FROM peers WHERE device_id = ?",
                     (device_id,),
@@ -3091,9 +3100,23 @@ def main():
                     (device_id, device_id),
                 )
 
+        # Remove from WireGuard interface (outside the db context manager)
+        if device_id and revoked_pubkey:
+            try:
+                subprocess.run(
+                    ["sudo", "wg", "set", CONFIG["wireguard"]["interface"],
+                     "peer", revoked_pubkey, "remove"],
+                    capture_output=True, timeout=10,
+                )
+                log.info(f"Removed WG peer {revoked_pubkey[:20]}... from {CONFIG['wireguard']['interface']}")
+            except Exception as e:
+                log.warning(f"Could not remove WG peer: {e}")
+
         print(f"\n  Node '{node_name}' revoked and removed from the network.")
         if device_id:
             print(f"  Device ID {device_id} cleared from peers and mesh tunnels.")
+            if revoked_pubkey:
+                print(f"  WireGuard peer {revoked_pubkey[:20]}... removed from {CONFIG['wireguard']['interface']}")
         print()
         return
 

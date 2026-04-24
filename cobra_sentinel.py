@@ -175,6 +175,10 @@ DEFAULT_CONFIG = {
         r"ERROR.*endpoint.*(?:unreachable|failed)",
         r"ERROR.*heartbeat.*(?:failed|timeout)",
         r"ERROR.*PSK.*(?:rotation|expired|failed)",
+        r"WARNING.*NAT classification.*only \d+ STUN",
+        r"WARNING.*Path monitor.*stale handshake",
+        r"WARNING.*Path monitor.*exhausted.*retries",
+        r"WARNING.*STUN.*(?:failed|DNS|resolution)",
     ],
     "safe_commands_whitelist": [
         "systemctl restart",

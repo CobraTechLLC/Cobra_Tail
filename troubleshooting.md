@@ -352,6 +352,91 @@ sudo systemctl disable cobra-identity
 
 ---
 
+## 11. STUN / NAT Discovery Failure
+
+**Symptoms:**
+- `WARNING NAT classification: only 0 STUN responses (need 2+)`
+- `STUN DNS resolution failed`
+- `STUN failed — will only punch non-STUN candidates`
+- Mesh peers show `stale` handshakes despite being online
+- Mesh works on LAN but fails for remote/roaming peers
+
+**Diagnostics:**
+```bash
+dig stun.l.google.com +short
+dig @8.8.8.8 stun.l.google.com +short
+cat /etc/resolv.conf
+resolvectl status
+nc -u -z -w3 stun.l.google.com 19302 && echo "reachable" || echo "blocked"
+sudo iptables -L OUTPUT -n | grep -i drop
+sudo ufw status
+```
+
+**Fix — if DNS resolution is failing (most common cause):**
+```bash
+sudo resolvectl flush-caches 2>/dev/null || sudo systemd-resolve --flush-caches 2>/dev/null
+sudo systemctl restart systemd-resolved
+```
+
+If `/etc/resolv.conf` is empty or misconfigured:
+```bash
+sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+sudo systemctl restart systemd-resolved
+```
+
+**Fix — if firewall is blocking outbound UDP:**
+```bash
+sudo ufw allow out 19302/udp
+sudo ufw allow out 3478/udp
+```
+
+**Fix — if STUN works externally but not from the VPN client process:**
+The WireGuard tunnel may be capturing STUN traffic. Restart the client to
+re-bind the physical interface:
+```bash
+sudo systemctl restart cobratail
+```
+
+---
+
+## 12. Mesh Handshake Stale / Path Monitor Exhausted
+
+**Symptoms:**
+- `WARNING Path monitor: stale handshake for <peer_id>`
+- `WARNING Path monitor: exhausted N retries for <peer_id>`
+- Mesh peers listed but handshakes show `stale`
+- `Mesh path recovery failed — needs relay or manual fix`
+
+**Diagnostics:**
+```bash
+sudo wg show wg_mesh latest-handshakes
+sudo wg show wg_mesh endpoints
+ip link show wg_mesh
+ss -ulnp | grep 51821
+```
+
+**Fix — restart mesh tunnel to force fresh handshakes:**
+```bash
+sudo wg-quick down wg_mesh && sudo wg-quick up wg_mesh
+```
+
+**Fix — if mesh interface is up but no handshakes complete:**
+Restart the full client to re-trigger peer discovery and hole punching:
+```bash
+sudo systemctl restart cobratail
+```
+
+**Fix — if only one specific peer is stale:**
+The remote peer may have changed networks or its NAT mappings expired.
+Wait for the path monitor to re-punch (automatic every 30s), or restart
+the remote peer's client.
+
+**Fix — if STUN is also failing (check section 11):**
+Fix DNS resolution first. Without STUN, only LAN/IPv6 candidates are
+used for hole punching, which won't work for remote peers.
+
+---
+
 ## Quick Reference — Common One-Liners
 
 | Problem | Command |

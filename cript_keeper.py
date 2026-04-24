@@ -392,29 +392,46 @@ def handle_regen_keys(uart: serial.Serial) -> None:
 def register_with_lighthouse(uart: serial.Serial, public_key: bytes) -> None:
     """Send public key and device ID to the Lighthouse over UART."""
     device_id = get_device_id()
-    msg = frame_message("register", {
-        "device_id": device_id,
-        "device_type": "vault",
-        "public_key": base64.b64encode(public_key).decode(),
-        "kem_algorithm": KEM_ALGORITHM,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-    uart.write(msg)
-    uart.flush()
-    log.info(f"Sent registration to Lighthouse (device: {device_id})")
 
-    # Short wait for ACK — don't block long or we'll miss kem_requests
-    response = read_frame(uart, timeout=1.0)
-    if response and response.get("type") == "ack":
-        log.info("Lighthouse acknowledged registration")
-    elif response:
-        # Got a non-ACK message (probably a kem_request that arrived
-        # while we were registering) — process it immediately
-        msg_type = response.get("type", "")
-        log.info(f"Got {msg_type} instead of ACK — processing it")
-        _handle_message(uart, response)
-    else:
-        log.warning("No ACK from Lighthouse — will retry")
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        # Flush any stale bytes before each attempt
+        uart.reset_input_buffer()
+
+        msg = frame_message("register", {
+            "device_id": device_id,
+            "device_type": "vault",
+            "public_key": base64.b64encode(public_key).decode(),
+            "kem_algorithm": KEM_ALGORITHM,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        uart.write(msg)
+        uart.flush()
+        log.info(f"Sent registration to Lighthouse (device: {device_id}) [attempt {attempt}/{max_attempts}]")
+
+        # Wait for ACK — drain any non-ACK messages that arrive first
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            response = read_frame(uart, timeout=1.0)
+            if response is None:
+                continue
+            if response.get("type") == "ack":
+                log.info("Lighthouse acknowledged registration")
+                return
+            # Got a non-ACK message — handle it, but skip pings to
+            # avoid re-entering register_with_lighthouse recursively
+            msg_type = response.get("type", "")
+            if msg_type == "ping":
+                log.info("Got ping while registering — ignoring (already registering)")
+                continue
+            log.info(f"Got {msg_type} while waiting for ACK — processing it")
+            _handle_message(uart, response)
+
+        log.warning(f"No ACK from Lighthouse (attempt {attempt}/{max_attempts})")
+        if attempt < max_attempts:
+            time.sleep(2)
+
+    log.warning("Registration not acknowledged after all attempts — will retry on next heartbeat")
 
 def send_heartbeat(uart: serial.Serial) -> None:
     """Send a heartbeat over UART."""
@@ -546,9 +563,12 @@ def run_service() -> None:
         log.error("Did you run setup.sh and reboot?")
         sys.exit(1)
 
-    log.info("UART link open — registering with Lighthouse...")
+    log.info("UART link open — flushing stale buffer...")
+    uart.reset_input_buffer()
+    uart.reset_output_buffer()
     time.sleep(1)
 
+    log.info("Registering with Lighthouse...")
     register_with_lighthouse(uart, public_key)
 
     last_heartbeat = 0

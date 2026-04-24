@@ -230,6 +230,15 @@ STUN_SERVERS = [
     ("stun1.l.google.com", 19302),
     ("stun2.l.google.com", 19302),
 ]
+
+# Hardcoded IP fallbacks — used when DNS resolution fails for STUN hostnames
+STUN_SERVERS_IP_FALLBACK = [
+    ("74.125.250.129", 19302),   # stun.l.google.com
+    ("172.64.155.209", 3478),    # stun.cloudflare.com
+    ("74.125.250.129", 19302),   # stun1.l.google.com
+    ("74.125.250.129", 19302),   # stun2.l.google.com
+]
+
 NAT_TYPE_FULL_CONE = "full_cone"
 NAT_TYPE_RESTRICTED = "restricted"
 NAT_TYPE_SYMMETRIC_PREDICTABLE = "symmetric_predictable"
@@ -554,45 +563,69 @@ def stun_query(host: str, port: int, timeout: float = 2.0) -> tuple[str, int] | 
     Send a single STUN Binding Request and return (public_ip, mapped_port).
     Returns None on failure. This is the reusable building block for NAT classification.
     Binds to the physical interface to bypass WireGuard full-tunnel routing.
+    If DNS resolution fails for the hostname, attempts a direct IP fallback.
     """
+    targets = [(host, port)]
+
+    # Build fallback list: if host is a hostname (not an IP), add IP fallbacks
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        _bind_physical(sock)
-        # STUN Binding Request (RFC 5389)
-        txn_id = os.urandom(12)
-        msg = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + txn_id
-        sock.sendto(msg, (host, port))
-        data, _ = sock.recvfrom(1024)
-        sock.close()
+        socket.inet_aton(host)
+    except OSError:
+        # host is a hostname — add IP fallbacks in case DNS is broken
+        for i, (srv_host, srv_port) in enumerate(STUN_SERVERS):
+            if srv_host == host and srv_port == port and i < len(STUN_SERVERS_IP_FALLBACK):
+                fallback_ip, fallback_port = STUN_SERVERS_IP_FALLBACK[i]
+                if (fallback_ip, fallback_port) != (host, port):
+                    targets.append((fallback_ip, fallback_port))
+                break
 
-        # Parse STUN Binding Response
-        pos = 20  # skip 20-byte header
-        while pos < len(data) - 4:
-            attr_type = struct.unpack("!H", data[pos:pos+2])[0]
-            attr_len = struct.unpack("!H", data[pos+2:pos+4])[0]
+    for target_host, target_port in targets:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            _bind_physical(sock)
+            # STUN Binding Request (RFC 5389)
+            txn_id = os.urandom(12)
+            msg = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + txn_id
+            sock.sendto(msg, (target_host, target_port))
+            data, _ = sock.recvfrom(1024)
+            sock.close()
 
-            if attr_type == 0x0020:  # XOR-MAPPED-ADDRESS
-                family = data[pos+5]
-                if family == 0x01:  # IPv4
-                    xor_port = struct.unpack("!H", data[pos+6:pos+8])[0]
-                    mapped_port = xor_port ^ 0x2112
-                    xor_ip = struct.unpack("!I", data[pos+8:pos+12])[0]
-                    ip_int = xor_ip ^ 0x2112A442
-                    ip = socket.inet_ntoa(struct.pack("!I", ip_int))
-                    return (ip, mapped_port)
-            elif attr_type == 0x0001:  # MAPPED-ADDRESS
-                family = data[pos+5]
-                if family == 0x01:  # IPv4
-                    mapped_port = struct.unpack("!H", data[pos+6:pos+8])[0]
-                    ip = socket.inet_ntoa(data[pos+8:pos+12])
-                    return (ip, mapped_port)
+            # Parse STUN Binding Response
+            pos = 20  # skip 20-byte header
+            while pos < len(data) - 4:
+                attr_type = struct.unpack("!H", data[pos:pos+2])[0]
+                attr_len = struct.unpack("!H", data[pos+2:pos+4])[0]
 
-            pos += 4 + attr_len
-            if attr_len % 4:
-                pos += 4 - (attr_len % 4)  # STUN padding
-    except Exception as e:
-        log.debug(f"STUN query to {host}:{port} failed: {e}")
+                if attr_type == 0x0020:  # XOR-MAPPED-ADDRESS
+                    family = data[pos+5]
+                    if family == 0x01:  # IPv4
+                        xor_port = struct.unpack("!H", data[pos+6:pos+8])[0]
+                        mapped_port = xor_port ^ 0x2112
+                        xor_ip = struct.unpack("!I", data[pos+8:pos+12])[0]
+                        ip_int = xor_ip ^ 0x2112A442
+                        ip = socket.inet_ntoa(struct.pack("!I", ip_int))
+                        if target_host != host:
+                            log.debug(f"STUN query succeeded via IP fallback {target_host}:{target_port} (DNS failed for {host})")
+                        return (ip, mapped_port)
+                elif attr_type == 0x0001:  # MAPPED-ADDRESS
+                    family = data[pos+5]
+                    if family == 0x01:  # IPv4
+                        mapped_port = struct.unpack("!H", data[pos+6:pos+8])[0]
+                        ip = socket.inet_ntoa(data[pos+8:pos+12])
+                        if target_host != host:
+                            log.debug(f"STUN query succeeded via IP fallback {target_host}:{target_port} (DNS failed for {host})")
+                        return (ip, mapped_port)
+
+                pos += 4 + attr_len
+                if attr_len % 4:
+                    pos += 4 - (attr_len % 4)  # STUN padding
+        except socket.gaierror:
+            # DNS resolution failed — try next target (IP fallback)
+            log.debug(f"STUN DNS resolution failed for {target_host}:{target_port}, trying fallback...")
+            continue
+        except Exception as e:
+            log.debug(f"STUN query to {target_host}:{target_port} failed: {e}")
     return None
 
 def classify_nat_type(quiet: bool = False) -> tuple[str, list[dict]]:
@@ -649,6 +682,12 @@ def classify_nat_type(quiet: bool = False) -> tuple[str, list[dict]]:
     if len(endpoints) < 2:
         log.warning(f"NAT classification: only {len(endpoints)} STUN responses (need 2+)")
         nat_type = NAT_TYPE_UNKNOWN
+        notify_sentinel(
+            f"STUN failed — only {len(endpoints)} responses (need 2+), NAT type unknown. Possible DNS resolution failure.",
+            component="stun",
+            stun_responses=len(endpoints),
+            stun_servers_queried=len(servers),
+        )
         return nat_type, endpoints
 
     ports = [ep["port"] for ep in endpoints]
@@ -2919,12 +2958,21 @@ def build_wireguard_config(handshake_result: dict, wg_privkey: str,
     # feature where users select a specific peer to route traffic through.
     allowed_ips = "10.100.0.0/24"
 
+    # For split-tunnel (AllowedIPs != 0.0.0.0/0), omit the DNS line.
+    # wg-quick's DNS directive registers a catch-all (~.) route in
+    # systemd-resolved, which hijacks ALL DNS lookups away from the
+    # physical interface's resolver. This breaks STUN hostname resolution
+    # and any other DNS that can't route through the tunnel.
+    # DNS is only needed for full-tunnel mode (future opt-in feature).
+    is_full_tunnel = "0.0.0.0/0" in allowed_ips or "::/0" in allowed_ips
+    dns_line = f"DNS = {', '.join(dns_servers)}\n" if is_full_tunnel else ""
+
     # Build config as bytearray so we can wipe the PSK from memory after use
     config = (
         "[Interface]\n"
         f"PrivateKey = {wg_privkey}\n"
         f"Address = {vpn_addr}/32\n"
-        f"DNS = {', '.join(dns_servers)}\n"
+        f"{dns_line}"
         "\n"
         "[Peer]\n"
         f"PublicKey = {server_pubkey}\n"
@@ -3042,6 +3090,119 @@ def _wireguard_down():
             )
     except Exception:
         pass  # Ignore errors if it's already down
+
+def _mesh_wireguard_down():
+    """Bring down the mesh WireGuard interface (wg_mesh).
+
+    Hardened teardown matching _wireguard_down(): tries the clean path first,
+    then aggressively removes any ghost interface. Verifies the interface is
+    actually gone so the next startup doesn't collide with a zombie tunnel.
+    """
+    iface = "wg_mesh"
+    log.info(f"Bringing down mesh WireGuard interface ({iface})...")
+
+    try:
+        if platform.system() == "Windows":
+            wireguard_exe = _find_wireguard_windows()
+
+            # Step 1: Clean uninstall
+            subprocess.run(
+                [wireguard_exe, "/uninstalltunnelservice", iface],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(2)
+
+            # Step 2: Verify it's gone — retry if still running
+            for attempt in range(5):
+                check = subprocess.run(
+                    [wireguard_exe, "/uninstalltunnelservice", iface],
+                    capture_output=True, text=True, timeout=5,
+                )
+                stderr = (check.stderr or "").lower()
+                if "not found" in stderr or "not installed" in stderr:
+                    log.info(f"Mesh tunnel service removed (attempt {attempt + 1})")
+                    break
+                time.sleep(1)
+            else:
+                # Step 3: Force-kill the tunnel service process
+                log.warning("Mesh tunnel service still running — force-killing...")
+                subprocess.run(
+                    ["taskkill", "/F", "/FI", f"SERVICES eq WireGuardTunnel${iface}"],
+                    capture_output=True, timeout=10,
+                )
+                time.sleep(2)
+                subprocess.run(
+                    [wireguard_exe, "/uninstalltunnelservice", iface],
+                    capture_output=True, timeout=10,
+                )
+
+            # Step 4: Wipe any leftover config state
+            wg_path = _find_wg_windows()
+            subprocess.run(
+                [wg_path, "setconf", iface, "NUL"],
+                capture_output=True,
+            )
+
+        else:
+            # Linux: hardened multi-step teardown (mirrors _wireguard_down)
+            # All mesh commands use sudo to match apply_mesh_peer / wg set patterns
+
+            # 1. wg-quick down with config file path
+            mesh_conf = CONFIG_DIR / "wg_mesh.conf"
+            if mesh_conf.exists():
+                subprocess.run(
+                    ["sudo", "wg-quick", "down", str(mesh_conf)],
+                    capture_output=True, timeout=10,
+                )
+
+            # 2. wg-quick down by interface name (catches path mismatch)
+            subprocess.run(
+                ["sudo", "wg-quick", "down", iface],
+                capture_output=True, timeout=10,
+            )
+
+            # 3. Nuke ghost interface if wg-quick failed partway
+            subprocess.run(
+                ["sudo", "ip", "link", "delete", "dev", iface],
+                capture_output=True, timeout=10,
+            )
+
+            # 4. Clean orphaned resolvconf entries
+            subprocess.run(
+                ["sudo", "resolvconf", "-d", iface, "-f"],
+                capture_output=True, timeout=10,
+            )
+
+            # 5. Verify it's actually gone
+            check = subprocess.run(
+                ["sudo", "wg", "show", iface],
+                capture_output=True, timeout=5,
+            )
+            if check.returncode == 0:
+                log.warning(f"Mesh interface {iface} still exists after teardown — "
+                            "forcing link delete")
+                subprocess.run(
+                    ["sudo", "ip", "link", "set", iface, "down"],
+                    capture_output=True, timeout=5,
+                )
+                subprocess.run(
+                    ["sudo", "ip", "link", "delete", "dev", iface],
+                    capture_output=True, timeout=5,
+                )
+            else:
+                log.info(f"Mesh interface {iface} confirmed down")
+
+    except Exception as e:
+        log.warning(f"Error during mesh teardown: {e}")
+        # Last resort: try raw interface deletion
+        try:
+            if platform.system() != "Windows":
+                subprocess.run(
+                    ["sudo", "ip", "link", "delete", "dev", iface],
+                    capture_output=True, timeout=5,
+                )
+        except Exception:
+            pass
 
 def update_wireguard_endpoint(new_endpoint: str) -> bool:
     """Update the WireGuard peer endpoint without tearing down the tunnel."""
@@ -3337,6 +3498,32 @@ class QuantumVPNService:
                     last_heartbeat = now
                     # Pick a fresh jittered interval for next cycle
                     next_heartbeat_interval = HEARTBEAT_INTERVAL + random.uniform(-HEARTBEAT_JITTER, HEARTBEAT_JITTER)
+
+                # ── Reconnect to Lighthouse when disconnected ──
+                # If we lost connection, periodically try to re-establish it.
+                # Without this, a failed _handle_connection_loss() leaves
+                # self.connected=False and no heartbeat fires to trigger retry.
+                if not self.connected and self.lighthouse_url:
+                    if now - last_heartbeat >= self._reconnect_delay:
+                        log.info(f"Attempting background reconnect (attempt #{self._consecutive_failures + 1})...")
+                        if self._full_connect():
+                            log.info(f"Background reconnect succeeded after {self._consecutive_failures} attempt(s)")
+                            self._reconnect_delay = RECONNECT_DELAY
+                            self._consecutive_failures = 0
+                            # Send an immediate heartbeat so the lighthouse marks us online
+                            hb_result = send_heartbeat(self.lighthouse_url)
+                            if hb_result:
+                                log.info("Post-reconnect heartbeat sent — lighthouse should show us online")
+                        else:
+                            self._consecutive_failures += 1
+                            self._reconnect_delay = min(
+                                self._reconnect_delay * RECONNECT_BACKOFF_FACTOR,
+                                RECONNECT_MAX_DELAY,
+                            )
+                            log.warning(
+                                f"Background reconnect failed — next attempt in {self._reconnect_delay:.0f}s"
+                            )
+                        last_heartbeat = now  # Reset timer regardless so we wait before next attempt
 
                 # Network change detection
                 if now - last_network_check >= NETWORK_CHECK_INTERVAL:
@@ -3756,7 +3943,12 @@ class QuantumVPNService:
             log.debug(f"Auto-heal: failed — {type(e).__name__}: {e}")
 
     def _shutdown(self) -> None:
-        """Clean shutdown."""
+        """Clean shutdown — tears down all WireGuard interfaces (quantum + mesh).
+
+        Uses hardened multi-step teardown for the mesh interface, matching
+        the approach in _wireguard_down() for the main tunnel. Verifies
+        interfaces are actually gone before declaring success.
+        """
         log.info("Shutting down VPN service...")
         self.discovery.stop()
         self.peer_kem.stop()
@@ -3769,26 +3961,7 @@ class QuantumVPNService:
                 release_upnp_mapping(ext_port)
 
         _wireguard_down()
-        # Tear down mesh interface
-        try:
-            if platform.system() == "Windows":
-                wg_dir = r"C:\Program Files\WireGuard"
-                wireguard_exe = os.path.join(wg_dir, "wireguard.exe")
-                if not os.path.exists(wireguard_exe):
-                    wireguard_exe = "wireguard.exe"
-                subprocess.run(
-                    [wireguard_exe, "/uninstalltunnelservice", "wg_mesh"],
-                    capture_output=True, timeout=10,
-                )
-            else:
-                mesh_conf = CONFIG_DIR / "wg_mesh.conf"
-                if mesh_conf.exists():
-                    subprocess.run(
-                        ["sudo", "wg-quick", "down", str(mesh_conf)],
-                        capture_output=True, timeout=10,
-                    )
-        except Exception:
-            pass
+        _mesh_wireguard_down()
         log.info("VPN service stopped")
 
     def _rehydrate_mesh_state(self) -> None:
@@ -3976,8 +4149,8 @@ class QuantumVPNService:
         Reconcile local mesh state with the Lighthouse.
 
         Two-way reconciliation:
-        1. If the Lighthouse has no record of a local tunnel → clear local state
-           so auto-mesh can re-establish.
+        1. If the Lighthouse has no record of a local tunnel → clear local state,
+           remove the WireGuard peer, and clean mesh_peers.json on disk.
         2. If the Lighthouse has an 'active' tunnel that we don't have locally
            (e.g., stale record from a previous session) → ask the Lighthouse to
            delete it so auto-mesh isn't blocked by a phantom 409 conflict.
@@ -3998,23 +4171,34 @@ class QuantumVPNService:
             active_request_ids = {t["request_id"] for t in lighthouse_tunnels}
 
             # Direction 1: local tunnels not on lighthouse → clear local state
+            #              AND remove WireGuard peer + disk record
             if self.mesh_peers:
                 stale_local = []
                 for request_id, info in self.mesh_peers.items():
                     if request_id not in active_request_ids:
                         stale_local.append(request_id)
 
+                # Collect peer IDs BEFORE deleting from self.mesh_peers
+                gone_peers = set()
                 for request_id in stale_local:
-                    peer_id = self.mesh_peers[request_id].get("peer_id", "unknown")
-                    log.info(f"Mesh tunnel {request_id} with {peer_id} no longer on Lighthouse — clearing local state")
+                    peer_info = self.mesh_peers[request_id]
+                    peer_id = peer_info.get("peer_id", "")
+                    peer_pubkey = peer_info.get("peer_wg_pubkey", "")
+                    if peer_id:
+                        gone_peers.add(peer_id)
+                    log.info(f"Mesh tunnel {request_id} with {peer_id or 'unknown'} no longer on Lighthouse — clearing local state")
+
+                    # Remove the WireGuard peer from the live interface
+                    if peer_pubkey:
+                        self._remove_wg_mesh_peer(peer_pubkey)
+
                     del self.mesh_peers[request_id]
 
+                # Remove revoked peers from mesh_peers.json on disk
+                if stale_local:
+                    self._clean_mesh_peers_json()
+
                 # Clean up pending initiations that reference gone peers
-                gone_peers = {
-                    self.mesh_peers.get(r, {}).get("peer_id")
-                    for r in stale_local
-                    if self.mesh_peers.get(r, {}).get("peer_id")
-                }
                 for device_id in list(self._mesh_pending_initiations.keys()):
                     if device_id in gone_peers:
                         del self._mesh_pending_initiations[device_id]
@@ -4051,6 +4235,53 @@ class QuantumVPNService:
 
         except Exception as e:
             log.debug(f"Mesh state reconciliation failed: {e}")
+
+    def _remove_wg_mesh_peer(self, peer_pubkey: str) -> None:
+        """Remove a single peer from the live wg_mesh WireGuard interface."""
+        iface = "wg_mesh"
+        try:
+            if platform.system() == "Windows":
+                wg_dir = r"C:\Program Files\WireGuard"
+                wg_exe = os.path.join(wg_dir, "wg.exe")
+                if not os.path.exists(wg_exe):
+                    wg_exe = "wg"
+                subprocess.run(
+                    [wg_exe, "set", iface, "peer", peer_pubkey, "remove"],
+                    capture_output=True, timeout=10,
+                )
+            else:
+                subprocess.run(
+                    ["sudo", "wg", "set", iface, "peer", peer_pubkey, "remove"],
+                    capture_output=True, timeout=10,
+                )
+            log.info(f"Removed WireGuard mesh peer {peer_pubkey[:20]}... from {iface}")
+        except Exception as e:
+            log.warning(f"Failed to remove WG mesh peer {peer_pubkey[:20]}...: {e}")
+
+    def _clean_mesh_peers_json(self) -> None:
+        """Remove entries from mesh_peers.json that are no longer in self.mesh_peers."""
+        mesh_peers_path = DATA_DIR / "mesh_peers.json"
+        if not mesh_peers_path.exists():
+            return
+
+        try:
+            disk_peers = json.loads(mesh_peers_path.read_text())
+        except (json.JSONDecodeError, IOError):
+            return
+
+        # Build the set of pubkeys still active in memory
+        active_pubkeys = {
+            info.get("peer_wg_pubkey")
+            for info in self.mesh_peers.values()
+            if info.get("peer_wg_pubkey")
+        }
+
+        cleaned = {pk: info for pk, info in disk_peers.items() if pk in active_pubkeys}
+
+        if len(cleaned) != len(disk_peers):
+            removed_count = len(disk_peers) - len(cleaned)
+            mesh_peers_path.write_text(json.dumps(cleaned, indent=2))
+            log.info(f"Cleaned {removed_count} revoked peer(s) from mesh_peers.json")
 
     def _auto_mesh_with_lan_peers(self) -> None:
         """Automatically request mesh tunnels with discovered LAN and remote peers."""
@@ -4276,6 +4507,14 @@ class QuantumVPNService:
                         f"({peer_wg_pubkey[:20]}...) — {age:.0f}s old, threshold {HANDSHAKE_STALE_THRESHOLD}s"
                     )
 
+                    notify_sentinel(
+                        f"Mesh handshake stale for peer {peer_id} — {age:.0f}s since last handshake",
+                        component="mesh",
+                        peer_id=peer_id,
+                        handshake_age_seconds=int(age),
+                        threshold_seconds=HANDSHAKE_STALE_THRESHOLD,
+                    )
+
                     # M2: Re-collect, push, fetch, re-punch
                     self._path_monitor_repunch(request_id, peer_info)
 
@@ -4426,6 +4665,12 @@ class QuantumVPNService:
             log.warning(
                 f"Path monitor: exhausted {PATH_MONITOR_MAX_RETRIES} retries for {peer_id} "
                 f"— path may need relay fallback"
+            )
+            notify_sentinel(
+                f"Mesh path recovery failed for peer {peer_id} after {PATH_MONITOR_MAX_RETRIES} retries — needs relay or manual fix",
+                component="mesh",
+                peer_id=peer_id,
+                retries_exhausted=PATH_MONITOR_MAX_RETRIES,
             )
         finally:
             self._repunch_active.pop(peer_id, None)
