@@ -1225,6 +1225,69 @@ def _kem_relay_cleanup() -> None:
             if not _kem_relay[device_id]:
                 del _kem_relay[device_id]
 
+
+# ─── Mesh Peer Notifications ────────────────────────────────────────────────
+# When a peer registers or re-registers, we notify all other online clients
+# so they can immediately initiate mesh tunnels instead of waiting for their
+# next periodic discovery cycle. This dramatically speeds up mesh convergence.
+
+_mesh_notifications: dict[str, list[dict]] = {}  # device_id → [notifications]
+_mesh_notifications_lock = threading.Lock()
+MESH_NOTIFICATION_TTL = 120  # seconds
+
+
+def _notify_peers_of_mesh_event(event_device_id: str, event_type: str = "peer_online") -> None:
+    """Notify all other online client peers that a mesh-relevant event occurred.
+    Each online peer gets a notification in their mailbox that they pick up
+    on their next heartbeat, triggering an immediate mesh reconciliation."""
+    with get_db() as conn:
+        online_clients = conn.execute(
+            "SELECT device_id FROM peers WHERE device_type = 'client' "
+            "AND device_id != ? AND last_seen > ?",
+            (event_device_id, time.time() - CONFIG.get("peer_timeout", 120)),
+        ).fetchall()
+
+    notification = {
+        "event": event_type,
+        "device_id": event_device_id,
+        "timestamp": time.time(),
+    }
+
+    with _mesh_notifications_lock:
+        for row in online_clients:
+            target_id = row["device_id"]
+            if target_id not in _mesh_notifications:
+                _mesh_notifications[target_id] = []
+            # Avoid duplicate notifications for the same event
+            existing = _mesh_notifications[target_id]
+            if not any(n["device_id"] == event_device_id and n["event"] == event_type for n in existing):
+                _mesh_notifications[target_id].append(notification)
+
+    if online_clients:
+        log.info(f"Mesh notification: {event_type} for {event_device_id} → {len(online_clients)} peers")
+
+
+def _fetch_mesh_notifications(device_id: str) -> list[dict]:
+    """Fetch and clear all pending mesh notifications for a device."""
+    now = time.time()
+    with _mesh_notifications_lock:
+        notifications = _mesh_notifications.pop(device_id, [])
+    # Filter expired
+    return [n for n in notifications if now - n.get("timestamp", 0) < MESH_NOTIFICATION_TTL]
+
+
+def _mesh_notifications_cleanup() -> None:
+    """Remove expired mesh notifications. Called periodically."""
+    now = time.time()
+    with _mesh_notifications_lock:
+        for device_id in list(_mesh_notifications.keys()):
+            _mesh_notifications[device_id] = [
+                n for n in _mesh_notifications[device_id]
+                if now - n.get("timestamp", 0) < MESH_NOTIFICATION_TTL
+            ]
+            if not _mesh_notifications[device_id]:
+                del _mesh_notifications[device_id]
+
 # ─── FastAPI App ─────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -1507,6 +1570,13 @@ async def register_device(req: RegisterRequest):
         local_host = local_url.split("://")[1].split(":")[0]
         local_wg_endpoint = f"{local_host}:{CONFIG['wireguard']['listen_port']}"
 
+    # Notify all other online peers that this device just came online
+    # so they can immediately initiate mesh tunnels with it
+    try:
+        _notify_peers_of_mesh_event(req.device_id, "peer_online")
+    except Exception as e:
+        log.debug(f"Mesh notification failed: {e}")
+
     return {
         "status": "registered",
         "device_id": req.device_id,
@@ -1647,14 +1717,19 @@ async def heartbeat(req: HeartbeatRequest):
         _cleanup_stale_mesh_tunnels()
         _kem_relay_cleanup()
         _rate_limit_cleanup()
+        _mesh_notifications_cleanup()
     except Exception as e:
         log.error(f"Heartbeat cleanup failed: {e}")
         pass
+
+        # Fetch any pending mesh notifications (e.g., "a new peer just came online")
+    mesh_events = _fetch_mesh_notifications(req.device_id)
 
     return {
         "status": "ok",
         "pending_mesh_requests": pending_mesh,
         "peer_candidates_updated": peer_candidates_updated,
+        "mesh_events": [{"event": e["event"], "device_id": e["device_id"]} for e in mesh_events],
     }
 
 @app.get("/api/v1/peers")
@@ -2758,8 +2833,16 @@ async def mesh_cleanup_orphan(request: Request):
             (request_id,),
         )
 
-    log.info(f"Orphan tunnel cleanup: {request_id} deleted by {device_id}")
-    return {"status": "deleted", "request_id": request_id}
+        # Notify the OTHER peer so they can re-mesh immediately
+        other_id = tunnel["target_id"] if device_id == tunnel["initiator_id"] else tunnel["initiator_id"]
+        try:
+            _notify_peers_of_mesh_event(other_id, "tunnel_cleared")
+            _notify_peers_of_mesh_event(device_id, "tunnel_cleared")
+        except Exception:
+            pass
+
+        log.info(f"Orphan tunnel cleanup: {request_id} deleted by {device_id}")
+        return {"status": "deleted", "request_id": request_id}
 
 def _get_peer_vpn_address(device_id: str) -> str:
     """Look up a peer's VPN address."""

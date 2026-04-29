@@ -261,6 +261,7 @@ PATH_MONITOR_INTERVAL = 30           # Check mesh handshake freshness every 30s
 HANDSHAKE_STALE_THRESHOLD = 120      # Seconds since last WG handshake before considered stale (2.5 missed keepalives)
 PATH_MONITOR_MAX_RETRIES = 3         # Max re-punch attempts before flagging for relay
 PATH_MONITOR_RETRY_DELAYS = [5, 15, 30]  # Delays between re-punch attempts (seconds)
+PATH_MONITOR_COOLDOWN = 300              # Skip re-punch for 5 min after exhausting retries
 
 # ─── STUN Cache (Phase 4 optimization) ───────────────────────────────────────
 STUN_CACHE_TTL = 300  # Reuse cached STUN/NAT data for 5 minutes between refreshes
@@ -3358,6 +3359,7 @@ class QuantumVPNService:
         self.mesh_wg_pubkey = None
         self.mesh_peers = {}  # request_id → {peer_id, vpn_address, ...}
         self._repunch_active: dict[str, bool] = {}  # peer_id → True if re-punch in progress
+        self._repunch_cooldown: dict[str, float] = {}  # peer_id → time.time() when cooldown started
         self._mesh_pending_initiations = {}  # device_id → request_id (in-flight requests)
         self.auto_accept_mesh = True  # Auto-accept mesh requests from registered peers
         self.peer_kem = PeerKEMExchange(self)
@@ -3365,6 +3367,7 @@ class QuantumVPNService:
         # Resilience: exponential backoff tracking
         self._reconnect_delay = RECONNECT_DELAY  # Current backoff delay (resets on success)
         self._consecutive_failures = 0            # Count of consecutive reconnect failures
+        self._last_reconnect_attempt = 0  # Independent timer for reconnect loop
 
     def run(self) -> None:
         """Main service entry point."""
@@ -3426,6 +3429,15 @@ class QuantumVPNService:
 
         # Rehydrate mesh peer state from disk + Lighthouse
         self._rehydrate_mesh_state()
+
+        # Immediately try to mesh with all known online peers
+        # Don't wait for the first discovery cycle — this is critical for
+        # freshly enrolled/restarted nodes to mesh within seconds
+        if self.lighthouse_url and self.connected:
+            try:
+                self._auto_mesh_with_lan_peers()
+            except Exception as e:
+                log.debug(f"Initial auto-mesh failed: {e}")
 
         # Start LAN discovery if we have a VPN address
         if self.vpn_address:
@@ -3493,23 +3505,35 @@ class QuantumVPNService:
                                             daemon=True,
                                             name=f"hb-repunch-{req_id[:8]}",
                                         ).start()
+                                # Lighthouse pushed mesh events (peer came online, tunnel cleared)
+                                # → trigger immediate mesh reconciliation + auto-mesh
+                                mesh_events = hb_result.get("mesh_events", [])
+                                if mesh_events:
+                                    event_peers = [e.get("device_id", "?") for e in mesh_events]
+                                    log.info(f"Heartbeat: {len(mesh_events)} mesh event(s) from Lighthouse: {event_peers}")
+                                    self._reconcile_mesh_state()
+                                    self._auto_mesh_with_lan_peers()
+                                    self._process_pending_mesh()
                         # Phase 2 U7: Renew UPnP mappings on heartbeat
                         renew_upnp_mappings()
-                    last_heartbeat = now
-                    # Pick a fresh jittered interval for next cycle
-                    next_heartbeat_interval = HEARTBEAT_INTERVAL + random.uniform(-HEARTBEAT_JITTER, HEARTBEAT_JITTER)
+                        last_heartbeat = now
+                        # Pick a fresh jittered interval for next cycle
+                        next_heartbeat_interval = HEARTBEAT_INTERVAL + random.uniform(-HEARTBEAT_JITTER,
+                                                                                      HEARTBEAT_JITTER)
 
                 # ── Reconnect to Lighthouse when disconnected ──
-                # If we lost connection, periodically try to re-establish it.
-                # Without this, a failed _handle_connection_loss() leaves
-                # self.connected=False and no heartbeat fires to trigger retry.
+                # Uses its own timer (self._last_reconnect_attempt) so the heartbeat
+                # interval can never starve reconnect attempts. Previously, last_heartbeat
+                # was reset every 30s even when disconnected, which meant any reconnect
+                # delay >= 30s could never fire — permanently stalling reconnection.
                 if not self.connected and self.lighthouse_url:
-                    if now - last_heartbeat >= self._reconnect_delay:
+                    if now - self._last_reconnect_attempt >= self._reconnect_delay:
                         log.info(f"Attempting background reconnect (attempt #{self._consecutive_failures + 1})...")
                         if self._full_connect():
                             log.info(f"Background reconnect succeeded after {self._consecutive_failures} attempt(s)")
                             self._reconnect_delay = RECONNECT_DELAY
                             self._consecutive_failures = 0
+                            last_heartbeat = now
                             # Send an immediate heartbeat so the lighthouse marks us online
                             hb_result = send_heartbeat(self.lighthouse_url)
                             if hb_result:
@@ -3523,7 +3547,7 @@ class QuantumVPNService:
                             log.warning(
                                 f"Background reconnect failed — next attempt in {self._reconnect_delay:.0f}s"
                             )
-                        last_heartbeat = now  # Reset timer regardless so we wait before next attempt
+                        self._last_reconnect_attempt = now
 
                 # Network change detection
                 if now - last_network_check >= NETWORK_CHECK_INTERVAL:
@@ -4457,6 +4481,10 @@ class QuantumVPNService:
         If a handshake is stale (NAT mapping expired, peer changed networks),
         re-collects candidates, pushes them to the Lighthouse, fetches peer's
         latest candidates, and re-punches.
+
+        Skips peers that are offline on the Lighthouse (no point punching a
+        dead peer) and enforces a cooldown after exhausting retries to avoid
+        log spam and wasted cycles.
         """
         log.info("Path monitor: started")
         while self._running:
@@ -4465,7 +4493,6 @@ class QuantumVPNService:
                 if not self._running or not self.mesh_peers or not self.lighthouse_url:
                     continue
 
-                # Read all mesh handshake timestamps in one call
                 handshake_map = self._get_mesh_handshake_times()
                 log.info(
                     f"Path monitor: checking {len(self.mesh_peers)} mesh peer(s), "
@@ -4476,15 +4503,26 @@ class QuantumVPNService:
                     log.info("Path monitor: no handshake data from WireGuard — wg_mesh may be down")
                     continue
 
+                # Fetch online peer list from Lighthouse once per cycle
+                online_peer_ids = set()
+                try:
+                    resp = get_session().get(
+                        f"{self.lighthouse_url}/api/v1/peers", timeout=5
+                    )
+                    if resp.status_code == 200:
+                        for p in resp.json().get("peers", []):
+                            if p.get("status") == "online":
+                                online_peer_ids.add(p["device_id"])
+                except Exception as e:
+                    log.debug(f"Path monitor: failed to fetch peer list: {e}")
+                    online_peer_ids = None
+
                 now = time.time()
                 for request_id, peer_info in list(self.mesh_peers.items()):
                     peer_id = peer_info.get("peer_id", "unknown")
-                    # Look up the pubkey from the handshake map by matching against
-                    # what WireGuard knows — mesh_peers may not store peer_wg_pubkey
                     peer_wg_pubkey = peer_info.get("peer_wg_pubkey", "")
 
                     if not peer_wg_pubkey:
-                        # Fallback: if only one peer in handshake_map, it's likely ours
                         if len(handshake_map) == 1:
                             peer_wg_pubkey = list(handshake_map.keys())[0]
                             log.debug(f"Path monitor: inferred pubkey for {peer_id} from WG: {peer_wg_pubkey[:20]}...")
@@ -4500,6 +4538,25 @@ class QuantumVPNService:
                     age = now - last_hs
                     if age < HANDSHAKE_STALE_THRESHOLD:
                         log.info(f"Path monitor: {peer_id} healthy — handshake {age:.0f}s ago")
+                        self._repunch_cooldown.pop(peer_id, None)
+                        continue
+
+                    # Cooldown check
+                    cooldown_start = self._repunch_cooldown.get(peer_id, 0)
+                    if cooldown_start and (now - cooldown_start) < PATH_MONITOR_COOLDOWN:
+                        remaining = PATH_MONITOR_COOLDOWN - (now - cooldown_start)
+                        log.debug(
+                            f"Path monitor: {peer_id} in cooldown — "
+                            f"{remaining:.0f}s remaining, skipping"
+                        )
+                        continue
+
+                    # Online check
+                    if online_peer_ids is not None and peer_id not in online_peer_ids:
+                        log.info(
+                            f"Path monitor: {peer_id} offline on Lighthouse — "
+                            f"skipping re-punch (handshake {age:.0f}s stale)"
+                        )
                         continue
 
                     log.warning(
@@ -4515,7 +4572,6 @@ class QuantumVPNService:
                         threshold_seconds=HANDSHAKE_STALE_THRESHOLD,
                     )
 
-                    # M2: Re-collect, push, fetch, re-punch
                     self._path_monitor_repunch(request_id, peer_info)
 
             except Exception as e:
@@ -4565,17 +4621,17 @@ class QuantumVPNService:
         Graceful STUN degradation: if STUN fails completely, only punch
         non-STUN candidates (IPv6, LAN, UPnP, VPN-routed) instead of
         wasting time on stale port predictions.
+        Cooldown: records timestamp when retries are exhausted so the path
+        monitor skips this peer for PATH_MONITOR_COOLDOWN seconds.
         """
         peer_id = peer_info.get("peer_id", "unknown")
         peer_wg_pubkey = peer_info.get("peer_wg_pubkey", "")
 
-        # Guard against concurrent re-punch for the same peer
         if self._repunch_active.get(peer_id):
             log.info(f"Path monitor: re-punch already active for {peer_id} — skipping")
             return
         self._repunch_active[peer_id] = True
 
-        # Candidate types that are valid without any STUN data
         STUN_INDEPENDENT_TYPES = {"ipv6_token", "ipv6", "lan", "upnp", "vpn_routed"}
 
         try:
@@ -4586,7 +4642,6 @@ class QuantumVPNService:
                 log.info(f"Path monitor: re-punch attempt {attempt}/{PATH_MONITOR_MAX_RETRIES} for {peer_id}")
 
                 try:
-                    # Step 1: Re-collect fresh candidates (fresh STUN, fresh IPs)
                     fresh_candidates = collect_endpoint_candidates()
                     candidates_json = json.dumps(fresh_candidates)
                     nat_type = NAT_TYPE_UNKNOWN
@@ -4601,23 +4656,17 @@ class QuantumVPNService:
                     if not stun_succeeded:
                         log.info("Path monitor: STUN failed — will only punch non-STUN candidates")
 
-                    # Step 2: Push our fresh candidates to the Lighthouse (M4)
                     update_mesh_candidates(
                         self.lighthouse_url, request_id,
                         candidates_json, nat_type,
                     )
 
-                    # Step 3: Fetch peer's latest candidates from the Lighthouse
                     peer_candidates = fetch_peer_latest_candidates(
                         self.lighthouse_url, request_id, peer_id,
                     )
 
-                    # Step 4: Hole-punch with combined endpoints
                     all_endpoints = []
                     if peer_candidates:
-                        # Graceful STUN degradation: if our STUN failed,
-                        # filter out the peer's STUN/predicted/public candidates too —
-                        # our NAT mappings won't match so punching those is wasted effort
                         if stun_succeeded:
                             all_endpoints = [c["endpoint"] for c in peer_candidates if c.get("endpoint")]
                         else:
@@ -4632,7 +4681,6 @@ class QuantumVPNService:
 
                         log.info(f"Path monitor: got {len(all_endpoints)} peer endpoints, punching...")
 
-                        # Step 5: Update WireGuard mesh endpoint to the best fresh candidate
                         best_endpoint = self._pick_best_candidate_endpoint(peer_candidates)
                         if best_endpoint:
                             current_ep = peer_info.get("endpoint", "")
@@ -4641,7 +4689,6 @@ class QuantumVPNService:
                                 self._update_mesh_wg_endpoint(peer_wg_pubkey, best_endpoint)
                                 peer_info["endpoint"] = best_endpoint
                     else:
-                        # Fallback: use whatever endpoint WireGuard currently has
                         current_ep = peer_info.get("endpoint", "")
                         if current_ep:
                             all_endpoints = [current_ep]
@@ -4653,19 +4700,20 @@ class QuantumVPNService:
                 except Exception as e:
                     log.warning(f"Path monitor: re-punch attempt {attempt} failed: {e}")
 
-                # Wait, then check if handshake recovered
                 time.sleep(delay)
 
                 handshake_map = self._get_mesh_handshake_times()
                 last_hs = handshake_map.get(peer_wg_pubkey, 0)
                 if last_hs > 0 and (time.time() - last_hs) < HANDSHAKE_STALE_THRESHOLD:
                     log.info(f"Path monitor: handshake recovered for {peer_id} after attempt {attempt}")
+                    self._repunch_cooldown.pop(peer_id, None)
                     return
 
             log.warning(
                 f"Path monitor: exhausted {PATH_MONITOR_MAX_RETRIES} retries for {peer_id} "
-                f"— path may need relay fallback"
+                f"— entering {PATH_MONITOR_COOLDOWN}s cooldown before next attempt"
             )
+            self._repunch_cooldown[peer_id] = time.time()
             notify_sentinel(
                 f"Mesh path recovery failed for peer {peer_id} after {PATH_MONITOR_MAX_RETRIES} retries — needs relay or manual fix",
                 component="mesh",
