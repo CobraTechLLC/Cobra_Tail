@@ -419,7 +419,42 @@ def start_service() -> bool:
 
 
 def stop_service() -> bool:
-    """Stop the client service."""
+    """Stop the client service — tears down WireGuard tunnels first, then kills the process."""
+
+    # ── Step 1: Tear down WireGuard tunnel services BEFORE killing the process ──
+    # taskkill /F is a hard kill — Python's finally block never runs,
+    # so _shutdown() never calls _wireguard_down() / _mesh_wireguard_down().
+    # We must do it here.
+    if IS_WINDOWS:
+        wireguard_exe = None
+        for candidate in [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "WireGuard" / "wireguard.exe",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "WireGuard" / "wireguard.exe",
+        ]:
+            if candidate.exists():
+                wireguard_exe = str(candidate)
+                break
+
+        if wireguard_exe:
+            for iface in ["wg_quantum", "wg_mesh"]:
+                try:
+                    result = run_cmd([wireguard_exe, "/uninstalltunnelservice", iface])
+                    if result.returncode == 0:
+                        print(f"  {GREEN}Stopped tunnel: {iface}{RESET}")
+                    else:
+                        # Check if it wasn't running
+                        stderr = (result.stderr or "").lower()
+                        if "not found" in stderr or "not installed" in stderr:
+                            pass  # Already stopped
+                        else:
+                            print(f"  {YELLOW}Could not stop tunnel {iface}: {result.stderr.strip()}{RESET}")
+                except Exception as e:
+                    print(f"  {YELLOW}Error stopping tunnel {iface}: {e}{RESET}")
+                time.sleep(1)
+        else:
+            print(f"  {YELLOW}WireGuard not found — tunnels may still be running{RESET}")
+
+    # ── Step 2: Stop the systemd service or kill the Python process ──
     if IS_LINUX:
         service_file = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
         if service_file.exists():

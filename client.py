@@ -4092,16 +4092,26 @@ class QuantumVPNService:
 
                 if self.auto_accept_mesh:
                     try:
-                        # Detect if initiator is on the same LAN to skip STUN
+                        # Detect if initiator is on the same LAN to skip STUN.
+                        # Same /24 subnet alone is NOT sufficient — most consumer
+                        # routers use 192.168.1.0/24, so two devices on completely
+                        # different networks can match. Require BOTH same subnet
+                        # AND same public IP to confirm they share a real LAN.
                         initiator_lan_ip = req.get("initiator_lan_ip", "")
+                        initiator_public_ip = req.get("initiator_public_ip", "")
                         my_lan_ip = get_physical_ip()
+                        my_public_ip = get_public_ip()
                         peer_is_lan = False
                         if initiator_lan_ip and my_lan_ip:
-                            # Same /24 subnet = same LAN
                             try:
                                 init_parts = initiator_lan_ip.rsplit(".", 1)[0]
                                 my_parts = my_lan_ip.rsplit(".", 1)[0]
-                                peer_is_lan = (init_parts == my_parts)
+                                same_subnet = (init_parts == my_parts)
+                                same_public = (
+                                    initiator_public_ip and my_public_ip
+                                    and initiator_public_ip == my_public_ip
+                                )
+                                peer_is_lan = same_subnet and same_public
                             except (ValueError, IndexError):
                                 pass
 
