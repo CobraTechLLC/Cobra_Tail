@@ -4000,6 +4000,10 @@ class QuantumVPNService:
         We cross-reference mesh_peers.json (has pubkeys, endpoints, IPs)
         with the Lighthouse's active tunnel list (has request_ids and
         device_ids) to rebuild the full in-memory state.
+
+        After rehydrating, if wg_mesh is not up but we have valid peers
+        and a config on disk, bring the interface up so the path monitor
+        and hole-punching can actually work.
         """
         mesh_peers_path = DATA_DIR / "mesh_peers.json"
         if not mesh_peers_path.exists():
@@ -4074,6 +4078,42 @@ class QuantumVPNService:
 
         if rehydrated:
             log.info(f"Mesh rehydrate: restored {rehydrated} peer(s) from disk + Lighthouse")
+
+            # Ensure wg_mesh interface is actually up — rehydrating the in-memory
+            # dict is useless if the WireGuard interface doesn't exist. The config
+            # file on disk (wg_mesh.conf) was written by the previous session and
+            # should still be valid with the correct private key, peers, and PSKs.
+            if not _mesh_interface_is_up():
+                mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
+                if mesh_conf_path.exists():
+                    log.info("Mesh rehydrate: wg_mesh interface is DOWN — bringing it up from saved config")
+                    try:
+                        # Clean teardown first in case of partial state
+                        subprocess.run(
+                            ["sudo", "wg-quick", "down", str(mesh_conf_path)],
+                            capture_output=True, timeout=10,
+                        )
+                        subprocess.run(
+                            ["sudo", "ip", "link", "delete", "dev", "wg_mesh"],
+                            capture_output=True, timeout=5,
+                        )
+                        subprocess.run(
+                            ["sudo", "resolvconf", "-d", "wg_mesh", "-f"],
+                            capture_output=True, timeout=5,
+                        )
+                        # Bring it up
+                        result = subprocess.run(
+                            ["sudo", "wg-quick", "up", str(mesh_conf_path)],
+                            capture_output=True, text=True, timeout=15,
+                        )
+                        if result.returncode == 0:
+                            log.info("Mesh rehydrate: wg_mesh interface is now UP")
+                        else:
+                            log.error(f"Mesh rehydrate: failed to bring up wg_mesh: {result.stderr.strip()}")
+                    except Exception as e:
+                        log.error(f"Mesh rehydrate: wg-quick up failed: {e}")
+                else:
+                    log.warning("Mesh rehydrate: wg_mesh is down and no wg_mesh.conf found — peers will need to re-mesh")
         else:
             log.debug("Mesh rehydrate: no peers matched between disk and Lighthouse")
 
