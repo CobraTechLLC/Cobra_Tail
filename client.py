@@ -3361,6 +3361,7 @@ class QuantumVPNService:
         self._repunch_active: dict[str, bool] = {}  # peer_id → True if re-punch in progress
         self._repunch_cooldown: dict[str, float] = {}  # peer_id → time.time() when cooldown started
         self._mesh_pending_initiations = {}  # device_id → request_id (in-flight requests)
+        self._mesh_failure_cooldowns = {}  # device_id → timestamp when cooldown expires
         self.auto_accept_mesh = True  # Auto-accept mesh requests from registered peers
         self.peer_kem = PeerKEMExchange(self)
         self._path_monitor_thread = None  # Phase 4: mesh path monitor thread
@@ -4128,6 +4129,13 @@ class QuantumVPNService:
                 request_id = req["request_id"]
                 initiator_id = req["initiator_id"]
 
+                # ── Cooldown check: skip peers that recently failed mesh setup
+                cooldown_until = self._mesh_failure_cooldowns.get(initiator_id, 0)
+                if time.time() < cooldown_until:
+                    remaining = int(cooldown_until - time.time())
+                    log.debug(f"Skipping mesh request from {initiator_id} — cooldown ({remaining}s remaining)")
+                    continue
+
                 log.info(f"Pending mesh request from {initiator_id} ({request_id})")
 
                 if self.auto_accept_mesh:
@@ -4200,6 +4208,9 @@ class QuantumVPNService:
                                 }
                                 log.info(f"Mesh tunnel active: {initiator_id} (mesh: {peer_mesh_ip or peer_vpn})")
 
+                                # Clear any prior cooldown on success
+                                self._mesh_failure_cooldowns.pop(initiator_id, None)
+
                                 # Initiate direct peer KEM exchange to replace
                                 # Lighthouse-brokered PSK with zero-trust one
                                 self.peer_kem.initiate_exchange(
@@ -4214,6 +4225,9 @@ class QuantumVPNService:
 
                     except Exception as e:
                         log.warning(f"Failed to accept mesh tunnel {request_id}: {e}")
+                        # Apply cooldown so we don't immediately retry this peer
+                        self._mesh_failure_cooldowns[initiator_id] = time.time() + 120
+                        log.info(f"Mesh cooldown set for {initiator_id} (120s)")
 
         except Exception as e:
             log.debug(f"Mesh check failed: {e}")
@@ -4294,6 +4308,9 @@ class QuantumVPNService:
                         f"Lighthouse has active tunnel {request_id} with {peer_id} "
                         f"but we don't have it locally — requesting cleanup"
                     )
+                    # Set a cooldown to prevent immediate re-mesh after cleanup
+                    if peer_id and peer_id != "unknown":
+                        self._mesh_failure_cooldowns[peer_id] = time.time() + 60
                     # Ask lighthouse to delete this orphaned tunnel
                     try:
                         get_session().post(
@@ -4362,6 +4379,21 @@ class QuantumVPNService:
         try:
             my_device_id = get_client_id()
 
+            # Clean up stale pending initiations — "failed" entries and entries
+            # older than 2 minutes should not block future mesh attempts forever
+            stale_cutoff = time.time() - 120
+            stale_pending = [
+                did for did, rid in self._mesh_pending_initiations.items()
+                if rid == "failed" or (
+                    isinstance(rid, str) and rid.startswith("mesh-")
+                    and did not in {m.get("peer_id") for m in self.mesh_peers.values()}
+                )
+            ]
+            for did in stale_pending:
+                del self._mesh_pending_initiations[did]
+            if stale_pending:
+                log.debug(f"Cleared {len(stale_pending)} stale pending mesh initiation(s)")
+
             # Collect peers from both LAN discovery and the Lighthouse peer list
             peers_to_mesh = {}
 
@@ -4395,13 +4427,22 @@ class QuantumVPNService:
                 # Tie-breaking: only the lower device_id initiates mesh requests.
                 # The higher device_id waits for the incoming request and accepts it.
                 # This prevents both peers from creating duplicate mesh requests.
-                if my_device_id > device_id:
+                #
+                # Exception: if we have ZERO mesh peers, nobody is meshing with us.
+                # Override tie-breaking so we don't wait forever for a peer that
+                # may be in cooldown, already meshed, or simply not initiating.
+                has_any_mesh = bool(self.mesh_peers)
+                if has_any_mesh and my_device_id > device_id:
                     continue
 
                 # Skip if we already have a mesh tunnel or pending request with this peer
                 if any(m["peer_id"] == device_id for m in self.mesh_peers.values()):
                     continue
                 if device_id in self._mesh_pending_initiations:
+                    continue
+                # Skip peers in failure cooldown
+                cooldown_until = self._mesh_failure_cooldowns.get(device_id, 0)
+                if time.time() < cooldown_until:
                     continue
 
                 source = peer_info["source"]
@@ -4433,7 +4474,12 @@ class QuantumVPNService:
                     err_msg = str(e)
                     if "409" in err_msg or "already exists" in err_msg.lower():
                         log.debug(f"Mesh tunnel already exists with {device_id}")
+                    elif "429" in err_msg:
+                        # Rate limited — back off longer
+                        self._mesh_failure_cooldowns[device_id] = time.time() + 300
+                        log.warning(f"Rate limited requesting mesh with {device_id} — cooldown 300s")
                     else:
+                        self._mesh_failure_cooldowns[device_id] = time.time() + 120
                         log.warning(f"Failed to request mesh tunnel with {device_id}: {e}")
 
         except Exception as e:

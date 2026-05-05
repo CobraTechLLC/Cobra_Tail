@@ -1501,7 +1501,7 @@ async def register_device(req: RegisterRequest):
     )
 
     vpn_addr = existing["vpn_address"] if existing and existing["vpn_address"] else allocate_vpn_address()
-    mesh_addr = existing["mesh_address"] if existing and existing["mesh_address"] else None
+    mesh_addr = existing["mesh_address"] if existing and existing["mesh_address"] else get_or_allocate_mesh_address(req.device_id)
 
     with get_db() as conn:
         conn.execute("""
@@ -2086,6 +2086,32 @@ async def trigger_rotation():
 
     return {"status": "rotation_triggered", "message": "Rotation cycle started in background"}
 
+def _verify_same_lan(initiator_public_ip: str, target_public_ip: str,
+                     initiator_lan_ip: str, target_lan_ip: str) -> bool:
+    """
+    Verify two peers are genuinely on the same LAN.
+    Subnet match alone is not enough — 192.168.1.0/24 is used by nearly every
+    consumer router. Two peers on different WiFi networks (e.g. home vs cafe)
+    will both report 192.168.1.x but can't reach each other.
+    Requires BOTH: same /24 subnet AND same public IP.
+    """
+    if not initiator_lan_ip or not target_lan_ip:
+        return False
+    init_prefix = ".".join(initiator_lan_ip.split(".")[:3])
+    tgt_prefix = ".".join(target_lan_ip.split(".")[:3])
+    if init_prefix != tgt_prefix:
+        return False
+    # Subnet matches — now verify they share the same public IP
+    if not initiator_public_ip or not target_public_ip:
+        # Can't confirm — don't assume same LAN
+        return False
+    if initiator_public_ip != target_public_ip:
+        log.info(f"  LAN subnet match ({init_prefix}.x) but different public IPs "
+                 f"({initiator_public_ip} vs {target_public_ip}) — NOT same LAN")
+        return False
+    return True
+
+
 def _select_best_endpoint(candidates_json: str | None, fallback_endpoint: str,
                           same_lan: bool = False) -> str:
     """
@@ -2173,6 +2199,8 @@ def _compute_nat_pairing(
     target_nat_type: str | None,
     initiator_candidates_json: str | None,
     target_candidates_json: str | None,
+    initiator_public_ip: str = "",
+    target_public_ip: str = "",
 ) -> dict:
     """
     Phase 2 B7: Smart NAT pairing logic.
@@ -2218,9 +2246,9 @@ def _compute_nat_pairing(
     if init_lan and tgt_lan:
         init_lan_ip = init_lan[0]["endpoint"].split(":")[0]
         tgt_lan_ip = tgt_lan[0]["endpoint"].split(":")[0]
-        init_prefix = ".".join(init_lan_ip.split(".")[:3])
-        tgt_prefix = ".".join(tgt_lan_ip.split(".")[:3])
-        if init_prefix == tgt_prefix:
+        if _verify_same_lan(initiator_public_ip, target_public_ip,
+                            init_lan_ip, tgt_lan_ip):
+            init_prefix = ".".join(init_lan_ip.split(".")[:3])
             log.info(f"  NAT pairing: SAME LAN ({init_prefix}.x) — direct connection")
             return {
                 "initiator_endpoint": init_lan[0]["endpoint"],
@@ -2441,12 +2469,10 @@ async def mesh_request(req: MeshHandshakeRequest):
     initiator_public_ip = req.initiator_public_ip or (initiator["public_ip"] if "public_ip" in initiator.keys() else "") or ""
     target_lan_ip = target["lan_ip"] or ""
 
-    # Check if both peers are on the same LAN
-    same_lan = False
-    if initiator_lan_ip and target_lan_ip:
-        init_prefix = ".".join(initiator_lan_ip.split(".")[:3])
-        tgt_prefix = ".".join(target_lan_ip.split(".")[:3])
-        same_lan = (init_prefix == tgt_prefix)
+    # Check if both peers are on the same LAN (subnet match + public IP match)
+    target_public_ip = (target["public_ip"] if "public_ip" in target.keys() else "") or ""
+    same_lan = _verify_same_lan(initiator_public_ip, target_public_ip,
+                                initiator_lan_ip, target_lan_ip)
 
     if same_lan and initiator_lan_ip:
         initiator_endpoint = f"{initiator_lan_ip}:{req.initiator_wg_listen_port}"
@@ -2529,12 +2555,10 @@ async def mesh_accept(req: MeshAcceptRequest):
     acceptor_public_ip = req.acceptor_public_ip or (acceptor_peer["public_ip"] if acceptor_peer and "public_ip" in acceptor_peer.keys() else "") or ""
     initiator_lan_ip = initiator_peer["lan_ip"] if initiator_peer else ""
 
-    # Check if both peers are on the same LAN
-    same_lan = False
-    if acceptor_lan_ip and initiator_lan_ip:
-        acc_prefix = ".".join(acceptor_lan_ip.split(".")[:3])
-        init_prefix = ".".join(initiator_lan_ip.split(".")[:3])
-        same_lan = (acc_prefix == init_prefix)
+    # Check if both peers are on the same LAN (subnet match + public IP match)
+    initiator_public_ip = (initiator_peer["public_ip"] if initiator_peer and "public_ip" in initiator_peer.keys() else "") or ""
+    same_lan = _verify_same_lan(initiator_public_ip, acceptor_public_ip,
+                                initiator_lan_ip, acceptor_lan_ip)
 
     if same_lan and acceptor_lan_ip:
         acceptor_endpoint = f"{acceptor_lan_ip}:{req.acceptor_wg_listen_port}"
@@ -2554,6 +2578,8 @@ async def mesh_accept(req: MeshAcceptRequest):
         pairing = _compute_nat_pairing(
             tunnel["initiator_nat_type"], req.acceptor_nat_type,
             tunnel["initiator_candidates"], req.acceptor_candidates,
+            initiator_public_ip=initiator_public_ip,
+            target_public_ip=acceptor_public_ip,
         )
         pairing_confidence = pairing["confidence"]
 
@@ -2768,20 +2794,23 @@ async def mesh_update_candidates(req: MeshUpdateCandidatesRequest):
     else:
         raise HTTPException(403, "You are not part of this mesh tunnel")
 
-    # Detect same-LAN from the candidate list — if a LAN candidate exists
-    # and the current best is also a LAN IP, preserve LAN preference
-    has_lan_candidate = False
+    # Detect same-LAN: verify both peers share the same public IP,
+    # not just the same private subnet (which is common across different networks)
+    same_lan_hint = False
     try:
         cands = json.loads(req.candidates) if isinstance(req.candidates, str) else req.candidates
         has_lan_candidate = any(c.get("type") == "lan" for c in (cands or []))
+        if has_lan_candidate:
+            # Look up both peers' public IPs to verify they're actually on the same network
+            other_device_id = tunnel["target_id"] if tunnel["initiator_id"] == req.device_id else tunnel["initiator_id"]
+            with get_db() as conn:
+                my_peer = conn.execute("SELECT public_ip FROM peers WHERE device_id = ?", (req.device_id,)).fetchone()
+                other_peer = conn.execute("SELECT public_ip FROM peers WHERE device_id = ?", (other_device_id,)).fetchone()
+            my_pub = (my_peer["public_ip"] if my_peer and "public_ip" in my_peer.keys() else "") or ""
+            other_pub = (other_peer["public_ip"] if other_peer and "public_ip" in other_peer.keys() else "") or ""
+            same_lan_hint = bool(my_pub and other_pub and my_pub == other_pub)
     except (json.JSONDecodeError, TypeError):
         pass
-    # Check if the OTHER side's endpoint is also a LAN IP
-    other_col = "target_endpoint" if col_endpoint == "initiator_endpoint" else "initiator_endpoint"
-    other_ep = tunnel[other_col] or ""
-    other_is_lan = any(other_ep.startswith(p) for p in (
-        "192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31."))
-    same_lan_hint = has_lan_candidate and other_is_lan
     new_endpoint = _select_best_endpoint(req.candidates, tunnel[col_endpoint] or "", same_lan=same_lan_hint)
 
     with get_db() as conn:
