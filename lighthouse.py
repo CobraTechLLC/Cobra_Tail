@@ -2476,6 +2476,7 @@ async def mesh_request(req: MeshHandshakeRequest):
 
     if same_lan and initiator_lan_ip:
         initiator_endpoint = f"{initiator_lan_ip}:{req.initiator_wg_listen_port}"
+        init_prefix = ".".join(initiator_lan_ip.split(".")[:3])
         log.info(f"  Mesh topology: SAME LAN (both on {init_prefix}.x)")
     elif initiator_public_ip:
         initiator_endpoint = f"{initiator_public_ip}:{req.initiator_wg_listen_port}"
