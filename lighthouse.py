@@ -170,7 +170,7 @@ def load_config(path: str) -> dict:
     # Set defaults for optional fields
     cfg.setdefault("listen_addr", "0.0.0.0")
     cfg.setdefault("listen_port", 8443)
-    cfg.setdefault("peer_timeout", 120)
+    cfg.setdefault("peer_timeout", 180)
     cfg.setdefault("max_clients", 25)
     cfg.setdefault("tls", {"enabled": False})
     cfg.setdefault("vault_uart", {"enabled": True, "device": "/dev/ttyAMA0", "baud_rate": 115200})
@@ -2397,6 +2397,7 @@ async def mesh_request(req: MeshHandshakeRequest):
         raise HTTPException(503, "Target peer is offline")
 
     # Check for existing active tunnel between these two peers
+    # Also count total active tunnels per peer pair to prevent accumulation
     with get_db() as conn:
         existing = conn.execute(
             "SELECT request_id FROM mesh_tunnels "
@@ -2404,10 +2405,19 @@ async def mesh_request(req: MeshHandshakeRequest):
             "AND status IN ('pending', 'active')",
             (req.initiator_device_id, req.target_device_id,
              req.target_device_id, req.initiator_device_id),
-        ).fetchone()
+        ).fetchall()
 
     if existing:
-        raise HTTPException(409, f"Mesh tunnel already exists: {existing['request_id']}")
+        if len(existing) > 1:
+            # Multiple tunnels exist between same pair — keep newest, delete rest
+            log.warning(f"Found {len(existing)} duplicate tunnels between "
+                       f"{req.initiator_device_id} and {req.target_device_id} — cleaning up")
+            with get_db() as conn:
+                for row in existing[:-1]:
+                    conn.execute("DELETE FROM mesh_tunnels WHERE request_id = ?",
+                                (row["request_id"],))
+                    log.info(f"Deleted duplicate tunnel {row['request_id']}")
+        raise HTTPException(409, f"Mesh tunnel already exists: {existing[-1]['request_id']}")
 
     request_id = f"mesh-{uuid.uuid4().hex[:12]}"
 
@@ -2863,11 +2873,11 @@ async def mesh_cleanup_orphan(request: Request):
             (request_id,),
         )
 
-        # Notify the OTHER peer so they can re-mesh immediately
+        # Only notify the OTHER peer (not all peers) and use a quieter event type
+        # that doesn't trigger full re-mesh storms across the entire network
         other_id = tunnel["target_id"] if device_id == tunnel["initiator_id"] else tunnel["initiator_id"]
         try:
-            _notify_peers_of_mesh_event(other_id, "tunnel_cleared")
-            _notify_peers_of_mesh_event(device_id, "tunnel_cleared")
+            _notify_peers_of_mesh_event(other_id, "orphan_cleared")
         except Exception:
             pass
 
@@ -2894,22 +2904,21 @@ def _cleanup_stale_mesh_tunnels() -> None:
             (cutoff,)
         ).rowcount
 
-        # Remove active tunnels where EITHER peer has been offline for over 2 minutes.
-        # Previously required BOTH peers offline for 10 minutes, which left stale
-        # records during testing when one peer restarted but the other was still
-        # "online" from a recent heartbeat. 2 minutes = ~4 missed heartbeats,
-        # enough to confirm a peer is genuinely gone.
-        offline_cutoff = time.time() - 120
+        # Remove active tunnels where BOTH peers have been offline for over 5 minutes.
+        # Using EITHER peer was too aggressive — a single peer's missed heartbeat
+        # cascade would wipe all its tunnels, causing reconcile/re-mesh churn.
+        # Requiring BOTH offline with a 5-minute window ensures genuine disconnection.
+        offline_cutoff = time.time() - 300
         stale = conn.execute("""
-            DELETE FROM mesh_tunnels WHERE status = 'active' AND request_id IN (
-                SELECT mt.request_id FROM mesh_tunnels mt
-                LEFT JOIN peers p1 ON mt.initiator_id = p1.device_id
-                LEFT JOIN peers p2 ON mt.target_id = p2.device_id
-                WHERE mt.status = 'active'
-                AND (p1.last_seen IS NULL OR p1.last_seen < ?
-                     OR p2.last_seen IS NULL OR p2.last_seen < ?)
-            )
-        """, (offline_cutoff, offline_cutoff)).rowcount
+                    DELETE FROM mesh_tunnels WHERE status = 'active' AND request_id IN (
+                        SELECT mt.request_id FROM mesh_tunnels mt
+                        LEFT JOIN peers p1 ON mt.initiator_id = p1.device_id
+                        LEFT JOIN peers p2 ON mt.target_id = p2.device_id
+                        WHERE mt.status = 'active'
+                        AND (p1.last_seen IS NULL OR p1.last_seen < ?)
+                        AND (p2.last_seen IS NULL OR p2.last_seen < ?)
+                    )
+                """, (offline_cutoff, offline_cutoff)).rowcount
 
         if expired > 0 or stale > 0:
             log.info(f"Mesh cleanup: {expired} expired pending, {stale} stale active tunnels removed")

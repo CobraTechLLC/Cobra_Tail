@@ -199,12 +199,12 @@ WG_CONFIG_PATH = CONFIG_DIR / "wg_quantum.conf"
 STATE_PATH = DATA_DIR / "client_state.json"
 
 # Timers
-HEARTBEAT_INTERVAL = 30         # Heartbeat to Lighthouse every 30s
-NETWORK_CHECK_INTERVAL = 5     # Check for network changes every 5s
-DISCOVERY_INTERVAL = 30         # LAN broadcast every 30s
-RECONNECT_DELAY = 10            # Initial wait before reconnect attempt
-RECONNECT_MAX_DELAY = 120       # Maximum backoff cap (seconds)
-RECONNECT_BACKOFF_FACTOR = 2    # Multiply delay by this on each failure
+HEARTBEAT_INTERVAL = 20         # Heartbeat to Lighthouse every 20s (tighter keeps us online)
+NETWORK_CHECK_INTERVAL = 3      # Check for network changes every 3s (faster detection)
+DISCOVERY_INTERVAL = 20         # LAN broadcast every 20s (faster peer discovery)
+RECONNECT_DELAY = 5             # Initial wait before reconnect attempt
+RECONNECT_MAX_DELAY = 60        # Maximum backoff cap (seconds)
+RECONNECT_BACKOFF_FACTOR = 1.5  # Multiply delay by this on each failure (gentler backoff)
 ENDPOINT_PROBE_TIMEOUT = 3      # Timeout for LAN probe (seconds)
 
 # Heartbeat jitter — spread load when many clients heartbeat simultaneously
@@ -257,11 +257,11 @@ UPNP_MAPPING_DURATION = 3600  # seconds (1 hour), auto-renewed by heartbeat
 _active_upnp_mappings = {}    # external_port → {"internal_port": int, "gateway": str}
 
 # ─── Path Monitoring (Phase 4) ───────────────────────────────────────────────
-PATH_MONITOR_INTERVAL = 30           # Check mesh handshake freshness every 30s
-HANDSHAKE_STALE_THRESHOLD = 120      # Seconds since last WG handshake before considered stale (2.5 missed keepalives)
-PATH_MONITOR_MAX_RETRIES = 3         # Max re-punch attempts before flagging for relay
-PATH_MONITOR_RETRY_DELAYS = [5, 15, 30]  # Delays between re-punch attempts (seconds)
-PATH_MONITOR_COOLDOWN = 300              # Skip re-punch for 5 min after exhausting retries
+PATH_MONITOR_INTERVAL = 15           # Check mesh handshake freshness every 15s (catch stale faster)
+HANDSHAKE_STALE_THRESHOLD = 90       # Seconds since last WG handshake before considered stale
+PATH_MONITOR_MAX_RETRIES = 5         # Max re-punch attempts before flagging for relay
+PATH_MONITOR_RETRY_DELAYS = [3, 5, 10, 15, 20]  # Delays between re-punch attempts (faster retries)
+PATH_MONITOR_COOLDOWN = 120              # Skip re-punch for 2 min after exhausting retries
 
 # ─── STUN Cache (Phase 4 optimization) ───────────────────────────────────────
 STUN_CACHE_TTL = 300  # Reuse cached STUN/NAT data for 5 minutes between refreshes
@@ -1745,7 +1745,7 @@ def send_heartbeat(lighthouse_url: str) -> dict | bool:
         resp = get_session().post(
             f"{lighthouse_url}/api/v1/heartbeat",
             json=payload,
-            timeout=10,
+            timeout=6,
         )
         if resp.status_code == 200:
             return resp.json()
@@ -3473,14 +3473,18 @@ class QuantumVPNService:
             while self._running:
                 now = time.time()
 
-                # Heartbeat to Lighthouse (with jitter)
+                # Heartbeat to Lighthouse (with jitter and retry)
                 if now - last_heartbeat >= next_heartbeat_interval:
                     if self.lighthouse_url and self.connected:
                         hb_result = send_heartbeat(self.lighthouse_url)
                         if not hb_result:
-                            log.warning("Heartbeat failed — connection may be lost")
+                            # Retry once after a short pause before declaring loss
+                            time.sleep(2)
+                            hb_result = send_heartbeat(self.lighthouse_url)
+                        if not hb_result:
+                            log.warning("Heartbeat failed twice — connection may be lost")
                             notify_sentinel(
-                                "Heartbeat failed — connection may be lost",
+                                "Heartbeat failed (2 attempts) — connection may be lost",
                                 component="heartbeat",
                                 lighthouse_url=self.lighthouse_url or "",
                             )
@@ -3770,12 +3774,28 @@ class QuantumVPNService:
             return False
 
     def _check_network_change(self) -> None:
-        """Detect if we've switched networks and re-evaluate endpoint."""
+        """Detect if we've switched networks and re-evaluate endpoint.
+        Monitors both default gateway AND local IP address changes to catch
+        WiFi flaps and DHCP renewals that don't change the gateway."""
         current_gateway = get_default_gateway_ip()
+        current_ip = get_physical_ip()
 
-        if current_gateway != self.last_gateway and self.last_gateway is not None:
-            log.info(f"Network change detected: {self.last_gateway} → {current_gateway}")
+        # Track local IP for WiFi flap detection
+        if not hasattr(self, '_last_local_ip'):
+            self._last_local_ip = current_ip
+
+        gateway_changed = (current_gateway != self.last_gateway and self.last_gateway is not None)
+        ip_changed = (current_ip != self._last_local_ip and self._last_local_ip is not None
+                      and current_ip and current_ip != "127.0.0.1")
+
+        if gateway_changed or ip_changed:
+            if gateway_changed:
+                log.info(f"Network change detected: gateway {self.last_gateway} → {current_gateway}")
+            if ip_changed:
+                log.info(f"Network change detected: IP {self._last_local_ip} → {current_ip}")
+
             self.last_gateway = current_gateway
+            self._last_local_ip = current_ip
 
             # Force public IP refresh since network changed
             get_public_ip(force_refresh=True)
@@ -3812,8 +3832,16 @@ class QuantumVPNService:
                     log.info("Endpoint update failed — doing full reconnect")
                     self._full_connect()
 
+            # Send immediate heartbeat so Lighthouse knows we're alive at new address
+            if self.lighthouse_url and self.connected:
+                try:
+                    send_heartbeat(self.lighthouse_url)
+                    log.info("Post-network-change heartbeat sent")
+                except Exception:
+                    pass
+
             # Immediately re-punch all mesh peers on ANY network change
-            # Don't wait for the path monitor's 30s poll + 150s staleness threshold
+            # Don't wait for the path monitor's poll + staleness threshold
             if self.mesh_peers:
                 log.info(f"Network change: immediately re-punching {len(self.mesh_peers)} mesh peer(s)")
                 for request_id, peer_info in list(self.mesh_peers.items()):
@@ -3825,14 +3853,15 @@ class QuantumVPNService:
                     ).start()
         else:
             self.last_gateway = current_gateway
+            self._last_local_ip = current_ip
 
     def _handle_connection_loss(self) -> None:
         """Handle a lost connection to the Lighthouse with exponential backoff.
-        Escalates: 10s → 20s → 40s → 60s → 120s (capped).
-        Resets to base delay on successful reconnect.
+        NON-BLOCKING: marks state and returns immediately. The service loop's
+        reconnect branch (checked every second) handles the actual retry using
+        self._last_reconnect_attempt and self._reconnect_delay.
 
-        On persistent failures, attempts to auto-heal cert fingerprint mismatches
-        by fetching the new fingerprint from the Lighthouse (trusted on LAN).
+        On persistent failures, attempts to auto-heal cert fingerprint mismatches.
         Also resets VPN-internal URLs that are unreachable when tunnel is down.
         """
         self.connected = False
@@ -3866,25 +3895,18 @@ class QuantumVPNService:
         if self._consecutive_failures > 0 and self._consecutive_failures % 3 == 0:
             self._try_auto_heal_fingerprint()
 
-        delay = self._reconnect_delay
-        log.info(f"Attempting reconnect in {delay:.0f}s (attempt #{self._consecutive_failures})...")
-        time.sleep(delay)
+        # Escalate the backoff for next attempt, capped at RECONNECT_MAX_DELAY
+        self._reconnect_delay = min(
+            self._reconnect_delay * RECONNECT_BACKOFF_FACTOR,
+            RECONNECT_MAX_DELAY,
+        )
+        # Set the reconnect timer so the service loop's reconnect branch picks it up
+        self._last_reconnect_attempt = time.time()
 
-        # Try to reconnect — endpoint might have changed
-        if self._full_connect():
-            log.info(f"Reconnected successfully after {self._consecutive_failures} attempt(s)")
-            self._reconnect_delay = RECONNECT_DELAY
-            self._consecutive_failures = 0
-        else:
-            # Escalate the backoff for next time, capped at RECONNECT_MAX_DELAY
-            self._reconnect_delay = min(
-                self._reconnect_delay * RECONNECT_BACKOFF_FACTOR,
-                RECONNECT_MAX_DELAY,
-            )
-            log.warning(
-                f"Reconnect failed — next attempt in {self._reconnect_delay:.0f}s "
-                f"(will retry on next heartbeat cycle)"
-            )
+        log.warning(
+            f"Connection lost — reconnect scheduled in {self._reconnect_delay:.0f}s "
+            f"(attempt #{self._consecutive_failures})"
+        )
 
     def _try_auto_heal_fingerprint(self) -> None:
         """Attempt to detect and fix a stale TLS cert fingerprint.
@@ -4294,19 +4316,50 @@ class QuantumVPNService:
             # Direction 2: lighthouse tunnels not applied locally → tell lighthouse
             # to delete them. This prevents phantom "active" records from blocking
             # auto-mesh with a 409 conflict forever.
+            #
+            # IMPORTANT: Add a grace period before deleting — a tunnel might be in
+            # the accept/apply pipeline (background thread) and not yet in self.mesh_peers.
+            # Only clean tunnels that have been on the Lighthouse for at least 90 seconds
+            # without being applied locally.
             local_request_ids = set(self.mesh_peers.keys())
             # Also count pending initiations as "known" — don't delete tunnels
             # we're actively polling for acceptance on
             pending_request_ids = set(self._mesh_pending_initiations.values())
             known_ids = local_request_ids | pending_request_ids
 
+            # Track first-seen time for unknown tunnels so we don't delete them immediately
+            if not hasattr(self, '_orphan_first_seen'):
+                self._orphan_first_seen = {}  # request_id → timestamp first noticed
+
+            now = time.time()
+            current_unknown = set()
+
             for tunnel in lighthouse_tunnels:
                 request_id = tunnel["request_id"]
                 if request_id not in known_ids:
+                    current_unknown.add(request_id)
                     peer_id = tunnel.get("peer_id", "unknown")
+
+                    # First time seeing this unknown tunnel — record and skip
+                    if request_id not in self._orphan_first_seen:
+                        self._orphan_first_seen[request_id] = now
+                        log.debug(
+                            f"Lighthouse tunnel {request_id} with {peer_id} not local — "
+                            f"will clean if still orphaned after 90s"
+                        )
+                        continue
+
+                    # Check grace period — don't delete tunnels we just noticed
+                    age = now - self._orphan_first_seen[request_id]
+                    if age < 90:
+                        log.debug(
+                            f"Orphan tunnel {request_id} age {age:.0f}s < 90s grace — skipping"
+                        )
+                        continue
+
                     log.info(
                         f"Lighthouse has active tunnel {request_id} with {peer_id} "
-                        f"but we don't have it locally — requesting cleanup"
+                        f"orphaned for {age:.0f}s — requesting cleanup"
                     )
                     # Set a cooldown to prevent immediate re-mesh after cleanup
                     if peer_id and peer_id != "unknown":
@@ -4321,8 +4374,15 @@ class QuantumVPNService:
                             },
                             timeout=5,
                         )
+                        self._orphan_first_seen.pop(request_id, None)
                     except Exception as e:
                         log.debug(f"Orphan cleanup request failed: {e}")
+
+            # Clean up tracking for tunnels that are no longer unknown
+            # (they were either applied locally or deleted from Lighthouse)
+            stale_tracking = [rid for rid in self._orphan_first_seen if rid not in current_unknown]
+            for rid in stale_tracking:
+                del self._orphan_first_seen[rid]
 
         except Exception as e:
             log.debug(f"Mesh state reconciliation failed: {e}")
@@ -4423,6 +4483,12 @@ class QuantumVPNService:
             if not peers_to_mesh:
                 return
 
+            # Limit concurrent mesh initiations to avoid burst behavior that
+            # creates duplicate tunnels when multiple peers come online at once
+            active_initiations = sum(1 for v in self._mesh_pending_initiations.values()
+                                     if v != "failed")
+            max_concurrent_initiations = 2
+
             for device_id, peer_info in peers_to_mesh.items():
                 # Tie-breaking: only the lower device_id initiates mesh requests.
                 # The higher device_id waits for the incoming request and accepts it.
@@ -4445,6 +4511,12 @@ class QuantumVPNService:
                 if time.time() < cooldown_until:
                     continue
 
+                # Limit concurrent initiations to prevent burst-creating duplicates
+                if active_initiations >= max_concurrent_initiations:
+                    log.debug(f"Skipping mesh initiation with {device_id} — "
+                             f"{active_initiations} already in flight")
+                    break
+
                 source = peer_info["source"]
                 is_lan = peer_info["is_lan"]
                 log.info(f"Peer {device_id} found via {source} -- requesting mesh tunnel")
@@ -4458,6 +4530,7 @@ class QuantumVPNService:
                     request_id = result.get("request_id", "")
                     if result.get("status") == "pending" and request_id:
                         self._mesh_pending_initiations[device_id] = request_id
+                        active_initiations += 1
                         log.info(f"Mesh request sent to {device_id}: {request_id}")
 
                         # Poll for acceptance in a background thread
@@ -4733,6 +4806,11 @@ class QuantumVPNService:
         try:
             for attempt, delay in enumerate(PATH_MONITOR_RETRY_DELAYS[:PATH_MONITOR_MAX_RETRIES], 1):
                 if not self._running:
+                    return
+
+                # Check if this tunnel was cleaned up while we were sleeping
+                if request_id not in self.mesh_peers:
+                    log.info(f"Path monitor: tunnel {request_id} for {peer_id} was removed — stopping re-punch")
                     return
 
                 log.info(f"Path monitor: re-punch attempt {attempt}/{PATH_MONITOR_MAX_RETRIES} for {peer_id}")
