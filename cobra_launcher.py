@@ -1592,7 +1592,10 @@ def show_mesh_peers():
     else:
         wg_path = "wg"
 
-    result = run_cmd([wg_path, "show", "wg_mesh", "latest-handshakes"])
+    wg_cmd = [wg_path, "show", "wg_mesh", "latest-handshakes"]
+    if not IS_WINDOWS:
+        wg_cmd = ["sudo"] + wg_cmd
+    result = run_cmd(wg_cmd)
     if result.returncode == 0 and result.stdout.strip():
         print(f"  {BOLD}Handshakes{RESET}")
         for line in result.stdout.strip().splitlines():
