@@ -1043,7 +1043,23 @@ def send_holepunch_burst(target_endpoints: list[str], listen_port: int = MESH_WG
             try:
                 sock6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
                 sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-                sock6.bind(("::", listen_port if not sock4 else 0))
+                # FIX: Always bind to listen_port. IPV6_V6ONLY is set, so there's
+                # no conflict with the IPv4 socket on the same port. The old code
+                # used port 0 when sock4 existed, which meant IPv6 punch packets
+                # came from a random ephemeral port — never opening the correct
+                # NAT pinhole for WireGuard's listen port.
+                sock6.bind(("::", listen_port))
+            except OSError as e:
+                # If listen_port is truly unavailable (unlikely with V6ONLY),
+                # fall back to ephemeral and log a warning
+                log.warning(f"Hole punch: IPv6 bind to port {listen_port} failed: {e} — using ephemeral port")
+                try:
+                    sock6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                    sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    sock6.bind(("::", 0))
+                except Exception as e2:
+                    log.debug(f"Hole punch: IPv6 socket setup failed entirely: {e2}")
+                    sock6 = None
             except Exception as e:
                 log.debug(f"Hole punch: IPv6 socket setup failed: {e}")
                 sock6 = None
@@ -2007,8 +2023,28 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
     mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
     mesh_peers_path = DATA_DIR / "mesh_peers.json"
 
-    # Determine the AllowedIPs — use mesh IP if available, fall back to VPN address
+    # Determine the AllowedIPs — use mesh IP if available, fall back to VPN address.
+    # If peer_mesh_ip is empty, check mesh_peers.json for a previously saved mesh_ip
+    # before falling back to VPN address, which would break mesh routing.
+    if not peer_mesh_ip:
+        try:
+            if mesh_peers_path.exists():
+                saved_peers = json.loads(mesh_peers_path.read_text())
+                for pk, info in saved_peers.items():
+                    if info.get("vpn_address") == peer_vpn_address and info.get("mesh_ip"):
+                        peer_mesh_ip = info["mesh_ip"]
+                        log.info(f"Recovered mesh IP {peer_mesh_ip} from disk for peer {peer_vpn_address}")
+                        break
+        except Exception:
+            pass
+
     peer_allowed_ip = peer_mesh_ip or peer_vpn_address
+    if not peer_mesh_ip:
+        log.warning(
+            f"Mesh peer {peer_wg_pubkey[:20]}... has no mesh IP — "
+            f"falling back to VPN address {peer_vpn_address} for AllowedIPs. "
+            f"This WILL break mesh routing if other peers use 10.200.0.x mesh IPs."
+        )
 
     # Load existing mesh peers from disk
     existing_peers = {}
@@ -2851,10 +2887,43 @@ class PeerKEMExchange:
         # Look up the mesh IP and my mesh IP so apply_mesh_peer uses the right AllowedIPs
         peer_mesh_ip = ""
         my_mesh_ip = ""
+
+        # Strategy 1: match by vpn_address, endpoint, OR peer_id — endpoints change
+        # constantly (IPv6 rotation, LAN/public flips), so vpn_address and peer_id
+        # are more reliable identifiers.
         for req_id, peer in self.service.mesh_peers.items():
-            if peer.get("vpn_address") == peer_vpn_address or peer.get("endpoint") == peer_endpoint:
+            if (peer.get("vpn_address") == peer_vpn_address or
+                peer.get("endpoint") == peer_endpoint or
+                peer.get("peer_wg_pubkey") == peer_wg_pubkey):
                 peer_mesh_ip = peer.get("mesh_ip", "")
                 break
+
+        # Strategy 2: check on-disk mesh_peers.json if in-memory lookup failed
+        if not peer_mesh_ip:
+            try:
+                mesh_peers_path = DATA_DIR / "mesh_peers.json"
+                if mesh_peers_path.exists():
+                    saved_peers = json.loads(mesh_peers_path.read_text())
+                    # Check by pubkey first (most reliable for rekey — old pubkey is still in file)
+                    if peer_wg_pubkey in saved_peers:
+                        peer_mesh_ip = saved_peers[peer_wg_pubkey].get("mesh_ip", "")
+                    # Fallback: match by vpn_address
+                    if not peer_mesh_ip:
+                        for pk, info in saved_peers.items():
+                            if info.get("vpn_address") == peer_vpn_address and info.get("mesh_ip"):
+                                peer_mesh_ip = info["mesh_ip"]
+                                break
+                if peer_mesh_ip:
+                    log.info(f"Peer KEM: recovered mesh IP {peer_mesh_ip} from disk for {peer_vpn_address}")
+            except Exception:
+                pass
+
+        if not peer_mesh_ip:
+            log.warning(
+                f"Peer KEM: no mesh IP found for {peer_wg_pubkey[:20]}... "
+                f"(vpn={peer_vpn_address}, ep={peer_endpoint}) — "
+                f"AllowedIPs will fall back to VPN address, which may break routing"
+            )
 
         try:
             state = load_state()
@@ -3500,16 +3569,28 @@ class QuantumVPNService:
                                 if hb_result.get("pending_mesh_requests", 0) > 0:
                                     # Heartbeat told us there are pending mesh requests — check immediately
                                     self._process_pending_mesh()
-                                # If a mesh peer pushed new candidates, re-punch immediately
-                                if hb_result.get("peer_candidates_updated") and self.mesh_peers:
-                                    log.info("Heartbeat: peer candidates updated — triggering re-punch")
-                                    for req_id, p_info in list(self.mesh_peers.items()):
-                                        threading.Thread(
-                                            target=self._path_monitor_repunch,
-                                            args=(req_id, p_info),
-                                            daemon=True,
-                                            name=f"hb-repunch-{req_id[:8]}",
-                                        ).start()
+                                    # If a mesh peer pushed new candidates, re-punch only STALE peers
+                                    if hb_result.get("peer_candidates_updated") and self.mesh_peers:
+                                        log.info(
+                                            "Heartbeat: peer candidates updated — checking which peers need re-punch")
+                                        hb_handshake_map = self._get_mesh_handshake_times()
+                                        hb_now = time.time()
+                                        for req_id, p_info in list(self.mesh_peers.items()):
+                                            peer_id = p_info.get("peer_id", "unknown")
+                                            peer_wg_pubkey = p_info.get("peer_wg_pubkey", "")
+                                            last_hs = hb_handshake_map.get(peer_wg_pubkey, 0)
+                                            age = (hb_now - last_hs) if last_hs > 0 else float("inf")
+                                            if age < HANDSHAKE_STALE_THRESHOLD:
+                                                log.debug(
+                                                    f"Heartbeat: skipping {peer_id} — handshake {age:.0f}s ago (healthy)")
+                                                continue
+                                            log.info(f"Heartbeat: re-punching {peer_id} — handshake {age:.0f}s stale")
+                                            threading.Thread(
+                                                target=self._path_monitor_repunch,
+                                                args=(req_id, p_info),
+                                                daemon=True,
+                                                name=f"hb-repunch-{req_id[:8]}",
+                                            ).start()
                                 # Lighthouse pushed mesh events (peer came online, tunnel cleared)
                                 # → trigger immediate mesh reconciliation + auto-mesh
                                 mesh_events = hb_result.get("mesh_events", [])
