@@ -110,6 +110,10 @@ def notify_sentinel(error_msg: str, component: str = "general", **extra_context)
 
 CONFIG: dict = {}
 
+# Timestamp of when the Lighthouse process started — used to provide a grace
+# period before aggressive mesh tunnel cleanup, and to signal clients that
+# the Lighthouse recently restarted so they should rebuild mesh state.
+_lighthouse_start_time: float = 0.0
 # ─── UART Frame Protocol (matches Vault's protocol) ─────────────────────────
 
 STX = 0x02
@@ -729,14 +733,26 @@ def restore_wireguard_peers() -> None:
     log.info(f"Restored {restored}/{len(rows)} WireGuard peers from database")
 
 def reset_peer_status_on_startup() -> None:
-    """Mark all peers as offline on startup so stale last_seen values don't
-    cause false 'online' status. Peers will re-register/heartbeat to come back."""
+    """Mark ALL peers as offline on startup so stale last_seen values don't
+    cause false 'online' status. Peers will re-register/heartbeat to come back.
+
+    Previously only reset vault peers — but after a Lighthouse power cycle,
+    client last_seen timestamps are equally stale. This caused
+    _cleanup_stale_mesh_tunnels() and _is_alive() to make wrong decisions
+    during the critical first minutes after restart, deleting mesh tunnels
+    that nodes were about to reclaim."""
     with get_db() as conn:
-        updated = conn.execute(
+        vault_updated = conn.execute(
             "UPDATE peers SET status = 'offline' WHERE device_type = 'vault'"
         ).rowcount
-    if updated:
-        log.info(f"Reset {updated} vault peer(s) to offline — waiting for re-registration")
+        client_updated = conn.execute(
+            "UPDATE peers SET status = 'offline' WHERE device_type = 'client'"
+        ).rowcount
+    if vault_updated or client_updated:
+        log.info(
+            f"Reset {vault_updated} vault + {client_updated} client peer(s) to offline "
+            f"— waiting for re-registration/heartbeat"
+        )
 
 # ─── Key Rotation ────────────────────────────────────────────────────────────
 
@@ -1586,6 +1602,7 @@ async def register_device(req: RegisterRequest):
         "local_endpoint": local_wg_endpoint,
         "dns": CONFIG["wireguard"].get("dns", []),
         "discovery": CONFIG.get("discovery", {}),
+        "lighthouse_restarted": (time.time() - _lighthouse_start_time) < 180,
     }
 
 @app.post("/api/v1/enroll")
@@ -1722,14 +1739,20 @@ async def heartbeat(req: HeartbeatRequest):
         log.error(f"Heartbeat cleanup failed: {e}")
         pass
 
-        # Fetch any pending mesh notifications (e.g., "a new peer just came online")
+    # Fetch any pending mesh notifications (e.g., "a new peer just came online")
     mesh_events = _fetch_mesh_notifications(req.device_id)
+
+    # Signal clients that the Lighthouse recently restarted so they know to
+    # aggressively rebuild mesh state. 3-minute window matches the grace period
+    # in _cleanup_stale_mesh_tunnels.
+    lighthouse_restarted = (time.time() - _lighthouse_start_time) < 180
 
     return {
         "status": "ok",
         "pending_mesh_requests": pending_mesh,
         "peer_candidates_updated": peer_candidates_updated,
         "mesh_events": [{"event": e["event"], "device_id": e["device_id"]} for e in mesh_events],
+        "lighthouse_restarted": lighthouse_restarted,
     }
 
 @app.get("/api/v1/peers")
@@ -2893,7 +2916,28 @@ def _get_peer_vpn_address(device_id: str) -> str:
     return row["vpn_address"] if row else ""
 
 def _cleanup_stale_mesh_tunnels() -> None:
-    """Remove mesh tunnels that have been pending too long or are between offline peers."""
+    """Remove mesh tunnels that have been pending too long or are between offline peers.
+
+    After a Lighthouse restart, all peer last_seen timestamps are stale (from
+    before the shutdown). Without a grace period, this function would immediately
+    delete every active tunnel — then nodes re-register, find no tunnels, and
+    have to rebuild from scratch (slowly, with timing races).
+
+    The grace period gives nodes time to heartbeat/register and refresh their
+    last_seen before we start garbage-collecting tunnels.
+    """
+    # Grace period: don't delete active tunnels for 3 minutes after Lighthouse
+    # startup. Pending tunnels are still cleaned (they're truly stuck), but
+    # active tunnels are preserved so nodes can reclaim them via rehydration.
+    uptime = time.time() - _lighthouse_start_time
+    skip_active_cleanup = uptime < 180  # 3 minutes
+
+    if skip_active_cleanup:
+        log.debug(
+            f"Mesh cleanup: Lighthouse uptime {uptime:.0f}s < 180s — "
+            f"skipping active tunnel cleanup (grace period)"
+        )
+
     with get_db() as conn:
         # Expire pending requests older than 60 seconds
         cutoff = datetime.fromtimestamp(
@@ -2904,21 +2948,23 @@ def _cleanup_stale_mesh_tunnels() -> None:
             (cutoff,)
         ).rowcount
 
-        # Remove active tunnels where BOTH peers have been offline for over 5 minutes.
-        # Using EITHER peer was too aggressive — a single peer's missed heartbeat
-        # cascade would wipe all its tunnels, causing reconcile/re-mesh churn.
-        # Requiring BOTH offline with a 5-minute window ensures genuine disconnection.
-        offline_cutoff = time.time() - 300
-        stale = conn.execute("""
-                    DELETE FROM mesh_tunnels WHERE status = 'active' AND request_id IN (
-                        SELECT mt.request_id FROM mesh_tunnels mt
-                        LEFT JOIN peers p1 ON mt.initiator_id = p1.device_id
-                        LEFT JOIN peers p2 ON mt.target_id = p2.device_id
-                        WHERE mt.status = 'active'
-                        AND (p1.last_seen IS NULL OR p1.last_seen < ?)
-                        AND (p2.last_seen IS NULL OR p2.last_seen < ?)
-                    )
-                """, (offline_cutoff, offline_cutoff)).rowcount
+        stale = 0
+        if not skip_active_cleanup:
+            # Remove active tunnels where BOTH peers have been offline for over 5 minutes.
+            # Using EITHER peer was too aggressive — a single peer's missed heartbeat
+            # cascade would wipe all its tunnels, causing reconcile/re-mesh churn.
+            # Requiring BOTH offline with a 5-minute window ensures genuine disconnection.
+            offline_cutoff = time.time() - 300
+            stale = conn.execute("""
+                        DELETE FROM mesh_tunnels WHERE status = 'active' AND request_id IN (
+                            SELECT mt.request_id FROM mesh_tunnels mt
+                            LEFT JOIN peers p1 ON mt.initiator_id = p1.device_id
+                            LEFT JOIN peers p2 ON mt.target_id = p2.device_id
+                            WHERE mt.status = 'active'
+                            AND (p1.last_seen IS NULL OR p1.last_seen < ?)
+                            AND (p2.last_seen IS NULL OR p2.last_seen < ?)
+                        )
+                    """, (offline_cutoff, offline_cutoff)).rowcount
 
         if expired > 0 or stale > 0:
             log.info(f"Mesh cleanup: {expired} expired pending, {stale} stale active tunnels removed")
@@ -3329,10 +3375,16 @@ def main():
 
     init_database(CONFIG["database"]["path"])
 
-    # Reset vault status so stale last_seen doesn't cause false positives
+    # Record startup time — used for grace periods and signaling clients
+    global _lighthouse_start_time
+    _lighthouse_start_time = time.time()
+
+    # Reset ALL peer status so stale last_seen doesn't cause false positives
     reset_peer_status_on_startup()
 
-    # Clean up stale mesh tunnels from previous runs
+    # Clean up stale mesh tunnels from previous runs.
+    # NOTE: _cleanup_stale_mesh_tunnels now has a 3-minute grace period for
+    # active tunnels after startup, so this initial call only cleans pending.
     try:
         _cleanup_stale_mesh_tunnels()
     except Exception:

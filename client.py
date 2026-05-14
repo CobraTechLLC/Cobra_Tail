@@ -1979,7 +1979,16 @@ def _rewrite_mesh_conf(mesh_conf_path: Path, wg_privkey: str,
         config += f"Address = {my_mesh_ip}/32\n"
 
     for pubkey, peer_info in existing_peers.items():
-        allowed_ip = peer_info.get("allowed_ip", peer_info.get("vpn_address", ""))
+        # Prefer mesh_ip (10.200.0.x) over allowed_ip, which may be stale.
+        # Never silently use vpn_address (10.100.0.x) in the conf file when
+        # a mesh_ip exists — that breaks return routing for all other peers.
+        allowed_ip = (
+            peer_info.get("mesh_ip")
+            or peer_info.get("allowed_ip")
+            or peer_info.get("vpn_address", "")
+        )
+        if allowed_ip.startswith("10.100.") and peer_info.get("mesh_ip"):
+            allowed_ip = peer_info["mesh_ip"]
         config += (
             "\n[Peer]\n"
             f"PublicKey = {pubkey}\n"
@@ -2024,9 +2033,9 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
     mesh_peers_path = DATA_DIR / "mesh_peers.json"
 
     # Determine the AllowedIPs — use mesh IP if available, fall back to VPN address.
-    # If peer_mesh_ip is empty, check mesh_peers.json for a previously saved mesh_ip
-    # before falling back to VPN address, which would break mesh routing.
+    # If peer_mesh_ip is empty, try multiple recovery strategies before giving up.
     if not peer_mesh_ip:
+        # Strategy 1: check mesh_peers.json for a previously saved mesh_ip
         try:
             if mesh_peers_path.exists():
                 saved_peers = json.loads(mesh_peers_path.read_text())
@@ -2034,6 +2043,25 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
                     if info.get("vpn_address") == peer_vpn_address and info.get("mesh_ip"):
                         peer_mesh_ip = info["mesh_ip"]
                         log.info(f"Recovered mesh IP {peer_mesh_ip} from disk for peer {peer_vpn_address}")
+                        break
+        except Exception:
+            pass
+
+    if not peer_mesh_ip:
+        # Strategy 2: ask the Lighthouse — it always knows mesh IP assignments.
+        # This covers the case where mesh_peers.json never had the mesh_ip
+        # (e.g., original tunnel setup had a bug and it was never saved).
+        try:
+            my_device_id = get_client_id()
+            resp = get_session().get(
+                f"{load_state().get('lighthouse_url', '')}/api/v1/mesh/tunnels/{my_device_id}",
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                for t in resp.json().get("tunnels", []):
+                    if t.get("peer_vpn_address") == peer_vpn_address and t.get("peer_mesh_ip"):
+                        peer_mesh_ip = t["peer_mesh_ip"]
+                        log.info(f"Recovered mesh IP {peer_mesh_ip} from Lighthouse for peer {peer_vpn_address}")
                         break
         except Exception:
             pass
@@ -2053,6 +2081,21 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
             existing_peers = json.loads(mesh_peers_path.read_text())
         except Exception:
             pass
+
+    # Heal stale allowed_ip entries: if a peer has a mesh_ip (10.200.0.x) but
+    # allowed_ip still points to a VPN address (10.100.0.x), correct it now.
+    # This catches the scenario where a prior rekey wrote the wrong AllowedIPs
+    # and it's been persisted on disk ever since, reverting the live WG config
+    # every time _rewrite_mesh_conf runs.
+    for pk, info in existing_peers.items():
+        saved_mesh_ip = info.get("mesh_ip", "")
+        saved_allowed_ip = info.get("allowed_ip", "")
+        if saved_mesh_ip and saved_allowed_ip and saved_mesh_ip != saved_allowed_ip:
+            log.warning(
+                f"Healing stale allowed_ip for peer {pk[:20]}...: "
+                f"{saved_allowed_ip} → {saved_mesh_ip}"
+            )
+            info["allowed_ip"] = saved_mesh_ip
 
     # Check if this is a rekey of an existing peer or a brand new peer.
     # Match by mesh_ip or vpn_address — pubkey changes on every rekey so
@@ -2919,6 +2962,26 @@ class PeerKEMExchange:
                 pass
 
         if not peer_mesh_ip:
+            # Strategy 3: ask the Lighthouse — authoritative source for mesh IPs.
+            # Covers the case where mesh_ip was never saved to disk or memory.
+            try:
+                my_device_id = get_client_id()
+                lh_url = self.service.lighthouse_url
+                if lh_url:
+                    resp = get_session().get(
+                        f"{lh_url}/api/v1/mesh/tunnels/{my_device_id}",
+                        timeout=5,
+                    )
+                    if resp.status_code == 200:
+                        for t in resp.json().get("tunnels", []):
+                            if t.get("peer_vpn_address") == peer_vpn_address and t.get("peer_mesh_ip"):
+                                peer_mesh_ip = t["peer_mesh_ip"]
+                                log.info(f"Peer KEM: recovered mesh IP {peer_mesh_ip} from Lighthouse for {peer_vpn_address}")
+                                break
+            except Exception:
+                pass
+
+        if not peer_mesh_ip:
             log.warning(
                 f"Peer KEM: no mesh IP found for {peer_wg_pubkey[:20]}... "
                 f"(vpn={peer_vpn_address}, ep={peer_endpoint}) — "
@@ -3438,6 +3501,7 @@ class QuantumVPNService:
         self._reconnect_delay = RECONNECT_DELAY  # Current backoff delay (resets on success)
         self._consecutive_failures = 0            # Count of consecutive reconnect failures
         self._last_reconnect_attempt = 0  # Independent timer for reconnect loop
+        self._mesh_rebuild_pending = 0.0  # Timestamp for delayed mesh rebuild after reconnect
 
     def run(self) -> None:
         """Main service entry point."""
@@ -3508,6 +3572,13 @@ class QuantumVPNService:
                 self._auto_mesh_with_lan_peers()
             except Exception as e:
                 log.debug(f"Initial auto-mesh failed: {e}")
+
+            # Schedule a delayed second attempt — when the Lighthouse and this
+            # node both just powered on, other nodes may not have registered yet.
+            # The first auto-mesh fails because targets are "offline", but 15-20s
+            # later they'll have heartbeated in and be reachable.
+            self._mesh_rebuild_pending = time.time() + 15
+            log.info("Scheduled delayed mesh rebuild in 15s (waiting for other nodes to come online)")
 
         # Start LAN discovery if we have a VPN address
         if self.vpn_address:
@@ -3596,10 +3667,23 @@ class QuantumVPNService:
                                 mesh_events = hb_result.get("mesh_events", [])
                                 if mesh_events:
                                     event_peers = [e.get("device_id", "?") for e in mesh_events]
-                                    log.info(f"Heartbeat: {len(mesh_events)} mesh event(s) from Lighthouse: {event_peers}")
+                                    log.info(
+                                        f"Heartbeat: {len(mesh_events)} mesh event(s) from Lighthouse: {event_peers}")
                                     self._reconcile_mesh_state()
                                     self._auto_mesh_with_lan_peers()
                                     self._process_pending_mesh()
+
+                                # Lighthouse signals it recently restarted — aggressively
+                                # rebuild mesh since tunnel records may have been lost or
+                                # stale. Schedule a delayed rebuild so other nodes have
+                                # time to re-register too.
+                                if hb_result.get("lighthouse_restarted") and not self._mesh_rebuild_pending:
+                                    log.info(
+                                        "Heartbeat: Lighthouse recently restarted — "
+                                        "scheduling mesh rebuild in 15s"
+                                    )
+                                    self._mesh_rebuild_pending = time.time() + 15
+
                         # Phase 2 U7: Renew UPnP mappings on heartbeat
                         renew_upnp_mappings()
                         last_heartbeat = now
@@ -3624,6 +3708,12 @@ class QuantumVPNService:
                             hb_result = send_heartbeat(self.lighthouse_url)
                             if hb_result:
                                 log.info("Post-reconnect heartbeat sent — lighthouse should show us online")
+                            # Rehydrate mesh state and schedule delayed rebuild.
+                            # Immediate auto-mesh often fails because other nodes
+                            # haven't re-registered yet after a Lighthouse restart.
+                            self._rehydrate_mesh_state()
+                            self._mesh_rebuild_pending = time.time() + 15
+                            log.info("Post-reconnect: scheduled delayed mesh rebuild in 15s")
                         else:
                             self._consecutive_failures += 1
                             self._reconnect_delay = min(
@@ -3667,6 +3757,22 @@ class QuantumVPNService:
                             name="candidate-warm",
                         ).start()
                     last_candidate_warm = now
+
+                # Delayed mesh rebuild — fires once, 15s after a reconnect or
+                # Lighthouse restart signal. By this time other nodes have had
+                # a chance to re-register and heartbeat, so auto-mesh targets
+                # are actually online.
+                if self._mesh_rebuild_pending and now >= self._mesh_rebuild_pending:
+                    self._mesh_rebuild_pending = 0.0
+                    if self.lighthouse_url and self.connected:
+                        log.info("Delayed mesh rebuild firing — reconciling + auto-meshing")
+                        try:
+                            self._rehydrate_mesh_state()
+                            self._reconcile_mesh_state()
+                            self._auto_mesh_with_lan_peers()
+                            self._process_pending_mesh()
+                        except Exception as e:
+                            log.warning(f"Delayed mesh rebuild failed: {e}")
 
                 # Periodic mesh PSK re-keying (peer-to-peer, no server involvement)
                 if now - last_rekey_check >= MESH_REKEY_CHECK_INTERVAL:
@@ -4154,6 +4260,7 @@ class QuantumVPNService:
                 tunnel_by_mesh[mesh] = t
 
         rehydrated = 0
+        disk_modified = False
         for pubkey, info in disk_peers.items():
             vpn_addr = info.get("vpn_address", "")
             mesh_ip = info.get("mesh_ip", "")
@@ -4167,6 +4274,29 @@ class QuantumVPNService:
             request_id = tunnel["request_id"]
             peer_id = tunnel.get("peer_id", "")
 
+            # Heal empty mesh_ip from Lighthouse data — this is the authoritative
+            # source for mesh IP assignments. If the disk entry has no mesh_ip
+            # (e.g., from a bug where _apply_new_psk couldn't look it up), the
+            # Lighthouse always knows the correct value.
+            lighthouse_mesh_ip = tunnel.get("peer_mesh_ip", "")
+            if not mesh_ip and lighthouse_mesh_ip:
+                log.warning(
+                    f"Mesh rehydrate: healing empty mesh_ip for {vpn_addr} "
+                    f"from Lighthouse: {lighthouse_mesh_ip}"
+                )
+                mesh_ip = lighthouse_mesh_ip
+                info["mesh_ip"] = lighthouse_mesh_ip
+                info["allowed_ip"] = lighthouse_mesh_ip
+                disk_modified = True
+            elif mesh_ip and info.get("allowed_ip") and info["allowed_ip"] != mesh_ip:
+                # Also heal stale allowed_ip while we're here
+                log.warning(
+                    f"Mesh rehydrate: healing stale allowed_ip for {vpn_addr}: "
+                    f"{info['allowed_ip']} → {mesh_ip}"
+                )
+                info["allowed_ip"] = mesh_ip
+                disk_modified = True
+
             # Skip if already tracked (shouldn't happen on fresh start, but be safe)
             if request_id in self.mesh_peers:
                 continue
@@ -4179,6 +4309,14 @@ class QuantumVPNService:
                 "peer_wg_pubkey": pubkey,
             }
             rehydrated += 1
+
+        # Write healed mesh_peers.json back to disk so the fix persists
+        if disk_modified:
+            try:
+                mesh_peers_path.write_text(json.dumps(disk_peers, indent=2))
+                log.info("Mesh rehydrate: wrote healed mesh_peers.json to disk")
+            except Exception as e:
+                log.warning(f"Mesh rehydrate: failed to write healed mesh_peers.json: {e}")
 
         if rehydrated:
             log.info(f"Mesh rehydrate: restored {rehydrated} peer(s) from disk + Lighthouse")
