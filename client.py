@@ -5307,14 +5307,45 @@ class QuantumVPNService:
 
                     last_hs = handshake_map.get(peer_wg_pubkey, 0)
                     if last_hs == 0:
-                        log.info(f"Path monitor: {peer_id} handshake timestamp is 0 — peer may not have completed handshake yet")
-                        continue
+                        # Track how long this peer has been stuck at timestamp 0.
+                        # On first sight, record when we first noticed it; after a
+                        # grace period, treat it as a stale handshake and enter the
+                        # re-punch / VPN-routed fallback path instead of silently
+                        # skipping forever (which is what caused mesh to never work
+                        # on UDP-hostile networks like public wifi).
+                        ZERO_HS_GRACE = 45  # seconds — enough for initial punch
+                        if not hasattr(self, '_zero_hs_first_seen'):
+                            self._zero_hs_first_seen = {}
+                        first_seen = self._zero_hs_first_seen.setdefault(peer_id, now)
+                        zero_age = now - first_seen
 
-                    age = now - last_hs
-                    if age < HANDSHAKE_STALE_THRESHOLD:
-                        log.info(f"Path monitor: {peer_id} healthy — handshake {age:.0f}s ago")
-                        self._repunch_cooldown.pop(peer_id, None)
-                        continue
+                        if zero_age < ZERO_HS_GRACE:
+                            log.info(
+                                f"Path monitor: {peer_id} handshake timestamp is 0 — "
+                                f"waiting ({zero_age:.0f}s / {ZERO_HS_GRACE}s grace)"
+                            )
+                            continue
+
+                        # Grace period expired — treat as stale and fall through
+                        # to the re-punch logic (which includes VPN-routed fallback)
+                        log.warning(
+                            f"Path monitor: {peer_id} handshake stuck at 0 for {zero_age:.0f}s — "
+                            f"triggering re-punch (direct UDP likely blocked)"
+                        )
+                        # Synthesize a large age so the stale-threshold check below
+                        # doesn't skip this peer
+                        age = zero_age
+                        # Fall through to cooldown check → online check → re-punch
+
+                    if last_hs > 0:
+                        age = now - last_hs
+                        if age < HANDSHAKE_STALE_THRESHOLD:
+                            log.info(f"Path monitor: {peer_id} healthy — handshake {age:.0f}s ago")
+                            self._repunch_cooldown.pop(peer_id, None)
+                            # Clear zero-hs tracking on success
+                            if hasattr(self, '_zero_hs_first_seen'):
+                                self._zero_hs_first_seen.pop(peer_id, None)
+                            continue
 
                     # Cooldown check
                     cooldown_start = self._repunch_cooldown.get(peer_id, 0)
@@ -5487,7 +5518,37 @@ class QuantumVPNService:
                 if last_hs > 0 and (time.time() - last_hs) < HANDSHAKE_STALE_THRESHOLD:
                     log.info(f"Path monitor: handshake recovered for {peer_id} after attempt {attempt}")
                     self._repunch_cooldown.pop(peer_id, None)
+                    if hasattr(self, '_zero_hs_first_seen'):
+                        self._zero_hs_first_seen.pop(peer_id, None)
                     return
+
+            # All direct hole-punch retries exhausted — try VPN-routed fallback.
+            # This routes mesh traffic through the main Lighthouse WireGuard tunnel
+            # (10.100.0.x addresses), which works even on UDP-hostile networks
+            # because the main tunnel may be using wstunnel TCP.
+            vpn_addr = peer_info.get("vpn_address", "")
+            if vpn_addr:
+                mesh_port = peer_info.get("mesh_port", 51821)
+                vpn_endpoint = f"{vpn_addr}:{mesh_port}"
+                log.info(
+                    f"Path monitor: trying VPN-routed fallback for {peer_id} — "
+                    f"setting endpoint to {vpn_endpoint} (through Lighthouse tunnel)"
+                )
+                self._update_mesh_wg_endpoint(peer_wg_pubkey, vpn_endpoint)
+                peer_info["endpoint"] = vpn_endpoint
+
+                # Give the VPN-routed path time to establish a handshake
+                time.sleep(5)
+                handshake_map = self._get_mesh_handshake_times()
+                last_hs = handshake_map.get(peer_wg_pubkey, 0)
+                if last_hs > 0 and (time.time() - last_hs) < HANDSHAKE_STALE_THRESHOLD:
+                    log.info(f"Path monitor: VPN-routed fallback SUCCEEDED for {peer_id}")
+                    self._repunch_cooldown.pop(peer_id, None)
+                    if hasattr(self, '_zero_hs_first_seen'):
+                        self._zero_hs_first_seen.pop(peer_id, None)
+                    return
+
+                log.warning(f"Path monitor: VPN-routed fallback also failed for {peer_id}")
 
             log.warning(
                 f"Path monitor: exhausted {PATH_MONITOR_MAX_RETRIES} retries for {peer_id} "

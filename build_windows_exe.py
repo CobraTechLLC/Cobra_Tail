@@ -7,6 +7,7 @@ CobraTailSetup.exe — a single-file installer that bundles:
   - client.py, cobra_launcher.py, identity_manager.py
   - cobra_sentinel.py (AI diagnostic agent)
   - oqs.dll (if present)
+  - wstunnel.exe (if present — TCP fallback for WireGuard)
   - *.gguf LLM model (if present)
   - version.txt (offline fallback for the installer)
   - Icon and version info
@@ -22,6 +23,7 @@ Usage:
     python build_windows_exe.py
     python build_windows_exe.py --skip-oqs       # don't bundle oqs.dll
     python build_windows_exe.py --skip-model      # don't bundle .gguf model
+    python build_windows_exe.py --skip-wstunnel   # don't bundle wstunnel.exe
     python build_windows_exe.py --output-dir dist # custom output folder
 
 Version management:
@@ -77,6 +79,15 @@ OQS_DLL_SEARCH = [
     Path("C:/Program Files/liboqs/bin/oqs.dll"),
 ]
 
+# Directories to search for wstunnel.exe (TCP fallback for WireGuard)
+WSTUNNEL_EXE_SEARCH = [
+    Path(__file__).parent / "wstunnel.exe",
+    Path(__file__).parent / "bin" / "wstunnel.exe",
+    Path(__file__).parent / "lib" / "wstunnel.exe",
+    Path.home() / ".quantum_vpn" / "wstunnel.exe",
+    Path("C:/Program Files/CobraTail/bin/wstunnel.exe"),
+]
+
 
 def find_oqs_dll() -> Path | None:
     """Locate oqs.dll on the build machine."""
@@ -90,6 +101,18 @@ def find_oqs_dll() -> Path | None:
     local2 = Path(__file__).parent / "oqs.dll"
     if local2.exists():
         return local2
+    return None
+
+
+def find_wstunnel_exe() -> Path | None:
+    """Locate wstunnel.exe on the build machine."""
+    for p in WSTUNNEL_EXE_SEARCH:
+        if p.exists():
+            return p
+    # Check PATH
+    wst = shutil.which("wstunnel")
+    if wst:
+        return Path(wst)
     return None
 
 
@@ -175,6 +198,17 @@ def build(args):
             print("  WARNING: oqs.dll not found — installer will build it on target")
             print("  (Use --skip-oqs to suppress this warning)")
 
+    # Find wstunnel.exe (TCP fallback for WireGuard on UDP-hostile networks)
+    wstunnel_exe = None
+    if not args.skip_wstunnel:
+        wstunnel_exe = find_wstunnel_exe()
+        if wstunnel_exe:
+            print(f"  Found wstunnel.exe: {wstunnel_exe}")
+        else:
+            print("  WARNING: wstunnel.exe not found — installer will download on target")
+            print("  (Download from https://github.com/erebe/wstunnel/releases)")
+            print("  (Place wstunnel.exe next to this script, or use --skip-wstunnel)")
+
     # Create temp build dir
     with tempfile.TemporaryDirectory(prefix="cobratail_build_") as tmp:
         tmp_dir = Path(tmp)
@@ -202,6 +236,10 @@ def build(args):
         # Bundle oqs.dll if found
         if oqs_dll:
             add_data_args.extend(["--add-data", f"{oqs_dll}{sep}payload/lib"])
+
+        # Bundle wstunnel.exe if found (TCP fallback for WireGuard)
+        if wstunnel_exe:
+            add_data_args.extend(["--add-data", f"{wstunnel_exe}{sep}payload/bin"])
 
         # Bundle .gguf model if found
         gguf_model = None
@@ -260,6 +298,7 @@ def build(args):
         print(f"  Version: {VERSION}  (from version.txt)")
         print(f"  Payload: {', '.join(PAYLOAD_FILES)}")
         print(f"  OQS DLL: {'bundled' if oqs_dll else 'not bundled (will build on target)'}")
+        print(f"  wstunnel: {'bundled' if wstunnel_exe else 'not bundled (installer will download)'}")
         print(f"  LLM Model: {gguf_model.name if gguf_model else 'not bundled (no AI diagnostics)'}")
         print(f"  Output:  {output_dir}")
         print("=" * 60)
@@ -293,6 +332,8 @@ def main():
                         help="Don't bundle oqs.dll (installer will build on target)")
     parser.add_argument("--skip-model", action="store_true",
                         help="Don't bundle the .gguf LLM model (disables AI diagnostics)")
+    parser.add_argument("--skip-wstunnel", action="store_true",
+                        help="Don't bundle wstunnel.exe (installer will download on target)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory for the .exe (default: ./dist)")
     args = parser.parse_args()

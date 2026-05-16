@@ -369,6 +369,127 @@ def install_wireguard():
         return False
 
 
+def install_wstunnel():
+    """Install wstunnel.exe — TCP fallback for WireGuard on UDP-hostile networks.
+
+    Priority:
+      1. Bundled in payload/bin/wstunnel.exe (shipped with the .exe installer)
+      2. Already installed in BIN_DIR
+      3. Download from GitHub releases
+    """
+    wstunnel_dst = BIN_DIR / "wstunnel.exe"
+
+    # Already installed?
+    if wstunnel_dst.exists():
+        ok("wstunnel.exe already installed")
+        return True
+
+    # Check if bundled in payload
+    payload = get_payload_dir()
+    bundled = payload / "bin" / "wstunnel.exe"
+    if bundled.exists():
+        shutil.copy2(str(bundled), str(wstunnel_dst))
+        ok("Installed wstunnel.exe (bundled)")
+        return True
+
+    # Download from GitHub
+    info("wstunnel not bundled — downloading from GitHub...")
+    try:
+        import urllib.request
+
+        # Determine architecture
+        import platform
+        machine = platform.machine().lower()
+        if machine in ("amd64", "x86_64"):
+            ws_arch = "amd64"
+        elif machine in ("arm64", "aarch64"):
+            ws_arch = "arm64"
+        else:
+            warn(f"Unsupported architecture ({machine}) — skipping wstunnel")
+            info("Download manually from: https://github.com/erebe/wstunnel/releases")
+            info("Place wstunnel.exe in: " + str(BIN_DIR))
+            return False
+
+        # Query GitHub API for latest release
+        req = urllib.request.Request(
+            "https://api.github.com/repos/erebe/wstunnel/releases/latest",
+            headers={"Accept": "application/vnd.github.v3+json",
+                     "User-Agent": "CobraTail-Installer"},
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = json.loads(resp.read().decode())
+
+        # Find the Windows archive for our architecture
+        # Note: wstunnel ships Windows builds as .tar.gz, not .zip
+        ws_url = ""
+        for asset in data.get("assets", []):
+            name = asset["name"].lower()
+            if "windows" in name and ws_arch in name and name.endswith(".tar.gz"):
+                ws_url = asset["browser_download_url"]
+                break
+        # Fallback: try .zip in case they change format in the future
+        if not ws_url:
+            for asset in data.get("assets", []):
+                name = asset["name"].lower()
+                if "windows" in name and ws_arch in name and name.endswith(".zip"):
+                    ws_url = asset["browser_download_url"]
+                    break
+
+        if not ws_url:
+            warn("Could not find wstunnel Windows release for " + ws_arch)
+            info("Download manually from: https://github.com/erebe/wstunnel/releases")
+            info("Place wstunnel.exe in: " + str(BIN_DIR))
+            return False
+
+        info(f"Downloading: {ws_url}")
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_archive = tmp_dir / "wstunnel_archive"
+        urllib.request.urlretrieve(ws_url, str(tmp_archive))
+
+        # Extract wstunnel.exe from archive (.tar.gz or .zip)
+        extract_dir = tmp_dir / "extracted"
+        extract_dir.mkdir(exist_ok=True)
+
+        if ws_url.endswith(".tar.gz"):
+            import tarfile
+            with tarfile.open(str(tmp_archive), "r:gz") as tf:
+                tf.extractall(path=str(extract_dir))
+        else:
+            import zipfile
+            with zipfile.ZipFile(str(tmp_archive), "r") as zf:
+                zf.extractall(path=str(extract_dir))
+
+        # Find wstunnel.exe in extracted files
+        ws_exe = None
+        for root, dirs, files in os.walk(str(extract_dir)):
+            for f in files:
+                if f.lower() == "wstunnel.exe":
+                    ws_exe = Path(root) / f
+                    break
+            if ws_exe:
+                break
+
+        if ws_exe:
+            shutil.copy2(str(ws_exe), str(wstunnel_dst))
+            ok("Installed wstunnel.exe (downloaded)")
+        else:
+            warn("wstunnel.exe not found in downloaded archive")
+            info("Download manually from: https://github.com/erebe/wstunnel/releases")
+            shutil.rmtree(str(tmp_dir), ignore_errors=True)
+            return False
+
+        # Cleanup
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
+        return True
+
+    except Exception as e:
+        warn(f"wstunnel download failed: {e}")
+        info("TCP fallback will be unavailable until wstunnel is installed.")
+        info("Download from: https://github.com/erebe/wstunnel/releases")
+        info("Place wstunnel.exe in: " + str(BIN_DIR))
+        return False
+
+
 def build_oqs_dll():
     """Build oqs.dll if not already present."""
     if (LIB_DIR / "oqs.dll").exists():
@@ -769,7 +890,7 @@ def uninstall(quiet: bool = False):
 # ─── Main Install Flow ───────────────────────────────────────────────────────
 
 def install():
-    total = 9
+    total = 10
 
     print()
     print(f"  {BOLD}{'=' * 52}{RESET}")
@@ -811,18 +932,22 @@ def install():
     step(6, total, "Checking WireGuard...")
     install_wireguard()
 
-    # ── Step 7: oqs.dll (quantum crypto) ──
-    step(7, total, "Setting up quantum cryptography (oqs.dll)...")
+    # ── Step 7: wstunnel (TCP fallback for UDP-hostile networks) ──
+    step(7, total, "Installing wstunnel TCP fallback...")
+    install_wstunnel()
+
+    # ── Step 8: oqs.dll (quantum crypto) ──
+    step(8, total, "Setting up quantum cryptography (oqs.dll)...")
     oqs_ok = build_oqs_dll()
 
-    # ── Step 8: Shortcuts, PATH, Apps & Features ──
-    step(8, total, "Registering CobraTail...")
+    # ── Step 9: Shortcuts, PATH, Apps & Features ──
+    step(9, total, "Registering CobraTail...")
     create_cobra_command()
     register_uninstall()
     create_shortcuts()
 
-    # ── Step 9: Self-test ──
-    step(9, total, "Running ML-KEM-1024 self-test...")
+    # ── Step 10: Self-test ──
+    step(10, total, "Running ML-KEM-1024 self-test...")
     if oqs_ok or (LIB_DIR / "oqs.dll").exists():
         if run_mlkem_selftest():
             ok("ML-KEM-1024 encap/decap: PASSED")
@@ -842,6 +967,8 @@ def install():
     print(f"  {BOLD}Command:{RESET}       Open any terminal and type: {CYAN}cobra{RESET}")
     print(f"  {BOLD}Desktop:{RESET}       CobraTail shortcut on your Desktop")
     print(f"  {BOLD}Start Menu:{RESET}    {START_MENU_DIR.name}")
+    ws_status = f"{GREEN}installed{RESET}" if (BIN_DIR / "wstunnel.exe").exists() else f"{YELLOW}not installed{RESET}"
+    print(f"  {BOLD}wstunnel:{RESET}      {ws_status}")
     print(f"  {BOLD}Uninstall:{RESET}     Apps & Features → CobraTail VPN")
     print()
 
