@@ -230,7 +230,7 @@ echo ""
 
 # ── Create directories with correct permissions ──────────────
 
-echo "[1/5] Creating directories..."
+echo "[1/6] Creating directories..."
 
 mkdir -p /etc/lighthouse/wg_keys
 mkdir -p /var/lib/lighthouse
@@ -243,7 +243,7 @@ echo "  Created /var/lib/lighthouse/"
 
 # ── Enable GPIO UART (Pi 4 specific) ────────────────────────
 
-echo "[2/5] Checking for Raspberry Pi UART setup..."
+echo "[2/6] Checking for Raspberry Pi UART setup..."
 
 IS_PI=false
 if [ -f /proc/cpuinfo ] && grep -qi "raspberry\|BCM" /proc/cpuinfo 2>/dev/null; then
@@ -301,7 +301,7 @@ fi
 
 # ── Build and install liboqs C library ───────────────────────
 
-echo "[3/5] Checking liboqs shared library..."
+echo "[3/6] Checking liboqs shared library..."
 
 LIBOQS_FOUND=false
 for lib_path in /usr/local/lib/liboqs.so /usr/lib/liboqs.so /usr/local/lib64/liboqs.so; do
@@ -359,7 +359,7 @@ fi
 
 # ── Install Python dependencies ──────────────────────────────
 
-echo "[4/5] Installing Python dependencies..."
+echo "[4/6] Installing Python dependencies..."
 
 # Install core pip packages
 pip3 install --break-system-packages \
@@ -375,9 +375,115 @@ echo "  WARNING: liboqs-python install failed — post-quantum crypto unavailabl
 
 echo "  Python dependencies installed"
 
+# ── Install wstunnel binary (TCP fallback for WireGuard) ─────
+
+echo "[5/6] Installing wstunnel TCP fallback..."
+
+WSTUNNEL_INSTALLED=false
+
+# Check if already installed
+for ws_path in /usr/local/bin/wstunnel /opt/lighthouse/wstunnel; do
+    if [ -x "$ws_path" ]; then
+        echo "  wstunnel already installed: $ws_path"
+        "$ws_path" --version 2>/dev/null || true
+        WSTUNNEL_INSTALLED=true
+        break
+    fi
+done
+
+if [ "$WSTUNNEL_INSTALLED" = false ]; then
+    echo "  Detecting architecture..."
+    MACHINE=$(uname -m)
+    case "$MACHINE" in
+        x86_64)  WS_ARCH="x86_64" ;;
+        aarch64) WS_ARCH="aarch64" ;;
+        armv7*)  WS_ARCH="armv7" ;;
+        *)
+            echo "  WARNING: Unsupported architecture ($MACHINE) — skipping wstunnel install"
+            echo "  Download manually from: https://github.com/erebe/wstunnel/releases"
+            WS_ARCH=""
+            ;;
+    esac
+
+    if [ -n "$WS_ARCH" ]; then
+        echo "  Architecture: $WS_ARCH"
+        echo "  Fetching latest wstunnel release from GitHub..."
+
+        # Use Python to query the GitHub API for the latest release asset URL
+        WS_URL=$(python3 -c "
+import urllib.request, json, sys
+try:
+    req = urllib.request.Request(
+        'https://api.github.com/repos/erebe/wstunnel/releases/latest',
+        headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'CobraTail-Installer'}
+    )
+    resp = urllib.request.urlopen(req, timeout=15)
+    data = json.loads(resp.read().decode())
+    arch = '${WS_ARCH}'
+    for asset in data.get('assets', []):
+        name = asset['name'].lower()
+        if 'linux' in name and arch in name and name.endswith('.tar.gz'):
+            print(asset['browser_download_url'])
+            sys.exit(0)
+    # Fallback: try musl variant
+    for asset in data.get('assets', []):
+        name = asset['name'].lower()
+        if 'linux' in name and arch in name:
+            print(asset['browser_download_url'])
+            sys.exit(0)
+    sys.exit(1)
+except Exception as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null) || true
+
+        if [ -n "$WS_URL" ]; then
+            echo "  Downloading: $WS_URL"
+            WS_TMP=$(mktemp -d)
+            if wget -q -O "$WS_TMP/wstunnel.tar.gz" "$WS_URL" 2>/dev/null || \
+               curl -sL -o "$WS_TMP/wstunnel.tar.gz" "$WS_URL" 2>/dev/null; then
+
+                cd "$WS_TMP"
+                tar xzf wstunnel.tar.gz 2>/dev/null || true
+
+                # Find the binary (may be at top level or in a subdirectory)
+                WS_BIN=$(find "$WS_TMP" -name "wstunnel" -type f | head -1)
+                if [ -n "$WS_BIN" ]; then
+                    cp "$WS_BIN" /opt/lighthouse/wstunnel
+                    chmod 755 /opt/lighthouse/wstunnel
+                    echo "  Installed to /opt/lighthouse/wstunnel"
+                    /opt/lighthouse/wstunnel --version 2>/dev/null || true
+                    WSTUNNEL_INSTALLED=true
+                else
+                    echo "  WARNING: Could not find wstunnel binary in archive"
+                fi
+                cd /
+            else
+                echo "  WARNING: Download failed"
+            fi
+            rm -rf "$WS_TMP"
+        else
+            echo "  WARNING: Could not determine download URL from GitHub API"
+        fi
+
+        if [ "$WSTUNNEL_INSTALLED" = false ]; then
+            echo ""
+            echo "  wstunnel could not be installed automatically."
+            echo "  TCP fallback will be unavailable until wstunnel is installed."
+            echo "  Manual install:"
+            echo "    1. Download from https://github.com/erebe/wstunnel/releases"
+            echo "    2. Extract and copy to /opt/lighthouse/wstunnel"
+            echo "    3. chmod 755 /opt/lighthouse/wstunnel"
+            echo "  The Lighthouse will work fine without it — only clients on"
+            echo "  UDP-hostile networks (public wifi) need the TCP fallback."
+            echo ""
+        fi
+    fi
+fi
+
 # ── Reload systemd ───────────────────────────────────────────
 
-echo "[5/5] Configuring systemd..."
+echo "[6/6] Configuring systemd..."
 
 systemctl daemon-reload
 echo "  systemd reloaded"
@@ -436,6 +542,9 @@ echo "    /etc/lighthouse/          — configuration (created by wizard)"
 echo "    /var/lib/lighthouse/      — database"
 echo "    /usr/local/bin/lighthouse — management command"
 echo "    /usr/local/bin/cobra-sentinel — AI diagnostic agent"
+if [ -x /opt/lighthouse/wstunnel ]; then
+echo "    /opt/lighthouse/wstunnel  — TCP fallback for WireGuard"
+fi
 if [ -n "$GGUF_MODEL" ]; then
 echo "    /opt/lighthouse/models/   — LLM model ($(basename $GGUF_MODEL))"
 fi

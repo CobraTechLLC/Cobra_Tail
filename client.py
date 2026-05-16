@@ -263,6 +263,17 @@ PATH_MONITOR_MAX_RETRIES = 5         # Max re-punch attempts before flagging for
 PATH_MONITOR_RETRY_DELAYS = [3, 5, 10, 15, 20]  # Delays between re-punch attempts (faster retries)
 PATH_MONITOR_COOLDOWN = 120              # Skip re-punch for 2 min after exhausting retries
 
+# ─── wstunnel TCP Fallback (for UDP-hostile networks) ─────────────────────────
+# When direct UDP to the WireGuard port is blocked (public wifi, corporate nets),
+# wstunnel wraps WireGuard UDP inside a TCP WebSocket on port 443.
+# The client launches a local wstunnel process that creates a local UDP listener
+# which tunnels through TCP to the Lighthouse's wstunnel server.
+WSTUNNEL_ENABLED = True                    # Enable wstunnel fallback system
+WSTUNNEL_HANDSHAKE_TIMEOUT = 8             # Seconds to wait for WG handshake before fallback
+WSTUNNEL_LOCAL_UDP_PORT = 51820            # Local UDP port that wstunnel exposes
+WSTUNNEL_REMOTE_PORT = 443                 # TCP port where wstunnel server listens
+WSTUNNEL_HEALTH_INTERVAL = 30              # Re-check wstunnel process health every 30s
+
 # ─── STUN Cache (Phase 4 optimization) ───────────────────────────────────────
 STUN_CACHE_TTL = 300  # Reuse cached STUN/NAT data for 5 minutes between refreshes
 _stun_cache = {
@@ -1389,6 +1400,215 @@ def _find_wireguard_windows() -> str:
         if os.path.exists(path):
             return path
     return "wireguard.exe"  # Last resort — hope it's in PATH
+
+
+# ─── wstunnel TCP Fallback Management ─────────────────────────────────────────
+# Manages a local wstunnel client process that tunnels WireGuard UDP through
+# TCP WebSocket when direct UDP is blocked (public wifi, corporate networks).
+#
+# Architecture:
+#   Client (UDP) → local wstunnel (UDP→TCP) → Internet (TCP 443) →
+#   Lighthouse wstunnel server (TCP→UDP) → WireGuard (UDP 51820)
+#
+# The local wstunnel process creates a UDP listener on 127.0.0.1:WSTUNNEL_LOCAL_UDP_PORT.
+# WireGuard is pointed at this local port instead of the remote server directly.
+# wstunnel wraps each UDP packet in a WebSocket frame and sends it over TCP 443
+# to the Lighthouse, which unwraps and delivers to localhost:51820.
+
+_wstunnel_process: subprocess.Popen = None
+_wstunnel_lock = threading.Lock()
+_wstunnel_active = False  # True when tunnel is using wstunnel fallback
+
+
+def _find_wstunnel() -> str:
+    """Find the wstunnel binary. Returns the path or empty string."""
+    if platform.system() == "Windows":
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "CobraTail" / "bin" / "wstunnel.exe",
+            Path(__file__).parent / "wstunnel.exe",
+            Path(__file__).parent / "bin" / "wstunnel.exe",
+            Path.home() / ".quantum_vpn" / "wstunnel.exe",
+        ]
+        for p in candidates:
+            if p.exists():
+                return str(p)
+        # Try PATH
+        try:
+            result = subprocess.run(
+                ["where", "wstunnel"], capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().split("\n")[0].strip()
+        except Exception:
+            pass
+    else:
+        candidates = [
+            Path("/usr/local/bin/wstunnel"),
+            Path("/usr/bin/wstunnel"),
+            Path("/opt/cobratail/bin/wstunnel"),
+            Path(__file__).parent / "wstunnel",
+        ]
+        for p in candidates:
+            if p.exists():
+                return str(p)
+        # Try PATH
+        try:
+            result = subprocess.run(
+                ["which", "wstunnel"], capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+
+    return ""
+
+
+def _start_wstunnel(remote_host: str, remote_wg_port: int) -> bool:
+    """Start a local wstunnel client process that tunnels WireGuard UDP over TCP.
+
+    Creates: 127.0.0.1:WSTUNNEL_LOCAL_UDP_PORT (UDP) → remote_host:WSTUNNEL_REMOTE_PORT (TCP)
+    The remote wstunnel server then delivers to localhost:remote_wg_port (UDP).
+
+    Returns True if wstunnel started successfully.
+    """
+    global _wstunnel_process, _wstunnel_active
+
+    wstunnel_bin = _find_wstunnel()
+    if not wstunnel_bin:
+        log.warning("wstunnel binary not found — TCP fallback unavailable")
+        log.info("Install wstunnel: https://github.com/erebe/wstunnel/releases")
+        return False
+
+    _stop_wstunnel()  # Clean up any existing process
+
+    # wstunnel v9+ command syntax:
+    #   wstunnel client -L udp://127.0.0.1:LOCAL_PORT:127.0.0.1:REMOTE_WG_PORT ws://HOST:443
+    # This creates a local UDP listener that tunnels to the remote host over WebSocket.
+    # The remote wstunnel server (--restrict-to 127.0.0.1:51820) unwraps and delivers
+    # to its local WireGuard instance.
+    local_spec = f"udp://127.0.0.1:{WSTUNNEL_LOCAL_UDP_PORT}:127.0.0.1:{remote_wg_port}"
+    remote_url = f"ws://{remote_host}:{WSTUNNEL_REMOTE_PORT}"
+
+    cmd = [wstunnel_bin, "client", "-L", local_spec, remote_url]
+
+    log.info(f"Starting wstunnel: {' '.join(cmd)}")
+
+    with _wstunnel_lock:
+        try:
+            if platform.system() == "Windows":
+                _wstunnel_process = _SUBPROCESS_ORIG_POPEN(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=_CREATE_NO_WINDOW,
+                    startupinfo=_STARTUPINFO,
+                )
+            else:
+                _wstunnel_process = _SUBPROCESS_ORIG_POPEN(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+            # Give it a moment to start and check it didn't exit immediately
+            time.sleep(1.0)
+            if _wstunnel_process.poll() is not None:
+                stderr = _wstunnel_process.stderr.read().decode(errors="replace").strip()
+                log.error(f"wstunnel exited immediately: {stderr}")
+                _wstunnel_process = None
+                return False
+
+            _wstunnel_active = True
+            log.info(
+                f"wstunnel running (PID {_wstunnel_process.pid}): "
+                f"UDP 127.0.0.1:{WSTUNNEL_LOCAL_UDP_PORT} → TCP {remote_host}:{WSTUNNEL_REMOTE_PORT}"
+            )
+            return True
+
+        except FileNotFoundError:
+            log.error(f"wstunnel binary not executable: {wstunnel_bin}")
+            return False
+        except Exception as e:
+            log.error(f"Failed to start wstunnel: {e}")
+            return False
+
+
+def _stop_wstunnel() -> None:
+    """Stop the local wstunnel client process if running."""
+    global _wstunnel_process, _wstunnel_active
+
+    with _wstunnel_lock:
+        if _wstunnel_process is not None:
+            log.info(f"Stopping wstunnel (PID {_wstunnel_process.pid})...")
+            try:
+                _wstunnel_process.terminate()
+                try:
+                    _wstunnel_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _wstunnel_process.kill()
+                    _wstunnel_process.wait(timeout=3)
+            except Exception as e:
+                log.warning(f"Error stopping wstunnel: {e}")
+                try:
+                    _wstunnel_process.kill()
+                except Exception:
+                    pass
+            _wstunnel_process = None
+            log.info("wstunnel stopped")
+        _wstunnel_active = False
+
+
+def _is_wstunnel_running() -> bool:
+    """Check if the wstunnel process is still alive."""
+    with _wstunnel_lock:
+        if _wstunnel_process is None:
+            return False
+        return _wstunnel_process.poll() is None
+
+
+def _check_wg_handshake(timeout: float = WSTUNNEL_HANDSHAKE_TIMEOUT) -> bool:
+    """Check if WireGuard completes a handshake within the timeout.
+
+    After bringing up the WireGuard interface, the first handshake proves
+    that UDP packets are actually flowing end-to-end. If the handshake
+    doesn't complete, UDP is likely blocked.
+
+    Returns True if a handshake was observed, False if timed out.
+    """
+    interface = "wg_quantum"
+    deadline = time.time() + timeout
+    check_interval = 1.0
+
+    while time.time() < deadline:
+        try:
+            if platform.system() == "Windows":
+                wg_path = _find_wg_windows()
+                result = subprocess.run(
+                    [wg_path, "show", interface, "latest-handshakes"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            else:
+                result = subprocess.run(
+                    ["wg", "show", interface, "latest-handshakes"],
+                    capture_output=True, text=True, timeout=5,
+                )
+
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    parts = line.split("\t")
+                    if len(parts) == 2:
+                        ts = int(parts[1].strip())
+                        if ts > 0:
+                            log.info(f"WireGuard handshake confirmed (took {timeout - (deadline - time.time()):.1f}s)")
+                            return True
+        except Exception:
+            pass
+
+        time.sleep(check_interval)
+
+    log.warning(f"No WireGuard handshake within {timeout}s — UDP likely blocked")
+    return False
 
 # ─── State Persistence ───────────────────────────────────────────────────────
 
@@ -3602,6 +3822,7 @@ class QuantumVPNService:
         last_mesh_check = 0
         last_rekey_check = 0
         last_candidate_warm = 0
+        last_wstunnel_check = 0
 
         # Heartbeat jitter: randomize the interval each cycle so N clients
         # don't all hit the Lighthouse in the same second window
@@ -3724,6 +3945,15 @@ class QuantumVPNService:
                                 f"Background reconnect failed — next attempt in {self._reconnect_delay:.0f}s"
                             )
                         self._last_reconnect_attempt = now
+
+                # wstunnel process health check — restart if it crashed
+                if now - last_wstunnel_check >= WSTUNNEL_HEALTH_INTERVAL:
+                    if _wstunnel_active and self.connected:
+                        if not _is_wstunnel_running():
+                            log.error("wstunnel process died — tunnel will break, triggering reconnect")
+                            _stop_wstunnel()
+                            self._handle_connection_loss()
+                    last_wstunnel_check = now
 
                 # Network change detection
                 if now - last_network_check >= NETWORK_CHECK_INTERVAL:
@@ -3902,48 +4132,129 @@ class QuantumVPNService:
             tunnel_up = apply_wireguard_config(wg_config)
 
             if tunnel_up:
-                self.connected = True
+                # Step 5b: Verify the WireGuard handshake actually completes.
+                # "Tunnel UP" only means the service started — it does NOT mean
+                # packets are flowing. On UDP-hostile networks (public wifi, corp
+                # firewalls), the interface comes up but handshakes never complete
+                # because outbound UDP on port 51820 is silently dropped.
+                #
+                # On LAN we skip this check — no firewall between us and the Pi.
+                handshake_ok = True
+                using_wstunnel = False
 
-                # Step 6: Once tunnel is up with full routing (remote/public mode),
-                # switch Lighthouse URL to the VPN-internal address.
-                if not self.is_local:
-                    api_port = 8443
-                    if self.local_url:
-                        try:
-                            api_port = int(self.local_url.split(":")[-1])
-                        except (ValueError, IndexError):
-                            pass
-                    vpn_server_ip = "10.100.0.1"
-                    self.lighthouse_url = f"https://{vpn_server_ip}:{api_port}"
-                    log.info(f"Switched Lighthouse URL to VPN-internal: {self.lighthouse_url}")
+                if not self.is_local and WSTUNNEL_ENABLED:
+                    log.info(f"Verifying WireGuard handshake completes (direct UDP to {wg_endpoint})...")
+                    handshake_ok = _check_wg_handshake(timeout=WSTUNNEL_HANDSHAKE_TIMEOUT)
 
-                log.info(f"Connected via {'LAN' if self.is_local else 'public'} endpoint")
-                log.info(f"VPN address: {self.vpn_address}")
-                log.info(f"WireGuard endpoint: {wg_endpoint}")
-                log.info(f"Quantum PSK: {KEM_ALGORITHM}")
+                    if not handshake_ok:
+                        # UDP is blocked — try wstunnel TCP fallback
+                        log.warning(
+                            f"Direct UDP to {wg_endpoint} blocked — "
+                            f"attempting wstunnel TCP fallback via port {WSTUNNEL_REMOTE_PORT}"
+                        )
 
-                # Save state for restarts
-                save_state({
-                    "wg_privkey": self.wg_privkey,
-                    "wg_pubkey": self.wg_pubkey,
-                    "mesh_wg_privkey": self.mesh_wg_privkey,
-                    "mesh_wg_pubkey": self.mesh_wg_pubkey,
-                    "vpn_address": self.vpn_address,
-                    "lighthouse_url": self.lighthouse_url,
-                    "is_local": self.is_local,
-                    "server_public_key": handshake.get("server_public_key", ""),
-                    "wg_endpoint": wg_endpoint,
-                    "connected_at": datetime.now(timezone.utc).isoformat(),
-                })
-                return True
-            else:
-                log.error("Tunnel failed to come up")
-                notify_sentinel(
-                    "WireGuard tunnel failed to come up",
-                    component="wireguard",
-                    lighthouse_url=self.lighthouse_url or "",
-                )
-                return False
+                        # Extract the public host IP from the endpoint
+                        remote_host = wg_endpoint.split(":")[0]
+                        remote_wg_port = self.wg_port
+
+                        if _start_wstunnel(remote_host, remote_wg_port):
+                            # Rewrite WireGuard endpoint to point at the local wstunnel listener
+                            wstunnel_endpoint = f"127.0.0.1:{WSTUNNEL_LOCAL_UDP_PORT}"
+                            log.info(f"Switching WireGuard endpoint: {wg_endpoint} → {wstunnel_endpoint} (via wstunnel)")
+
+                            # Tear down the tunnel that's stuck on the blocked endpoint
+                            _wireguard_down()
+
+                            # Rebuild config with the wstunnel local endpoint
+                            # Re-initiate handshake since we wiped the PSK from the dict earlier
+                            try:
+                                if vault_error is None and oqs is not None:
+                                    vault_device_id_2, vault_pubkey_2 = vault_result
+                                    handshake, _ = initiate_client_encap_handshake(
+                                        self.lighthouse_url, vault_device_id_2, vault_pubkey_2
+                                    )
+                                else:
+                                    vault = discover_vault(self.lighthouse_url)
+                                    handshake = initiate_handshake(self.lighthouse_url, vault["device_id"])
+                            except Exception as e2:
+                                log.error(f"Re-handshake for wstunnel failed: {e2}")
+                                _stop_wstunnel()
+                                return False
+
+                            wg_config = build_wireguard_config(
+                                handshake, self.wg_privkey, wstunnel_endpoint, self.is_local
+                            )
+                            tunnel_up = apply_wireguard_config(wg_config)
+
+                            if tunnel_up:
+                                log.info("Verifying WireGuard handshake through wstunnel...")
+                                handshake_ok = _check_wg_handshake(timeout=WSTUNNEL_HANDSHAKE_TIMEOUT + 4)
+
+                                if handshake_ok:
+                                    wg_endpoint = wstunnel_endpoint
+                                    using_wstunnel = True
+                                    log.info("wstunnel TCP fallback: handshake confirmed — tunnel is live")
+                                else:
+                                    log.error("wstunnel fallback failed — handshake still not completing")
+                                    _stop_wstunnel()
+                                    return False
+                            else:
+                                log.error("WireGuard failed to come up with wstunnel endpoint")
+                                _stop_wstunnel()
+                                return False
+                        else:
+                            log.error(
+                                "wstunnel not available — cannot bypass UDP block. "
+                                "Install wstunnel: https://github.com/erebe/wstunnel/releases"
+                            )
+                            return False
+
+                if tunnel_up and handshake_ok:
+                    self.connected = True
+
+                    # Step 6: Once tunnel is up with full routing (remote/public mode),
+                    # switch Lighthouse URL to the VPN-internal address.
+                    if not self.is_local:
+                        api_port = 8443
+                        if self.local_url:
+                            try:
+                                api_port = int(self.local_url.split(":")[-1])
+                            except (ValueError, IndexError):
+                                pass
+                        vpn_server_ip = "10.100.0.1"
+                        self.lighthouse_url = f"https://{vpn_server_ip}:{api_port}"
+                        log.info(f"Switched Lighthouse URL to VPN-internal: {self.lighthouse_url}")
+
+                    transport = "wstunnel TCP" if using_wstunnel else "direct UDP"
+                    log.info(f"Connected via {'LAN' if self.is_local else 'public'} endpoint ({transport})")
+                    log.info(f"VPN address: {self.vpn_address}")
+                    log.info(f"WireGuard endpoint: {wg_endpoint}")
+                    log.info(f"Quantum PSK: {KEM_ALGORITHM}")
+
+                    # Save state for restarts
+                    save_state({
+                        "wg_privkey": self.wg_privkey,
+                        "wg_pubkey": self.wg_pubkey,
+                        "mesh_wg_privkey": self.mesh_wg_privkey,
+                        "mesh_wg_pubkey": self.mesh_wg_pubkey,
+                        "vpn_address": self.vpn_address,
+                        "lighthouse_url": self.lighthouse_url,
+                        "is_local": self.is_local,
+                        "server_public_key": handshake.get("server_public_key", ""),
+                        "wg_endpoint": wg_endpoint,
+                        "using_wstunnel": using_wstunnel,
+                        "connected_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    return True
+
+            # Tunnel failed to come up at all
+            log.error("Tunnel failed to come up")
+            notify_sentinel(
+                "WireGuard tunnel failed to come up",
+                component="wireguard",
+                lighthouse_url=self.lighthouse_url or "",
+            )
+            return False
 
         except Exception as e:
             msg = str(e).strip()
@@ -3992,6 +4303,13 @@ class QuantumVPNService:
             _stun_cache["timestamp"] = 0
             log.info("STUN cache invalidated due to network change")
             invalidate_physical_ip_cache()
+
+            # Stop wstunnel if active — the new network may allow direct UDP,
+            # or we may need a fresh wstunnel connection to the new gateway.
+            # _full_connect will re-test and restart wstunnel if needed.
+            if _wstunnel_active:
+                log.info("Network change: stopping wstunnel (will re-test on reconnect)")
+                _stop_wstunnel()
 
             # Re-probe and possibly switch endpoints
             new_url, new_is_local = select_lighthouse(self.public_url, self.local_url)
@@ -4053,6 +4371,10 @@ class QuantumVPNService:
         """
         self.connected = False
         self._consecutive_failures += 1
+
+        # Stop wstunnel — _full_connect will re-test and restart if needed
+        if _wstunnel_active:
+            _stop_wstunnel()
 
         # Notify Sentinel for AI-assisted diagnosis
         notify_sentinel(
@@ -4196,6 +4518,7 @@ class QuantumVPNService:
 
         _wireguard_down()
         _mesh_wireguard_down()
+        _stop_wstunnel()
         log.info("VPN service stopped")
 
     def _rehydrate_mesh_state(self) -> None:
@@ -4329,31 +4652,95 @@ class QuantumVPNService:
                 mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
                 if mesh_conf_path.exists():
                     log.info("Mesh rehydrate: wg_mesh interface is DOWN — bringing it up from saved config")
+                    iface = "wg_mesh"
                     try:
-                        # Clean teardown first in case of partial state
-                        subprocess.run(
-                            ["sudo", "wg-quick", "down", str(mesh_conf_path)],
-                            capture_output=True, timeout=10,
-                        )
-                        subprocess.run(
-                            ["sudo", "ip", "link", "delete", "dev", "wg_mesh"],
-                            capture_output=True, timeout=5,
-                        )
-                        subprocess.run(
-                            ["sudo", "resolvconf", "-d", "wg_mesh", "-f"],
-                            capture_output=True, timeout=5,
-                        )
-                        # Bring it up
-                        result = subprocess.run(
-                            ["sudo", "wg-quick", "up", str(mesh_conf_path)],
-                            capture_output=True, text=True, timeout=15,
-                        )
-                        if result.returncode == 0:
-                            log.info("Mesh rehydrate: wg_mesh interface is now UP")
+                        if platform.system() == "Windows":
+                            # Windows: use wireguard.exe tunnel service
+                            # (mirrors apply_mesh_peer / _mesh_wireguard_down)
+                            wireguard_exe = _find_wireguard_windows()
+
+                            # Clean teardown first — uninstall any stale service
+                            subprocess.run(
+                                [wireguard_exe, "/uninstalltunnelservice", iface],
+                                capture_output=True, timeout=10,
+                            )
+                            time.sleep(2)
+
+                            # Verify it's fully gone before reinstalling
+                            for _ in range(5):
+                                check = subprocess.run(
+                                    [wireguard_exe, "/uninstalltunnelservice", iface],
+                                    capture_output=True, text=True, timeout=5,
+                                )
+                                stderr = (check.stderr or "").lower()
+                                if "not found" in stderr or "not installed" in stderr or \
+                                   "does not exist" in stderr:
+                                    break
+                                time.sleep(1)
+
+                            # Bring it up
+                            result = subprocess.run(
+                                [wireguard_exe, "/installtunnelservice", str(mesh_conf_path)],
+                                capture_output=True, text=True, timeout=15,
+                            )
+                            if result.returncode == 0:
+                                log.info("Mesh rehydrate: wg_mesh interface is now UP")
+                            else:
+                                stderr = result.stderr.strip() if result.stderr else str(result.returncode)
+                                # Handle "already exists" race — force restart
+                                if "already" in stderr.lower():
+                                    log.warning("Mesh rehydrate: tunnel service still running — forcing restart")
+                                    subprocess.run(
+                                        ["taskkill", "/F", "/FI", f"SERVICES eq WireGuardTunnel${iface}"],
+                                        capture_output=True, timeout=10,
+                                    )
+                                    time.sleep(3)
+                                    subprocess.run(
+                                        [wireguard_exe, "/uninstalltunnelservice", iface],
+                                        capture_output=True, timeout=10,
+                                    )
+                                    time.sleep(2)
+                                    retry = subprocess.run(
+                                        [wireguard_exe, "/installtunnelservice", str(mesh_conf_path)],
+                                        capture_output=True, text=True, timeout=15,
+                                    )
+                                    if retry.returncode == 0:
+                                        log.info("Mesh rehydrate: wg_mesh interface is now UP (after forced restart)")
+                                    else:
+                                        log.error(f"Mesh rehydrate: failed to bring up wg_mesh after retry: "
+                                                  f"{retry.stderr.strip() if retry.stderr else retry.returncode}")
+                                else:
+                                    log.error(f"Mesh rehydrate: failed to bring up wg_mesh: {stderr}")
+
                         else:
-                            log.error(f"Mesh rehydrate: failed to bring up wg_mesh: {result.stderr.strip()}")
+                            # Linux: use sudo wg-quick (existing behavior)
+                            # Clean teardown first in case of partial state
+                            subprocess.run(
+                                ["sudo", "wg-quick", "down", str(mesh_conf_path)],
+                                capture_output=True, timeout=10,
+                            )
+                            subprocess.run(
+                                ["sudo", "ip", "link", "delete", "dev", iface],
+                                capture_output=True, timeout=5,
+                            )
+                            subprocess.run(
+                                ["sudo", "resolvconf", "-d", iface, "-f"],
+                                capture_output=True, timeout=5,
+                            )
+                            # Bring it up
+                            result = subprocess.run(
+                                ["sudo", "wg-quick", "up", str(mesh_conf_path)],
+                                capture_output=True, text=True, timeout=15,
+                            )
+                            if result.returncode == 0:
+                                log.info("Mesh rehydrate: wg_mesh interface is now UP")
+                            else:
+                                log.error(f"Mesh rehydrate: failed to bring up wg_mesh: {result.stderr.strip()}")
+
+                    except FileNotFoundError as e:
+                        log.error(f"Mesh rehydrate: WireGuard executable not found: {e}")
                     except Exception as e:
-                        log.error(f"Mesh rehydrate: wg-quick up failed: {e}")
+                        log.error(f"Mesh rehydrate: failed to bring up wg_mesh: {e}")
                 else:
                     log.warning("Mesh rehydrate: wg_mesh is down and no wg_mesh.conf found — peers will need to re-mesh")
         else:

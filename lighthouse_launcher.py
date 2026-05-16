@@ -319,6 +319,7 @@ def generate_config(
     external_port: int,
     internal_port: int,
     wg_port: int,
+    wstunnel_port: int = 443,
 ) -> str:
     """Generate a complete config.yaml from user inputs."""
     return textwrap.dedent(f"""\
@@ -361,6 +362,14 @@ def generate_config(
             - "9.9.9.9"
           exit_node: true
           key_dir: "{WG_KEY_DIR}"
+
+        # ─── wstunnel TCP Fallback ───────────────────────────────────
+        # Wraps WireGuard UDP inside TCP WebSocket for clients on
+        # UDP-hostile networks (public wifi, corporate firewalls).
+        wstunnel:
+          enabled: true
+          listen_port: {wstunnel_port}
+          forward_to: "127.0.0.1:{wg_port}"
 
         # ─── Post-Quantum Crypto ────────────────────────────────────
         pqc:
@@ -441,7 +450,7 @@ def run_wizard():
         print_info("Setup cancelled.")
         return False
 
-    total_steps = 7
+    total_steps = 8
 
     # ── Step 1: LAN IP ───────────────────────────────────────────────────
     print_step(1, total_steps, "Device LAN IP")
@@ -512,13 +521,29 @@ def run_wizard():
     print(f"  {c.YELLOW}ACTION REQUIRED:{c.RESET} Forward UDP port {c.BOLD}{wg_port}{c.RESET} on your")
     print(f"  router to {c.BOLD}{lan_ip}:{wg_port}{c.RESET}")
 
-    # ── Step 5: Summary & Confirmation ───────────────────────────────────
-    print_step(5, total_steps, "Configuration Summary")
+    # ── Step 5: wstunnel TCP Fallback ────────────────────────────────
+    print_step(5, total_steps, "wstunnel TCP Fallback")
+    print()
+    print(f"  wstunnel lets clients on UDP-hostile networks (public wifi,")
+    print(f"  corporate firewalls) connect by wrapping WireGuard UDP inside")
+    print(f"  a TCP WebSocket. Port 443 works on almost every network.")
+    print()
+
+    wstunnel_port_str = prompt("What TCP port for wstunnel fallback?", "443")
+    wstunnel_port = int(wstunnel_port_str)
+
+    print()
+    print(f"  {c.YELLOW}ACTION REQUIRED:{c.RESET} Forward TCP port {c.BOLD}{wstunnel_port}{c.RESET} on your")
+    print(f"  router to {c.BOLD}{lan_ip}:{wstunnel_port}{c.RESET}  (wstunnel fallback)")
+
+    # ── Step 6: Summary & Confirmation ───────────────────────────────
+    print_step(6, total_steps, "Configuration Summary")
     print()
     print(f"  {c.BOLD}Public URL:{c.RESET}       https://{public_ip}:{external_port}")
     print(f"  {c.BOLD}Local URL:{c.RESET}        https://{lan_ip}:{internal_port}")
     print(f"  {c.BOLD}Listen port:{c.RESET}      {internal_port} (TCP)")
     print(f"  {c.BOLD}WireGuard port:{c.RESET}   {wg_port} (UDP)")
+    print(f"  {c.BOLD}wstunnel port:{c.RESET}    {wstunnel_port} (TCP)")
     print(f"  {c.BOLD}VPN subnet:{c.RESET}       10.100.0.0/24")
     print(f"  {c.BOLD}Mesh subnet:{c.RESET}      10.200.0.0/24")
     print(f"  {c.BOLD}PQC algorithm:{c.RESET}    ML-KEM-1024")
@@ -529,6 +554,7 @@ def run_wizard():
         f"\n  {c.BOLD}Port forwarding checklist:{c.RESET}\n"
         f"    TCP {external_port} → {lan_ip}:{internal_port}  (API)\n"
         f"    UDP {wg_port} → {lan_ip}:{wg_port}  (WireGuard)\n"
+        f"    TCP {wstunnel_port} → {lan_ip}:{wstunnel_port}  (wstunnel fallback)\n"
     )
     print(port_summary)
 
@@ -536,8 +562,8 @@ def run_wizard():
         print_info("Setup cancelled. No files were changed.")
         return False
 
-    # ── Step 6: Create Directories & Write Config ────────────────────────
-    print_step(6, total_steps, "Writing Configuration")
+    # ── Step 7: Create Directories & Write Config ────────────────────────
+    print_step(7, total_steps, "Writing Configuration")
 
     # Create all directories
     for d in [LIGHTHOUSE_DIR, CONFIG_DIR, WG_KEY_DIR, DATA_DIR]:
@@ -549,7 +575,7 @@ def run_wizard():
     os.chmod(CONFIG_DIR, 0o755)
 
     # Write config.yaml
-    config_text = generate_config(public_ip, lan_ip, external_port, internal_port, wg_port)
+    config_text = generate_config(public_ip, lan_ip, external_port, internal_port, wg_port, wstunnel_port)
     CONFIG_PATH.write_text(config_text)
     os.chmod(CONFIG_PATH, 0o600)
     print_success(f"Config written to {CONFIG_PATH}")
@@ -557,8 +583,8 @@ def run_wizard():
     # Copy lighthouse.py to /opt/lighthouse/ if not already there
     _ensure_lighthouse_installed()
 
-    # ── Step 7: Generate TLS Certificate ─────────────────────────────────
-    print_step(7, total_steps, "Generating TLS Certificate")
+    # ── Step 8: Generate TLS Certificate ─────────────────────────────────
+    print_step(8, total_steps, "Generating TLS Certificate")
     print_info("Generating self-signed TLS certificate...")
 
     try:
@@ -902,6 +928,34 @@ def _draw_menu_header():
     print(f"  {c.CYAN}║{c.RESET}  Status:       {status_str}")
     print(f"  {c.CYAN}║{c.RESET}  Peers:        {online_peers} online / {total_peers} total")
     print(f"  {c.CYAN}║{c.RESET}  Fingerprint:  {cert_str}")
+
+    # wstunnel status
+    import shutil as _shutil_check
+    wstunnel_bin = None
+    for p in ["/usr/local/bin/wstunnel", "/opt/lighthouse/wstunnel"]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            wstunnel_bin = p
+            break
+    if not wstunnel_bin:
+        wstunnel_bin = _shutil_check.which("wstunnel")
+
+    if wstunnel_bin:
+        # Check if wstunnel process is running
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "wstunnel server"],
+                capture_output=True, timeout=3,
+            )
+            if result.returncode == 0:
+                ws_str = f"{c.GREEN}RUNNING{c.RESET}"
+            else:
+                ws_str = f"{c.YELLOW}STOPPED{c.RESET}"
+        except Exception:
+            ws_str = f"{c.YELLOW}STOPPED{c.RESET}"
+    else:
+        ws_str = f"{c.DIM}NOT INSTALLED{c.RESET}"
+    print(f"  {c.CYAN}║{c.RESET}  wstunnel:     {ws_str}")
+
     if installed:
         enabled = is_service_enabled()
         boot_str = f"{c.GREEN}ON{c.RESET}" if enabled else f"{c.DIM}OFF{c.RESET}"

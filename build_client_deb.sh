@@ -256,7 +256,7 @@ echo ""
 
 # ── Create directories with correct permissions ──────────────
 
-echo "[1/4] Creating directories..."
+echo "[1/5] Creating directories..."
 
 mkdir -p /opt/cobratail/config
 mkdir -p /opt/cobratail/data
@@ -269,7 +269,7 @@ echo "  Created /opt/cobratail/{config,data,logs}/"
 
 # ── Build and install liboqs C library ───────────────────────
 
-echo "[2/4] Checking liboqs shared library..."
+echo "[2/5] Checking liboqs shared library..."
 
 LIBOQS_FOUND=false
 for lib_path in /usr/local/lib/liboqs.so /usr/lib/liboqs.so /usr/local/lib64/liboqs.so; do
@@ -327,7 +327,7 @@ fi
 
 # ── Install Python dependencies ──────────────────────────────
 
-echo "[3/4] Installing Python dependencies..."
+echo "[3/5] Installing Python dependencies..."
 
 # Install core pip packages
 pip3 install --break-system-packages \
@@ -358,9 +358,102 @@ print('  ML-KEM-1024 self-test: PASSED')
     echo "  until liboqs is properly built and liboqs-python is installed."
 }
 
+# ── Install wstunnel (TCP fallback for UDP-hostile networks) ──
+
+echo "[4/5] Installing wstunnel TCP fallback..."
+
+WSTUNNEL_BIN="/opt/cobratail/bin/wstunnel"
+WSTUNNEL_INSTALLED=false
+
+if [ -f "$WSTUNNEL_BIN" ] && [ -x "$WSTUNNEL_BIN" ]; then
+    echo "  wstunnel already installed"
+    WSTUNNEL_INSTALLED=true
+elif [ -f "/usr/local/bin/wstunnel" ]; then
+    echo "  wstunnel found at /usr/local/bin/wstunnel — symlinking"
+    ln -sf /usr/local/bin/wstunnel "$WSTUNNEL_BIN" 2>/dev/null || true
+    WSTUNNEL_INSTALLED=true
+fi
+
+if [ "$WSTUNNEL_INSTALLED" = false ]; then
+    # Detect architecture for download
+    MACHINE=$(uname -m)
+    case "$MACHINE" in
+        x86_64)  WS_ARCH="x86_64" ;;
+        aarch64) WS_ARCH="aarch64" ;;
+        armv7l)  WS_ARCH="armv7" ;;
+        *)       WS_ARCH="" ;;
+    esac
+
+    if [ -n "$WS_ARCH" ]; then
+        echo "  Downloading wstunnel for ${MACHINE}..."
+
+        # Get latest release URL from GitHub API
+        WS_URL=$(python3 -c "
+import json, urllib.request
+try:
+    req = urllib.request.Request(
+        'https://api.github.com/repos/erebe/wstunnel/releases/latest',
+        headers={'User-Agent': 'CobraTail-Installer'}
+    )
+    data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    for asset in data.get('assets', []):
+        name = asset['name']
+        if 'linux_${WS_ARCH}' in name and name.endswith('.tar.gz'):
+            print(asset['browser_download_url'])
+            break
+except Exception as e:
+    pass
+" 2>/dev/null)
+
+        if [ -n "$WS_URL" ]; then
+            TMPDIR=$(mktemp -d)
+            if wget -q -O "${TMPDIR}/wstunnel.tar.gz" "$WS_URL" 2>/dev/null || \
+               curl -sL -o "${TMPDIR}/wstunnel.tar.gz" "$WS_URL" 2>/dev/null; then
+                tar -xzf "${TMPDIR}/wstunnel.tar.gz" -C "${TMPDIR}/" 2>/dev/null
+                # The binary is either at the root or in a subdirectory
+                WS_EXTRACTED=$(find "${TMPDIR}" -name "wstunnel" -type f | head -1)
+                if [ -n "$WS_EXTRACTED" ]; then
+                    cp "$WS_EXTRACTED" "$WSTUNNEL_BIN"
+                    chmod 755 "$WSTUNNEL_BIN"
+                    echo "  wstunnel installed to ${WSTUNNEL_BIN}"
+                    WSTUNNEL_INSTALLED=true
+                else
+                    echo "  WARNING: Could not find wstunnel binary in archive"
+                fi
+            else
+                echo "  WARNING: wstunnel download failed"
+            fi
+            rm -rf "${TMPDIR}"
+        else
+            echo "  WARNING: Could not determine wstunnel download URL"
+        fi
+    else
+        echo "  WARNING: Unsupported architecture (${MACHINE}) — skipping wstunnel"
+    fi
+fi
+
+if [ "$WSTUNNEL_INSTALLED" = true ]; then
+    # Verify it runs
+    if "$WSTUNNEL_BIN" --version >/dev/null 2>&1; then
+        WS_VER=$("$WSTUNNEL_BIN" --version 2>&1 | head -1)
+        echo "  wstunnel verified: ${WS_VER}"
+    else
+        echo "  wstunnel binary present but --version failed (may still work)"
+    fi
+else
+    echo ""
+    echo "  WARNING: wstunnel not installed"
+    echo "  The VPN will work on most networks, but public wifi and"
+    echo "  corporate networks that block UDP will not be able to connect."
+    echo "  To install manually:"
+    echo "    Download from https://github.com/erebe/wstunnel/releases"
+    echo "    Place the binary at ${WSTUNNEL_BIN}"
+    echo ""
+fi
+
 # ── Reload systemd ───────────────────────────────────────────
 
-echo "[4/4] Configuring systemd..."
+echo "[5/5] Configuring systemd..."
 
 systemctl daemon-reload
 echo "  systemd reloaded"
@@ -405,7 +498,7 @@ echo ""
 echo "  Run 'cobra' to enroll and start the VPN."
 echo ""
 echo "  Files installed:"
-echo "    /opt/cobratail/bin/       — application code"
+echo "    /opt/cobratail/bin/       — application code + wstunnel"
 echo "    /opt/cobratail/config/    — enrollment & certs (created by wizard)"
 echo "    /opt/cobratail/data/      — state & mesh peers"
 echo "    /opt/cobratail/logs/      — client logs"

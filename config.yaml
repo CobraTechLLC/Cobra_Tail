@@ -94,6 +94,16 @@ wireguard:
   # Path to store WireGuard keys
   key_dir: "/etc/lighthouse/wg_keys"
 
+# ─── wstunnel TCP Fallback ───────────────────────────────────
+# Wraps WireGuard UDP inside TCP WebSocket for clients on
+# UDP-hostile networks (public wifi, corporate firewalls).
+# Forward TCP 443 on your router to this device.
+#
+wstunnel:
+  enabled: true
+  listen_port: 443          # TCP port wstunnel listens on (443 = HTTPS/QUIC port, rarely blocked)
+  forward_to: "127.0.0.1:51820"  # Where to deliver unwrapped UDP (WireGuard)
+
 # ─── Post-Quantum Crypto ────────────────────────────────────
 # ML-KEM-1024 (formerly Kyber-1024) settings.
 # The quantum PSK is layered on top of WireGuard's standard

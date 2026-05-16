@@ -1104,6 +1104,12 @@ def show_connection_details():
     print(f"  Lighthouse:     {state.get('lighthouse_url', 'n/a')}")
     print(f"  Local network:  {state.get('is_local', 'unknown')}")
     print(f"  WG endpoint:    {state.get('wg_endpoint', 'n/a')}")
+    using_wstunnel = state.get('using_wstunnel', False)
+    if using_wstunnel:
+        print(f"  Transport:      {YELLOW}wstunnel TCP fallback{RESET} (UDP blocked on this network)")
+    else:
+        transport = "direct UDP" if state.get('wg_endpoint') else "n/a"
+        print(f"  Transport:      {transport}")
     print(f"  Connected at:   {state.get('connected_at', 'never')}")
     print()
 
@@ -1192,6 +1198,17 @@ def settings_menu():
         print(f"  {BOLD}Advanced{RESET}")
         print(f"  [4] Re-enroll this device")
         print(f"  [5] Reset all data {DIM}(removes enrollment, state, keys){RESET}")
+        print()
+
+        # wstunnel status
+        wstunnel_path = BIN_DIR / ("wstunnel.exe" if IS_WINDOWS else "wstunnel")
+        if wstunnel_path.exists():
+            ws_status = f"{GREEN}installed{RESET}"
+        elif shutil.which("wstunnel"):
+            ws_status = f"{GREEN}installed (PATH){RESET}"
+        else:
+            ws_status = f"{YELLOW}not installed{RESET} {DIM}(public wifi fallback unavailable){RESET}"
+        print(f"  {DIM}wstunnel:  {ws_status}{RESET}")
         print()
         print(f"  [0] Back to main menu")
         print()

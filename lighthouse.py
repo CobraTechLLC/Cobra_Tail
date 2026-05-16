@@ -29,6 +29,8 @@ import queue
 import time
 import uuid
 import logging
+import atexit
+import signal as _signal
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -114,6 +116,10 @@ CONFIG: dict = {}
 # period before aggressive mesh tunnel cleanup, and to signal clients that
 # the Lighthouse recently restarted so they should rebuild mesh state.
 _lighthouse_start_time: float = 0.0
+
+# ─── wstunnel subprocess handle ──────────────────────────────────────────────
+_wstunnel_process: subprocess.Popen | None = None
+
 # ─── UART Frame Protocol (matches Vault's protocol) ─────────────────────────
 
 STX = 0x02
@@ -191,8 +197,102 @@ def load_config(path: str) -> dict:
     cfg.setdefault("local_server_url", "")
     cfg.setdefault("log", {"level": "info"})
 
+    # wstunnel TCP fallback — defaults track WireGuard listen port
+    wg_port = cfg.get("wireguard", {}).get("listen_port", 51820)
+    cfg.setdefault("wstunnel", {
+        "enabled": True,
+        "listen_port": 443,
+        "forward_to": f"127.0.0.1:{wg_port}",
+    })
+
     log.info(f"Config loaded from {path}")
     return cfg
+
+# ─── wstunnel TCP Fallback ────────────────────────────────────────────────────
+
+
+def _find_wstunnel() -> str:
+    """Search for the wstunnel binary. Returns path or empty string."""
+    search_paths = [
+        "/usr/local/bin/wstunnel",
+        "/opt/lighthouse/wstunnel",
+    ]
+    for p in search_paths:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    # Fall back to PATH
+    import shutil as _shutil
+    found = _shutil.which("wstunnel")
+    return found or ""
+
+
+def _start_wstunnel_server() -> None:
+    """Launch the wstunnel server as a managed subprocess."""
+    global _wstunnel_process
+
+    ws_cfg = CONFIG.get("wstunnel", {})
+    if not ws_cfg.get("enabled", False):
+        log.info("wstunnel: disabled in config — skipping")
+        return
+
+    binary = _find_wstunnel()
+    if not binary:
+        log.warning("wstunnel: binary not found — TCP fallback unavailable")
+        log.warning("wstunnel: install from https://github.com/erebe/wstunnel/releases")
+        log.warning("wstunnel: clients on restricted networks will not be able to connect")
+        return
+
+    listen_port = ws_cfg.get("listen_port", 443)
+    forward_to = ws_cfg.get("forward_to", "127.0.0.1:51820")
+
+    cmd = [
+        binary, "server",
+        f"ws://0.0.0.0:{listen_port}",
+        "--restrict-to", forward_to,
+    ]
+
+    try:
+        _wstunnel_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        log.info(f"wstunnel: started (PID {_wstunnel_process.pid}) "
+                 f"ws://0.0.0.0:{listen_port} → {forward_to}")
+    except Exception as e:
+        log.warning(f"wstunnel: failed to start — {e}")
+        notify_sentinel(
+            f"wstunnel failed to start: {e}",
+            component="wstunnel",
+        )
+        _wstunnel_process = None
+
+
+def _stop_wstunnel_server() -> None:
+    """Terminate the wstunnel subprocess gracefully."""
+    global _wstunnel_process
+
+    if _wstunnel_process is None:
+        return
+
+    pid = _wstunnel_process.pid
+    log.info(f"wstunnel: stopping (PID {pid})...")
+
+    try:
+        _wstunnel_process.terminate()
+        try:
+            _wstunnel_process.wait(timeout=5)
+            log.info("wstunnel: stopped gracefully")
+        except subprocess.TimeoutExpired:
+            log.warning("wstunnel: SIGTERM timed out — sending SIGKILL")
+            _wstunnel_process.kill()
+            _wstunnel_process.wait(timeout=3)
+            log.info("wstunnel: killed")
+    except Exception as e:
+        log.warning(f"wstunnel: error during shutdown — {e}")
+    finally:
+        _wstunnel_process = None
+
 
 # ─── TLS Certificate Management ─────────────────────────────────────────────
 
@@ -1603,6 +1703,8 @@ async def register_device(req: RegisterRequest):
         "dns": CONFIG["wireguard"].get("dns", []),
         "discovery": CONFIG.get("discovery", {}),
         "lighthouse_restarted": (time.time() - _lighthouse_start_time) < 180,
+        "wstunnel_enabled": CONFIG.get("wstunnel", {}).get("enabled", False),
+        "wstunnel_port": CONFIG.get("wstunnel", {}).get("listen_port", 443),
     }
 
 @app.post("/api/v1/enroll")
@@ -3405,6 +3507,21 @@ def main():
 
     rotation_thread = threading.Thread(target=key_rotation_thread, daemon=True)
     rotation_thread.start()
+
+    # ── wstunnel TCP fallback ──
+    ws_cfg = CONFIG.get("wstunnel", {})
+    if ws_cfg.get("enabled", False):
+        _start_wstunnel_server()
+
+    # Register clean shutdown for wstunnel subprocess
+    atexit.register(_stop_wstunnel_server)
+
+    def _shutdown_handler(signum, frame):
+        _stop_wstunnel_server()
+        sys.exit(0)
+
+    _signal.signal(_signal.SIGTERM, _shutdown_handler)
+    _signal.signal(_signal.SIGINT, _shutdown_handler)
 
     ssl_kwargs = {}
     if tls_cfg.get("enabled"):
