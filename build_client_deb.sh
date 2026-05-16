@@ -376,16 +376,17 @@ fi
 
 if [ "$WSTUNNEL_INSTALLED" = false ]; then
     # Detect architecture for download
+    # Note: wstunnel uses arm64/amd64 naming, not aarch64/x86_64
     MACHINE=$(uname -m)
     case "$MACHINE" in
-        x86_64)  WS_ARCH="x86_64" ;;
-        aarch64) WS_ARCH="aarch64" ;;
+        x86_64)  WS_ARCH="amd64" ;;
+        aarch64) WS_ARCH="arm64" ;;
         armv7l)  WS_ARCH="armv7" ;;
         *)       WS_ARCH="" ;;
     esac
 
     if [ -n "$WS_ARCH" ]; then
-        echo "  Downloading wstunnel for ${MACHINE}..."
+        echo "  Downloading wstunnel for ${MACHINE} (arch: ${WS_ARCH})..."
 
         # Get latest release URL from GitHub API
         WS_URL=$(python3 -c "
@@ -398,7 +399,7 @@ try:
     data = json.loads(urllib.request.urlopen(req, timeout=15).read())
     for asset in data.get('assets', []):
         name = asset['name']
-        if 'linux_${WS_ARCH}' in name and name.endswith('.tar.gz'):
+        if 'linux' in name and '${WS_ARCH}' in name and name.endswith('.tar.gz'):
             print(asset['browser_download_url'])
             break
 except Exception as e:

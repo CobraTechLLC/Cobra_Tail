@@ -395,8 +395,8 @@ if [ "$WSTUNNEL_INSTALLED" = false ]; then
     echo "  Detecting architecture..."
     MACHINE=$(uname -m)
     case "$MACHINE" in
-        x86_64)  WS_ARCH="x86_64" ;;
-        aarch64) WS_ARCH="aarch64" ;;
+        x86_64)  WS_ARCH="amd64" ;;
+        aarch64) WS_ARCH="arm64" ;;
         armv7*)  WS_ARCH="armv7" ;;
         *)
             echo "  WARNING: Unsupported architecture ($MACHINE) — skipping wstunnel install"
@@ -406,10 +406,11 @@ if [ "$WSTUNNEL_INSTALLED" = false ]; then
     esac
 
     if [ -n "$WS_ARCH" ]; then
-        echo "  Architecture: $WS_ARCH"
+        echo "  Architecture: ${MACHINE} → wstunnel arch: ${WS_ARCH}"
         echo "  Fetching latest wstunnel release from GitHub..."
 
         # Use Python to query the GitHub API for the latest release asset URL
+        # Note: wstunnel uses arm64/amd64 naming, not aarch64/x86_64
         WS_URL=$(python3 -c "
 import urllib.request, json, sys
 try:
@@ -420,12 +421,13 @@ try:
     resp = urllib.request.urlopen(req, timeout=15)
     data = json.loads(resp.read().decode())
     arch = '${WS_ARCH}'
+    # Try exact match first (e.g. linux_arm64.tar.gz)
     for asset in data.get('assets', []):
         name = asset['name'].lower()
         if 'linux' in name and arch in name and name.endswith('.tar.gz'):
             print(asset['browser_download_url'])
             sys.exit(0)
-    # Fallback: try musl variant
+    # Fallback: any linux archive matching arch
     for asset in data.get('assets', []):
         name = asset['name'].lower()
         if 'linux' in name and arch in name:
