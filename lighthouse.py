@@ -651,12 +651,29 @@ def setup_wireguard() -> tuple[str, str]:
         "SaveConfig = false\n"
     )
 
+    # Enable IP forwarding (required for peer-to-peer relay and exit-node)
+    # This is the kernel flag that was missing and caused mesh relay to silently drop packets.
+    conf_content += (
+        "PostUp = sysctl -w net.ipv4.ip_forward=1\n"
+    )
+
+    # Always allow peer-to-peer forwarding through the tunnel (mesh relay)
+    # Without this, VPN-routed mesh fallback fails when a client is behind symmetric NAT.
+    conf_content += (
+        "PostUp = iptables -A FORWARD -i %i -o %i -j ACCEPT\n"
+        "PostDown = iptables -D FORWARD -i %i -o %i -j ACCEPT\n"
+    )
+
     if wg.get("exit_node"):
+        # Auto-detect the default outbound interface instead of hardcoding wlan0/eth0
+        # This works whether the Pi is on ethernet, wifi, or anything else.
         conf_content += (
-            "PostUp = iptables -A FORWARD -i %i -j ACCEPT; "
-            "iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE\n"
-            "PostDown = iptables -D FORWARD -i %i -j ACCEPT; "
-            "iptables -t nat -D POSTROUTING -o wlan0 -j MASQUERADE\n"
+            "PostUp = iptables -A FORWARD -i %i -o $(ip route show default | awk '/default/ {print $5}' | head -1) -j ACCEPT; "
+            "iptables -A FORWARD -i $(ip route show default | awk '/default/ {print $5}' | head -1) -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; "
+            "iptables -t nat -A POSTROUTING -o $(ip route show default | awk '/default/ {print $5}' | head -1) -j MASQUERADE\n"
+            "PostDown = iptables -D FORWARD -i %i -o $(ip route show default | awk '/default/ {print $5}' | head -1) -j ACCEPT; "
+            "iptables -D FORWARD -i $(ip route show default | awk '/default/ {print $5}' | head -1) -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; "
+            "iptables -t nat -D POSTROUTING -o $(ip route show default | awk '/default/ {print $5}' | head -1) -j MASQUERADE\n"
         )
 
     conf_path.write_text(conf_content)

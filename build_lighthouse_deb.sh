@@ -230,7 +230,7 @@ echo ""
 
 # ── Create directories with correct permissions ──────────────
 
-echo "[1/6] Creating directories..."
+echo "[1/7] Creating directories..."
 
 mkdir -p /etc/lighthouse/wg_keys
 mkdir -p /var/lib/lighthouse
@@ -243,7 +243,7 @@ echo "  Created /var/lib/lighthouse/"
 
 # ── Enable GPIO UART (Pi 4 specific) ────────────────────────
 
-echo "[2/6] Checking for Raspberry Pi UART setup..."
+echo "[2/7] Checking for Raspberry Pi UART setup..."
 
 IS_PI=false
 if [ -f /proc/cpuinfo ] && grep -qi "raspberry\|BCM" /proc/cpuinfo 2>/dev/null; then
@@ -301,7 +301,7 @@ fi
 
 # ── Build and install liboqs C library ───────────────────────
 
-echo "[3/6] Checking liboqs shared library..."
+echo "[3/7] Checking liboqs shared library..."
 
 LIBOQS_FOUND=false
 for lib_path in /usr/local/lib/liboqs.so /usr/lib/liboqs.so /usr/local/lib64/liboqs.so; do
@@ -359,7 +359,7 @@ fi
 
 # ── Install Python dependencies ──────────────────────────────
 
-echo "[4/6] Installing Python dependencies..."
+echo "[4/7] Installing Python dependencies..."
 
 # Install core pip packages
 pip3 install --break-system-packages \
@@ -377,7 +377,7 @@ echo "  Python dependencies installed"
 
 # ── Install wstunnel binary (TCP fallback for WireGuard) ─────
 
-echo "[5/6] Installing wstunnel TCP fallback..."
+echo "[5/7] Installing wstunnel TCP fallback..."
 
 WSTUNNEL_INSTALLED=false
 
@@ -483,9 +483,38 @@ except Exception as e:
     fi
 fi
 
+# ── Enable IP forwarding & iptables for VPN relay ────────────
+# Without ip_forward=1, the Pi silently drops packets between VPN peers.
+# This is required for mesh relay (peer-to-peer through the Lighthouse tunnel)
+# and for exit-node mode (routing client traffic to the internet).
+
+echo "[6/7] Enabling IP forwarding and firewall rules..."
+
+# Enable immediately
+sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+
+# Make permanent across reboots
+SYSCTL_CONF="/etc/sysctl.d/99-lighthouse.conf"
+if [ ! -f "$SYSCTL_CONF" ] || ! grep -q "net.ipv4.ip_forward" "$SYSCTL_CONF" 2>/dev/null; then
+    echo "net.ipv4.ip_forward = 1" >> "$SYSCTL_CONF"
+    echo "  Enabled net.ipv4.ip_forward=1 (persistent)"
+else
+    echo "  net.ipv4.ip_forward already enabled"
+fi
+
+# Install iptables-persistent so rules survive reboot
+# (non-interactive — pre-seed debconf to avoid prompts)
+echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
+echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
+apt-get install -y -qq iptables-persistent > /dev/null 2>&1 || \
+echo "  WARNING: Could not install iptables-persistent — firewall rules may not survive reboot"
+
+echo "  IP forwarding and firewall configured"
+echo "  (WireGuard PostUp rules will apply detailed iptables at tunnel start)"
+
 # ── Reload systemd ───────────────────────────────────────────
 
-echo "[6/6] Configuring systemd..."
+echo "[7/7] Configuring systemd..."
 
 systemctl daemon-reload
 echo "  systemd reloaded"

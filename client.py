@@ -1048,21 +1048,27 @@ def send_holepunch_burst(target_endpoints: list[str], listen_port: int = MESH_WG
 
         if ipv4_targets:
             sock4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # SO_REUSEPORT lets us share port 51821 with WireGuard's wg_mesh.
+            # Without this, _bind_physical falls back to ephemeral port and
+            # punch packets come from the wrong source port — NAT pinholes
+            # never line up with where WireGuard is actually listening.
+            if hasattr(socket, "SO_REUSEPORT"):
+                sock4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             _bind_physical(sock4, listen_port)
 
         if ipv6_targets:
             try:
                 sock6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
                 sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-                # FIX: Always bind to listen_port. IPV6_V6ONLY is set, so there's
-                # no conflict with the IPv4 socket on the same port. The old code
-                # used port 0 when sock4 existed, which meant IPv6 punch packets
-                # came from a random ephemeral port — never opening the correct
-                # NAT pinhole for WireGuard's listen port.
+                # SO_REUSEPORT to share port 51821 with WireGuard's wg_mesh.
+                # Without this, bind() fails with EADDRINUSE because WireGuard
+                # already holds the port, and the fallback to ephemeral port
+                # means punch packets come from the wrong source port —
+                # they never open the correct NAT pinhole.
+                if hasattr(socket, "SO_REUSEPORT"):
+                    sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock6.bind(("::", listen_port))
             except OSError as e:
-                # If listen_port is truly unavailable (unlikely with V6ONLY),
-                # fall back to ephemeral and log a warning
                 log.warning(f"Hole punch: IPv6 bind to port {listen_port} failed: {e} — using ephemeral port")
                 try:
                     sock6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
@@ -1101,6 +1107,7 @@ def send_holepunch_burst(target_endpoints: list[str], listen_port: int = MESH_WG
     t = threading.Thread(target=_burst, daemon=True)
     t.start()
     log.info(f"Hole punch burst started targeting {len(target_endpoints)} endpoints")
+
 
 def attempt_upnp_mapping(internal_port: int, external_port: int = 0,
                           duration: int = UPNP_MAPPING_DURATION) -> str | None:
@@ -1339,10 +1346,25 @@ def _bind_physical(sock: socket.socket, port: int = 0) -> None:
     This ensures STUN queries and hole-punch packets go out on the real
     network adapter, bypassing the WireGuard full-tunnel (0.0.0.0/0) routing.
 
+    Uses SO_REUSEPORT when available so hole-punch sockets can share the
+    WireGuard listen port (51821). Without this, bind fails with EADDRINUSE
+    and the fallback to an ephemeral port means punch packets come from the
+    wrong source port — NAT pinholes never align with WireGuard's listener.
+
     If binding to the physical IP fails (e.g., no tunnel active, or can't
     determine the interface), falls back to default binding.
     """
     physical_ip = get_physical_ip()
+
+    # Ensure SO_REUSEPORT is set before any bind attempt so we can share
+    # the port with WireGuard. The caller may have already set it, but
+    # setting it twice is harmless.
+    if port and hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+
     try:
         sock.bind((physical_ip, port))
         log.debug(f"Socket bound to physical interface: {physical_ip}:{port}")
@@ -2248,6 +2270,9 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
             send_holepunch_burst(all_endpoints, listen_port)
             time.sleep(2)
 
+    # Ensure Windows Firewall allows mesh WireGuard traffic
+    _ensure_mesh_firewall_rule()
+
     iface = "wg_mesh"
     mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
     mesh_peers_path = DATA_DIR / "mesh_peers.json"
@@ -2676,6 +2701,8 @@ class PeerKEMExchange:
         except Exception as e:
             log.warning(f"Could not add firewall rule for port {PEER_KEM_PORT}: {e}")
             log.warning("You may need to manually allow TCP port 9876 in Windows Firewall")
+
+
 
     def stop(self) -> None:
         self._running = False
@@ -3289,6 +3316,38 @@ class PeerKEMExchange:
 
 # ─── WireGuard Config ────────────────────────────────────────────────────────
 
+
+def _ensure_mesh_firewall_rule() -> None:
+    """Add a Windows Firewall rule for mesh WireGuard UDP port if needed.
+
+    Without this rule, VPN-routed mesh traffic (arriving on the wg_quantum
+    virtual adapter at 10.100.0.x:51821) gets blocked by Windows Firewall,
+    preventing mesh handshakes when off-network.
+    """
+    if platform.system() != "Windows":
+        return
+    rule_name = "Quantum VPN - Mesh WireGuard"
+    try:
+        result = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule",
+             f"name={rule_name}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and rule_name in result.stdout:
+            return
+
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}",
+             "dir=in", "action=allow", "protocol=UDP",
+             f"localport={MESH_WG_LISTEN_PORT}",
+             "profile=any",
+             "description=Allow mesh WireGuard traffic including VPN-routed"],
+            capture_output=True, text=True, timeout=10,
+        )
+        log.info(f"Added firewall rule for mesh WireGuard (UDP port {MESH_WG_LISTEN_PORT})")
+    except Exception as e:
+        log.debug(f"Could not add mesh firewall rule: {e}")
 
 def build_wireguard_config(handshake_result: dict, wg_privkey: str,
                            endpoint_override: str = None, is_local: bool = False) -> str:
@@ -3973,6 +4032,7 @@ class QuantumVPNService:
                 if now - last_mesh_check >= MESH_CHECK_INTERVAL:
                     if self.lighthouse_url and self.connected:
                         self._reconcile_mesh_state()
+                        self._auto_mesh_with_lan_peers()
                         self._process_pending_mesh()
                         # Poll for relayed KEM messages (remote peer exchanges)
                         self.peer_kem._handle_relay_messages()
@@ -4624,11 +4684,34 @@ class QuantumVPNService:
             if request_id in self.mesh_peers:
                 continue
 
+            # When off-network, saved endpoints are likely LAN IPs (192.168.x.x)
+            # which are unreachable. Replace them with the peer's VPN address
+            # (10.100.0.x) which routes through the main Lighthouse WireGuard tunnel.
+            saved_endpoint = info.get("endpoint", "")
+            if not self.is_local and saved_endpoint and vpn_addr:
+                ep_host = saved_endpoint.split(":")[0]
+                if ep_host.startswith(("192.168.", "10.0.", "172.16.", "172.17.",
+                                       "172.18.", "172.19.", "172.2", "172.30.",
+                                       "172.31.")):
+                    # Extract the mesh listen port from the saved endpoint
+                    try:
+                        ep_port = saved_endpoint.split(":")[1]
+                    except IndexError:
+                        ep_port = str(MESH_WG_LISTEN_PORT)
+                    vpn_endpoint = f"{vpn_addr}:{ep_port}"
+                    log.info(
+                        f"Mesh rehydrate: off-network — replacing LAN endpoint "
+                        f"{saved_endpoint} → {vpn_endpoint} (VPN-routed) for {peer_id}"
+                    )
+                    saved_endpoint = vpn_endpoint
+                    info["endpoint"] = vpn_endpoint
+                    disk_modified = True
+
             self.mesh_peers[request_id] = {
                 "peer_id": peer_id,
                 "vpn_address": vpn_addr,
                 "mesh_ip": mesh_ip,
-                "endpoint": info.get("endpoint", ""),
+                "endpoint": saved_endpoint,
                 "peer_wg_pubkey": pubkey,
             }
             rehydrated += 1
@@ -4641,8 +4724,32 @@ class QuantumVPNService:
             except Exception as e:
                 log.warning(f"Mesh rehydrate: failed to write healed mesh_peers.json: {e}")
 
+        # Always rewrite wg_mesh.conf when off-network to ensure the WireGuard
+        # interface uses VPN-routed endpoints, not stale LAN IPs that may be
+        # baked into the conf from a previous LAN session. The conf on disk can
+        # diverge from mesh_peers.json because the path monitor uses `wg set`
+        # (live-only) to change endpoints without rewriting the conf.
+        if rehydrated and not self.is_local:
+            mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
+            try:
+                state = load_state()
+                my_mesh_ip = state.get("mesh_ip", "")
+                _rewrite_mesh_conf(
+                    mesh_conf_path, self.mesh_wg_privkey,
+                    MESH_WG_LISTEN_PORT, my_mesh_ip, disk_peers,
+                )
+                log.info(f"Mesh rehydrate: rewrote wg_mesh.conf for off-network "
+                         f"({rehydrated} peers, endpoints: "
+                         f"{[info.get('endpoint','?') for info in disk_peers.values()]})")
+            except Exception as e:
+                log.warning(f"Mesh rehydrate: failed to rewrite wg_mesh.conf: {e}")
+
         if rehydrated:
             log.info(f"Mesh rehydrate: restored {rehydrated} peer(s) from disk + Lighthouse")
+
+            # Log the endpoint state for debugging
+            for req_id, pi in self.mesh_peers.items():
+                log.info(f"  Mesh peer {pi.get('peer_id','?')}: endpoint={pi.get('endpoint','?')} vpn={pi.get('vpn_address','?')}")
 
             # Ensure wg_mesh interface is actually up — rehydrating the in-memory
             # dict is useless if the WireGuard interface doesn't exist. The config
@@ -4652,6 +4759,7 @@ class QuantumVPNService:
                 mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
                 if mesh_conf_path.exists():
                     log.info("Mesh rehydrate: wg_mesh interface is DOWN — bringing it up from saved config")
+                    _ensure_mesh_firewall_rule()
                     iface = "wg_mesh"
                     try:
                         if platform.system() == "Windows":
@@ -4685,6 +4793,21 @@ class QuantumVPNService:
                             )
                             if result.returncode == 0:
                                 log.info("Mesh rehydrate: wg_mesh interface is now UP")
+                                # Verify peers are loaded on the interface
+                                time.sleep(1)
+                                try:
+                                    wg_path = _find_wg_windows()
+                                    verify = subprocess.run(
+                                        [wg_path, "show", "wg_mesh", "latest-handshakes"],
+                                        capture_output=True, text=True, timeout=5,
+                                    )
+                                    if verify.returncode == 0:
+                                        peer_lines = [l for l in verify.stdout.strip().split("\n") if "\t" in l]
+                                        log.info(f"Mesh rehydrate: wg_mesh has {len(peer_lines)} peer(s) loaded")
+                                        if not peer_lines:
+                                            log.warning("Mesh rehydrate: wg_mesh UP but 0 peers — conf may be stale or invalid")
+                                except Exception as ve:
+                                    log.debug(f"Mesh rehydrate: peer verify check failed: {ve}")
                             else:
                                 stderr = result.stderr.strip() if result.stderr else str(result.returncode)
                                 # Handle "already exists" race — force restart
@@ -5275,7 +5398,78 @@ class QuantumVPNService:
                 )
 
                 if not handshake_map:
-                    log.info("Path monitor: no handshake data from WireGuard — wg_mesh may be down")
+                    # wg_mesh interface has 0 peers. Either it's down, or it
+                    # came up from a stale/empty conf. Try to recover by adding
+                    # peers via 'wg set' from our in-memory mesh_peers state.
+                    if not hasattr(self, '_mesh_repair_attempts'):
+                        self._mesh_repair_attempts = 0
+
+                    self._mesh_repair_attempts += 1
+
+                    if self._mesh_repair_attempts <= 3:
+                        log.warning(
+                            f"Path monitor: wg_mesh has 0 peers — attempting repair "
+                            f"(attempt {self._mesh_repair_attempts}/3)"
+                        )
+                        # Try adding each peer via wg set
+                        for req_id, pi in self.mesh_peers.items():
+                            pubkey = pi.get("peer_wg_pubkey", "")
+                            endpoint = pi.get("endpoint", "")
+                            if not pubkey or not endpoint:
+                                continue
+
+                            # Read the PSK from mesh_peers.json on disk
+                            try:
+                                mp_path = DATA_DIR / "mesh_peers.json"
+                                if mp_path.exists():
+                                    mp_data = json.loads(mp_path.read_text())
+                                    peer_disk = mp_data.get(pubkey, {})
+                                    psk = peer_disk.get("psk", "")
+                                    allowed_ip = peer_disk.get("mesh_ip") or peer_disk.get("allowed_ip") or pi.get("mesh_ip") or pi.get("vpn_address", "")
+                                else:
+                                    continue
+                            except Exception:
+                                continue
+
+                            if not psk or not allowed_ip:
+                                continue
+
+                            try:
+                                if platform.system() == "Windows":
+                                    wg_path = _find_wg_windows()
+                                    # Write PSK to a temp file for wg set
+                                    psk_file = DATA_DIR / f"_psk_{pubkey[:8]}.tmp"
+                                    psk_file.write_text(psk)
+                                    result = subprocess.run(
+                                        [wg_path, "set", "wg_mesh", "peer", pubkey,
+                                         "preshared-key", str(psk_file),
+                                         "endpoint", endpoint,
+                                         "allowed-ips", f"{allowed_ip}/32",
+                                         "persistent-keepalive", "25"],
+                                        capture_output=True, text=True, timeout=5,
+                                    )
+                                    psk_file.unlink(missing_ok=True)
+                                else:
+                                    psk_file = DATA_DIR / f"_psk_{pubkey[:8]}.tmp"
+                                    psk_file.write_text(psk)
+                                    result = subprocess.run(
+                                        ["sudo", "wg", "set", "wg_mesh", "peer", pubkey,
+                                         "preshared-key", str(psk_file),
+                                         "endpoint", endpoint,
+                                         "allowed-ips", f"{allowed_ip}/32",
+                                         "persistent-keepalive", "25"],
+                                        capture_output=True, text=True, timeout=5,
+                                    )
+                                    psk_file.unlink(missing_ok=True)
+
+                                if result.returncode == 0:
+                                    log.info(f"Path monitor: repaired — added {pubkey[:20]}... → {endpoint}")
+                                else:
+                                    log.warning(f"Path monitor: wg set failed for {pubkey[:20]}...: {result.stderr.strip()}")
+                            except Exception as e:
+                                log.warning(f"Path monitor: repair failed for {pubkey[:20]}...: {e}")
+                    else:
+                        log.info("Path monitor: no handshake data from WireGuard — wg_mesh may be down (repair exhausted)")
                     continue
 
                 # Fetch online peer list from Lighthouse once per cycle
@@ -5342,9 +5536,11 @@ class QuantumVPNService:
                         if age < HANDSHAKE_STALE_THRESHOLD:
                             log.info(f"Path monitor: {peer_id} healthy — handshake {age:.0f}s ago")
                             self._repunch_cooldown.pop(peer_id, None)
-                            # Clear zero-hs tracking on success
+                            # Clear zero-hs tracking and repair counter on success
                             if hasattr(self, '_zero_hs_first_seen'):
                                 self._zero_hs_first_seen.pop(peer_id, None)
+                            if hasattr(self, '_mesh_repair_attempts'):
+                                self._mesh_repair_attempts = 0
                             continue
 
                     # Cooldown check
@@ -5537,15 +5733,24 @@ class QuantumVPNService:
                 self._update_mesh_wg_endpoint(peer_wg_pubkey, vpn_endpoint)
                 peer_info["endpoint"] = vpn_endpoint
 
-                # Give the VPN-routed path time to establish a handshake
-                time.sleep(5)
-                handshake_map = self._get_mesh_handshake_times()
-                last_hs = handshake_map.get(peer_wg_pubkey, 0)
-                if last_hs > 0 and (time.time() - last_hs) < HANDSHAKE_STALE_THRESHOLD:
-                    log.info(f"Path monitor: VPN-routed fallback SUCCEEDED for {peer_id}")
-                    self._repunch_cooldown.pop(peer_id, None)
-                    if hasattr(self, '_zero_hs_first_seen'):
-                        self._zero_hs_first_seen.pop(peer_id, None)
+                # Give the VPN-routed path time to establish a handshake.
+                # Double-encapsulated WireGuard (mesh inside quantum tunnel)
+                # can take longer, especially on slower networks. Check
+                # multiple times over 15 seconds instead of once after 5.
+                vpn_route_success = False
+                for wait in (3, 4, 4, 4):  # total: 15 seconds
+                    time.sleep(wait)
+                    handshake_map = self._get_mesh_handshake_times()
+                    last_hs = handshake_map.get(peer_wg_pubkey, 0)
+                    if last_hs > 0 and (time.time() - last_hs) < HANDSHAKE_STALE_THRESHOLD:
+                        log.info(f"Path monitor: VPN-routed fallback SUCCEEDED for {peer_id}")
+                        self._repunch_cooldown.pop(peer_id, None)
+                        if hasattr(self, '_zero_hs_first_seen'):
+                            self._zero_hs_first_seen.pop(peer_id, None)
+                        vpn_route_success = True
+                        break
+
+                if vpn_route_success:
                     return
 
                 log.warning(f"Path monitor: VPN-routed fallback also failed for {peer_id}")
