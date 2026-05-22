@@ -223,6 +223,14 @@ PEER_KEM_TIMEOUT = 60             # Timeout for the full KEM exchange handshake
 MESH_REKEY_INTERVAL = 86400       # Re-key mesh tunnels 120-for test. 86400-for production every 24 hours (seconds)
 MESH_REKEY_CHECK_INTERVAL = 300   # Check for rekey-eligible peers every 5 minutes
 
+# Mesh interface mutation lock — serializes all wg_mesh conf rewrites and
+# interface teardown/bring-up operations so background threads (path monitor,
+# rekey, reconciliation) can't race each other.
+_mesh_interface_lock = threading.Lock()
+
+# Periodic health check: verify wg_mesh has its IP assigned, not just "is up"
+MESH_INTERFACE_HEALTH_INTERVAL = 60  # seconds
+
 # ─── NAT Traversal & Hole Punching (Phase 1) ────────────────────────────────
 STUN_SERVERS = [
     ("stun.l.google.com", 19302),
@@ -2006,7 +2014,16 @@ def send_heartbeat(lighthouse_url: str) -> dict | bool:
             timeout=6,
         )
         if resp.status_code == 200:
-            return resp.json()
+            hb_data = resp.json()
+
+            # Self-healing: Lighthouse returns our authoritative mesh IP.
+            # If it differs from local state, persist the correction.
+            # Then verify the interface actually has the IP assigned.
+            lh_mesh_ip = hb_data.get("your_mesh_ip", "")
+            if lh_mesh_ip:
+                _persist_my_mesh_ip(lh_mesh_ip)
+
+            return hb_data
         return False
     except Exception as e:
         log.debug(f"Heartbeat failed: {e}")
@@ -2208,17 +2225,166 @@ def generate_mesh_wireguard_keypair() -> tuple[str, str]:
     """Generate a separate WireGuard keypair for mesh tunnels."""
     return generate_wireguard_keypair()
 
+def _get_my_mesh_ip() -> str:
+    """Get this node's persistent mesh IP from state.
+
+    The mesh IP is allocated once by the Lighthouse and persisted locally.
+    This is the single source of truth for 'my_mesh_ip' — every function
+    that needs it should call this instead of passing it as a parameter
+    that can be lost in transit.
+    """
+    state = load_state()
+    mesh_ip = state.get("mesh_ip", "")
+    if mesh_ip:
+        return mesh_ip
+
+    # Fallback: read from wg_mesh.conf on disk (covers the case where
+    # state file was corrupted but the conf is still valid)
+    mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
+    if mesh_conf_path.exists():
+        try:
+            for line in mesh_conf_path.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("Address"):
+                    # "Address = 10.200.0.2/32"
+                    addr = line.split("=", 1)[1].strip().split("/")[0]
+                    if addr.startswith("10.200."):
+                        log.info(f"Recovered mesh IP {addr} from wg_mesh.conf (state was empty)")
+                        # Heal the state file
+                        state["mesh_ip"] = addr
+                        save_state(state)
+                        return addr
+        except Exception:
+            pass
+
+    return ""
+
+
+def _persist_my_mesh_ip(mesh_ip: str) -> None:
+    """Persist our mesh IP to state so it survives restarts.
+
+    Called whenever we receive a mesh IP from the Lighthouse (registration,
+    tunnel setup, heartbeat). Idempotent — no-ops if already correct.
+    """
+    if not mesh_ip or not mesh_ip.startswith("10.200."):
+        return
+    state = load_state()
+    if state.get("mesh_ip") != mesh_ip:
+        state["mesh_ip"] = mesh_ip
+        save_state(state)
+        log.info(f"Persisted mesh IP {mesh_ip} to state")
+
+
+def _validate_mesh_conf(mesh_conf_path: Path) -> bool:
+    """Validate that the mesh conf file contains an Address line.
+
+    MUST be called after every _rewrite_mesh_conf and before every
+    wg-quick up. If this returns False, do NOT bring up the interface —
+    it will come up without an IP and black-hole all traffic.
+    """
+    if not mesh_conf_path.exists():
+        log.error("Mesh conf validation FAILED: file does not exist")
+        return False
+    try:
+        content = mesh_conf_path.read_text()
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Address") and "10.200." in stripped:
+                return True
+        log.error(
+            "Mesh conf validation FAILED: no Address line with mesh IP (10.200.x.x) found. "
+            "Refusing to bring up wg_mesh — would create an interface with no IP."
+        )
+        return False
+    except Exception as e:
+        log.error(f"Mesh conf validation FAILED: {e}")
+        return False
+
+
+def _heal_mesh_interface_ip(iface: str = "wg_mesh") -> bool:
+    """Check if the mesh interface has its expected IP and heal if missing.
+
+    This catches the exact failure mode where wg_mesh is 'up' (crypto layer
+    works, handshakes succeed) but has no IP assigned (packets black-hole).
+
+    Returns True if the interface is healthy (has IP) or was healed.
+    Returns False if healing failed or interface is not up.
+    """
+    if platform.system() == "Windows":
+        # Windows assigns IPs through the tunnel service, not ip-addr
+        return True
+
+    my_mesh_ip = _get_my_mesh_ip()
+    if not my_mesh_ip:
+        return True  # No mesh IP allocated yet — nothing to heal
+
+    # Check if interface exists and has the correct IP
+    try:
+        result = subprocess.run(
+            ["ip", "addr", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return False  # Interface doesn't exist
+
+        output = result.stdout
+        expected = f"inet {my_mesh_ip}"
+        if expected in output:
+            return True  # Healthy
+
+        # Interface is up but missing its IP — heal it
+        log.warning(
+            f"Mesh interface {iface} is UP but missing IP {my_mesh_ip} — "
+            f"re-adding (this was the root cause of the black-hole bug)"
+        )
+        add_result = subprocess.run(
+            ["sudo", "ip", "addr", "add", f"{my_mesh_ip}/32", "dev", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        if add_result.returncode == 0:
+            log.info(f"Healed mesh interface: {my_mesh_ip} re-assigned to {iface}")
+            return True
+        elif "RTNETLINK answers: File exists" in (add_result.stderr or ""):
+            # IP is already there but maybe we missed it in parsing
+            return True
+        else:
+            log.error(f"Failed to heal mesh IP: {add_result.stderr.strip()}")
+            return False
+
+    except Exception as e:
+        log.error(f"Mesh IP health check failed: {e}")
+        return False
+
 def _rewrite_mesh_conf(mesh_conf_path: Path, wg_privkey: str,
                         listen_port: int, my_mesh_ip: str,
                         existing_peers: dict) -> None:
-    """Write the full wg_mesh.conf from current peer state."""
+    """Write the full wg_mesh.conf from current peer state.
+
+    If my_mesh_ip is empty, attempts to recover it from the persistent
+    state file or existing conf. REFUSES to write a conf without an
+    Address line — that's the root cause of the IP-disappearing bug.
+    """
+    # Recover mesh IP if caller lost it
+    if not my_mesh_ip:
+        my_mesh_ip = _get_my_mesh_ip()
+
+    if not my_mesh_ip:
+        log.error(
+            "_rewrite_mesh_conf: REFUSING to write conf — my_mesh_ip is empty "
+            "and could not be recovered. Interface would come up without an IP."
+        )
+        notify_sentinel(
+            "Mesh conf rewrite blocked: my_mesh_ip is empty",
+            component="mesh",
+        )
+        return
+
     config = (
         "[Interface]\n"
         f"PrivateKey = {wg_privkey}\n"
         f"ListenPort = {listen_port}\n"
+        f"Address = {my_mesh_ip}/32\n"
     )
-    if my_mesh_ip:
-        config += f"Address = {my_mesh_ip}/32\n"
 
     for pubkey, peer_info in existing_peers.items():
         # Prefer mesh_ip (10.200.0.x) over allowed_ip, which may be stale.
@@ -2239,11 +2405,29 @@ def _rewrite_mesh_conf(mesh_conf_path: Path, wg_privkey: str,
             f"AllowedIPs = {allowed_ip}/32\n"
             "PersistentKeepalive = 25\n"
         )
-    mesh_conf_path.write_text(config)
+
+    # Atomic write: write to temp file, validate, then rename
+    tmp_path = mesh_conf_path.with_suffix(".tmp")
+    tmp_path.write_text(config)
     try:
-        os.chmod(mesh_conf_path, 0o600)
+        os.chmod(tmp_path, 0o600)
     except Exception:
         pass
+
+    # Validate before committing
+    has_address = False
+    for line in config.splitlines():
+        if line.strip().startswith("Address") and "10.200." in line:
+            has_address = True
+            break
+
+    if not has_address:
+        log.error("_rewrite_mesh_conf: BUG — generated conf has no Address line, aborting write")
+        tmp_path.unlink(missing_ok=True)
+        return
+
+    # Commit: rename tmp → real (atomic on same filesystem)
+    tmp_path.replace(mesh_conf_path)
 
 
 def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
@@ -2257,18 +2441,34 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
     Uses separate mesh IPs (10.200.0.x) for Address and AllowedIPs to avoid
     routing conflicts with the main wg_quantum tunnel (10.100.0.0/24).
 
+    All interface mutations are serialized via _mesh_interface_lock to prevent
+    race conditions between concurrent callers (heartbeat, rekey, reconcile).
+
     On Windows: uses 'wg set' for live PSK updates (no service restart needed),
     and only reinstalls the tunnel service for initial peer setup.
     On Linux: uses 'wg set' for live updates if wg_mesh is up, otherwise
     brings up the interface fresh via wg-quick.
     """
-    # Phase 1: Multi-candidate hole punching
+    # Phase 1: Multi-candidate hole punching (outside the lock — network I/O)
     if peer_candidates:
         all_endpoints = [c["endpoint"] for c in peer_candidates if c.get("endpoint")]
         if all_endpoints:
             log.info(f"Hole punching {len(all_endpoints)} candidate endpoints before WG config...")
             send_holepunch_burst(all_endpoints, listen_port)
             time.sleep(2)
+
+    # Recover my_mesh_ip if caller lost it
+    if not my_mesh_ip:
+        my_mesh_ip = _get_my_mesh_ip()
+        if my_mesh_ip:
+            log.info(f"apply_mesh_peer: recovered my_mesh_ip={my_mesh_ip} from persistent state")
+
+    if not my_mesh_ip:
+        log.error(
+            "apply_mesh_peer: my_mesh_ip is empty and could not be recovered. "
+            "Refusing to proceed — interface would lose its IP."
+        )
+        return False
 
     # Ensure Windows Firewall allows mesh WireGuard traffic
     _ensure_mesh_firewall_rule()
@@ -2319,270 +2519,316 @@ def apply_mesh_peer(peer_wg_pubkey: str, peer_endpoint: str,
             f"This WILL break mesh routing if other peers use 10.200.0.x mesh IPs."
         )
 
-    # Load existing mesh peers from disk
-    existing_peers = {}
-    if mesh_peers_path.exists():
-        try:
-            existing_peers = json.loads(mesh_peers_path.read_text())
-        except Exception:
-            pass
-
-    # Heal stale allowed_ip entries: if a peer has a mesh_ip (10.200.0.x) but
-    # allowed_ip still points to a VPN address (10.100.0.x), correct it now.
-    # This catches the scenario where a prior rekey wrote the wrong AllowedIPs
-    # and it's been persisted on disk ever since, reverting the live WG config
-    # every time _rewrite_mesh_conf runs.
-    for pk, info in existing_peers.items():
-        saved_mesh_ip = info.get("mesh_ip", "")
-        saved_allowed_ip = info.get("allowed_ip", "")
-        if saved_mesh_ip and saved_allowed_ip and saved_mesh_ip != saved_allowed_ip:
-            log.warning(
-                f"Healing stale allowed_ip for peer {pk[:20]}...: "
-                f"{saved_allowed_ip} → {saved_mesh_ip}"
-            )
-            info["allowed_ip"] = saved_mesh_ip
-
-    # Check if this is a rekey of an existing peer or a brand new peer.
-    # Match by mesh_ip or vpn_address — pubkey changes on every rekey so
-    # we can't use it as the identity key here.
-    is_existing_peer = peer_wg_pubkey in existing_peers
-    old_pubkey = None
-    if not is_existing_peer:
-        for pk, info in existing_peers.items():
-            if (peer_mesh_ip and info.get("mesh_ip") == peer_mesh_ip) or \
-               (peer_vpn_address and info.get("vpn_address") == peer_vpn_address):
-                # Same peer, new pubkey — rekey detected, remove stale entry
-                old_pubkey = pk
-                is_existing_peer = True
-                break
-
-    if old_pubkey:
-        del existing_peers[old_pubkey]
-
-    # Add/update the peer under the current pubkey
-    existing_peers[peer_wg_pubkey] = {
-        "endpoint": peer_endpoint,
-        "vpn_address": peer_vpn_address,
-        "mesh_ip": peer_mesh_ip,
-        "allowed_ip": peer_allowed_ip,
-        "psk": psk,
-    }
-
-    # Save peers to disk so they survive restarts
-    mesh_peers_path.write_text(json.dumps(existing_peers, indent=2))
-
-    if platform.system() == "Windows":
-        wg_dir = r"C:\Program Files\WireGuard"
-        wg_exe = os.path.join(wg_dir, "wg.exe")
-        if not os.path.exists(wg_exe):
-            wg_exe = "wg"
-        wireguard_exe = os.path.join(wg_dir, "wireguard.exe")
-        if not os.path.exists(wireguard_exe):
-            wireguard_exe = "wireguard.exe"
-
-        # Check if the tunnel service is already running
-        check = subprocess.run(
-            ["sc", "query", f"WireGuardTunnel${iface}"],
-            capture_output=True, text=True,
-        )
-        tunnel_running = "RUNNING" in check.stdout
-
-        if tunnel_running and is_existing_peer:
-            # PSK rekey on existing peer — use 'wg set' for live update,
-            # no service restart needed, no admin required for set operation
-            import tempfile
-            psk_file = Path(tempfile.gettempdir()) / "cobratail_psk.tmp"
+    # --- All interface mutations below are serialized ---
+    with _mesh_interface_lock:
+        # Load existing mesh peers from disk
+        existing_peers = {}
+        if mesh_peers_path.exists():
             try:
-                psk_file.write_text(psk)
-                # If this is a rekey, remove the old pubkey from WireGuard first
-                if old_pubkey:
-                    subprocess.run(
-                        [wg_exe, "set", iface, "peer", old_pubkey, "remove"],
+                existing_peers = json.loads(mesh_peers_path.read_text())
+            except Exception:
+                pass
+
+        # Heal stale allowed_ip entries: if a peer has a mesh_ip (10.200.0.x) but
+        # allowed_ip still points to a VPN address (10.100.0.x), correct it now.
+        for pk, info in existing_peers.items():
+            saved_mesh_ip = info.get("mesh_ip", "")
+            saved_allowed_ip = info.get("allowed_ip", "")
+            if saved_mesh_ip and saved_allowed_ip and saved_mesh_ip != saved_allowed_ip:
+                log.warning(
+                    f"Healing stale allowed_ip for peer {pk[:20]}...: "
+                    f"{saved_allowed_ip} → {saved_mesh_ip}"
+                )
+                info["allowed_ip"] = saved_mesh_ip
+
+        # Check if this is a rekey of an existing peer or a brand new peer.
+        # Match by mesh_ip or vpn_address — pubkey changes on every rekey so
+        # we can't use it as the identity key here.
+        is_existing_peer = peer_wg_pubkey in existing_peers
+        old_pubkey = None
+        if not is_existing_peer:
+            for pk, info in existing_peers.items():
+                if (peer_mesh_ip and info.get("mesh_ip") == peer_mesh_ip) or \
+                   (peer_vpn_address and info.get("vpn_address") == peer_vpn_address):
+                    # Same peer, new pubkey — rekey detected, remove stale entry
+                    old_pubkey = pk
+                    is_existing_peer = True
+                    break
+
+        if old_pubkey:
+            del existing_peers[old_pubkey]
+
+        # Add/update the peer under the current pubkey
+        existing_peers[peer_wg_pubkey] = {
+            "endpoint": peer_endpoint,
+            "vpn_address": peer_vpn_address,
+            "mesh_ip": peer_mesh_ip,
+            "allowed_ip": peer_allowed_ip,
+            "psk": psk,
+        }
+
+        # Save peers to disk so they survive restarts
+        mesh_peers_path.write_text(json.dumps(existing_peers, indent=2))
+
+        if platform.system() == "Windows":
+            wg_dir = r"C:\Program Files\WireGuard"
+            wg_exe = os.path.join(wg_dir, "wg.exe")
+            if not os.path.exists(wg_exe):
+                wg_exe = "wg"
+            wireguard_exe = os.path.join(wg_dir, "wireguard.exe")
+            if not os.path.exists(wireguard_exe):
+                wireguard_exe = "wireguard.exe"
+
+            # Check if the tunnel service is already running
+            check = subprocess.run(
+                ["sc", "query", f"WireGuardTunnel${iface}"],
+                capture_output=True, text=True,
+            )
+            tunnel_running = "RUNNING" in check.stdout
+
+            if tunnel_running and is_existing_peer:
+                # PSK rekey on existing peer — use 'wg set' for live update,
+                # no service restart needed, no admin required for set operation
+                import tempfile
+                psk_file = Path(tempfile.gettempdir()) / "cobratail_psk.tmp"
+                try:
+                    psk_file.write_text(psk)
+                    # If this is a rekey, remove the old pubkey from WireGuard first
+                    if old_pubkey:
+                        subprocess.run(
+                            [wg_exe, "set", iface, "peer", old_pubkey, "remove"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                    result = subprocess.run(
+                        [wg_exe, "set", iface,
+                         "peer", peer_wg_pubkey,
+                         "preshared-key", str(psk_file),
+                         "endpoint", peer_endpoint,
+                         "allowed-ips", f"{peer_allowed_ip}/32",
+                         "persistent-keepalive", "25"],
                         capture_output=True, text=True, timeout=10,
                     )
-                result = subprocess.run(
-                    [wg_exe, "set", iface,
-                     "peer", peer_wg_pubkey,
-                     "preshared-key", str(psk_file),
-                     "endpoint", peer_endpoint,
-                     "allowed-ips", f"{peer_allowed_ip}/32",
-                     "persistent-keepalive", "25"],
-                    capture_output=True, text=True, timeout=10,
+                    if result.returncode == 0:
+                        _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
+                                           my_mesh_ip, existing_peers)
+                        log.info(f"Mesh peer updated via wg set: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+                        return True
+                    else:
+                        log.warning(f"wg set failed ({result.stderr.strip()}), falling back to tunnel reinstall")
+                except Exception as e:
+                    log.warning(f"wg set failed ({e}), falling back to tunnel reinstall")
+                finally:
+                    psk_file.unlink(missing_ok=True)
+
+            # Full tunnel reinstall — for new peers or if wg set failed
+            _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
+                               my_mesh_ip, existing_peers)
+
+            # Validate conf before proceeding
+            if not _validate_mesh_conf(mesh_conf_path):
+                log.error("apply_mesh_peer: conf validation failed — aborting Windows tunnel install")
+                return False
+
+            try:
+                subprocess.run(
+                    [wireguard_exe, "/uninstalltunnelservice", iface],
+                    capture_output=True, timeout=10,
                 )
-                if result.returncode == 0:
-                    _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
-                                       my_mesh_ip, existing_peers)
-                    log.info(f"Mesh peer updated via wg set: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
-                    return True
+                time.sleep(3)
+
+                for _ in range(5):
+                    check = subprocess.run(
+                        [wireguard_exe, "/uninstalltunnelservice", iface],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    stderr = (check.stderr or "").lower()
+                    if "not found" in stderr or "not installed" in stderr or \
+                       "already" not in stderr:
+                        break
+                    time.sleep(1)
+            except Exception:
+                pass
+
+            try:
+                subprocess.run(
+                    [wireguard_exe, "/installtunnelservice", str(mesh_conf_path)],
+                    check=True, capture_output=True, timeout=15,
+                )
+                log.info(f"Mesh peer added: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+                return True
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr.decode() if e.stderr else str(e)
+                if "already" in stderr.lower():
+                    log.warning("Tunnel service still running — forcing restart...")
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/FI", f"SERVICES eq WireGuardTunnel$wg_mesh"],
+                            capture_output=True, timeout=10,
+                        )
+                        time.sleep(3)
+                        subprocess.run(
+                            [wireguard_exe, "/uninstalltunnelservice", iface],
+                            capture_output=True, timeout=10,
+                        )
+                        time.sleep(2)
+                        subprocess.run(
+                            [wireguard_exe, "/installtunnelservice", str(mesh_conf_path)],
+                            check=True, capture_output=True, timeout=15,
+                        )
+                        log.info(f"Mesh peer added (after forced restart): {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+                        return True
+                    except Exception as e2:
+                        log.error(f"Failed to force restart mesh tunnel: {e2}")
+                        return False
                 else:
-                    log.warning(f"wg set failed ({result.stderr.strip()}), falling back to tunnel reinstall")
+                    log.error(f"Failed to install mesh tunnel service: {stderr}")
+                    return False
+            except FileNotFoundError:
+                log.error("wireguard.exe not found — install WireGuard from https://www.wireguard.com/install/")
+                return False
+
+        # ─── Linux branch ────────────────────────────────────────────
+        # Check if wg_mesh interface is already up
+        check = subprocess.run(
+            ["sudo", "wg", "show", iface],
+            capture_output=True, text=True,
+        )
+        iface_up = (check.returncode == 0)
+
+        if iface_up and is_existing_peer:
+            # PSK rekey on existing peer — use 'wg set' for live update,
+            # no interface teardown needed. Retry up to 2 times before
+            # falling through to the nuclear full-reinstall path.
+            import tempfile
+            psk_file = Path(tempfile.gettempdir()) / "cobratail_mesh_psk.tmp"
+            wg_set_success = False
+            try:
+                psk_file.write_text(psk)
+                os.chmod(psk_file, 0o600)
+
+                # If this is a rekey, remove the old pubkey first
+                if old_pubkey:
+                    subprocess.run(
+                        ["sudo", "wg", "set", iface, "peer", old_pubkey, "remove"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+
+                for wg_set_attempt in range(1, 3):
+                    result = subprocess.run(
+                        ["sudo", "wg", "set", iface,
+                         "peer", peer_wg_pubkey,
+                         "preshared-key", str(psk_file),
+                         "endpoint", peer_endpoint,
+                         "allowed-ips", f"{peer_allowed_ip}/32",
+                         "persistent-keepalive", "25"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if result.returncode == 0:
+                        _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
+                                           my_mesh_ip, existing_peers)
+                        # Heal IP if it was lost
+                        _heal_mesh_interface_ip(iface)
+                        log.info(f"Mesh peer updated via wg set: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+                        wg_set_success = True
+                        break
+                    else:
+                        log.warning(
+                            f"wg set attempt {wg_set_attempt}/2 failed ({result.stderr.strip()})"
+                        )
+                        if wg_set_attempt < 2:
+                            time.sleep(1)
             except Exception as e:
-                log.warning(f"wg set failed ({e}), falling back to tunnel reinstall")
+                log.warning(f"wg set failed ({e}), falling back to interface reinstall")
             finally:
                 psk_file.unlink(missing_ok=True)
 
-        # Full tunnel reinstall — for new peers or if wg set failed
+            if wg_set_success:
+                return True
+            log.warning("wg set failed after 2 retries — falling back to full interface reinstall")
+
+        # Full interface reinstall — for new peers or if wg set failed.
+        # wg-quick down may fail if the interface is in a weird state, so we
+        # use the same hardened teardown approach as _wireguard_down() for the
+        # main tunnel: try wg-quick down, then forcibly delete the interface,
+        # then clean orphaned DNS entries.
         _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
                            my_mesh_ip, existing_peers)
 
-        try:
-            subprocess.run(
-                [wireguard_exe, "/uninstalltunnelservice", iface],
-                capture_output=True, timeout=10,
-            )
-            time.sleep(3)
-
-            for _ in range(5):
-                check = subprocess.run(
-                    [wireguard_exe, "/uninstalltunnelservice", iface],
-                    capture_output=True, text=True, timeout=5,
-                )
-                stderr = (check.stderr or "").lower()
-                if "not found" in stderr or "not installed" in stderr or \
-                   "already" not in stderr:
-                    break
-                time.sleep(1)
-        except Exception:
-            pass
-
-        try:
-            subprocess.run(
-                [wireguard_exe, "/installtunnelservice", str(mesh_conf_path)],
-                check=True, capture_output=True, timeout=15,
-            )
-            log.info(f"Mesh peer added: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
-            return True
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode() if e.stderr else str(e)
-            if "already" in stderr.lower():
-                log.warning("Tunnel service still running — forcing restart...")
-                try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/FI", f"SERVICES eq WireGuardTunnel$wg_mesh"],
-                        capture_output=True, timeout=10,
-                    )
-                    time.sleep(3)
-                    subprocess.run(
-                        [wireguard_exe, "/uninstalltunnelservice", iface],
-                        capture_output=True, timeout=10,
-                    )
-                    time.sleep(2)
-                    subprocess.run(
-                        [wireguard_exe, "/installtunnelservice", str(mesh_conf_path)],
-                        check=True, capture_output=True, timeout=15,
-                    )
-                    log.info(f"Mesh peer added (after forced restart): {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
-                    return True
-                except Exception as e2:
-                    log.error(f"Failed to force restart mesh tunnel: {e2}")
-                    return False
-            else:
-                log.error(f"Failed to install mesh tunnel service: {stderr}")
-                return False
-        except FileNotFoundError:
-            log.error("wireguard.exe not found — install WireGuard from https://www.wireguard.com/install/")
+        # Validate conf before proceeding with teardown + bring-up
+        if not _validate_mesh_conf(mesh_conf_path):
+            log.error("apply_mesh_peer: conf validation failed — aborting interface reinstall")
             return False
 
-    # ─── Linux branch ────────────────────────────────────────────────
-    # Check if wg_mesh interface is already up
-    check = subprocess.run(
-        ["sudo", "wg", "show", iface],
-        capture_output=True, text=True,
-    )
-    iface_up = (check.returncode == 0)
+        subprocess.run(
+            ["sudo", "wg-quick", "down", str(mesh_conf_path)],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["sudo", "ip", "link", "delete", "dev", iface],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["sudo", "resolvconf", "-d", iface, "-f"],
+            capture_output=True,
+        )
 
-    if iface_up and is_existing_peer:
-        # PSK rekey on existing peer — use 'wg set' for live update,
-        # no interface teardown needed
-        import tempfile
-        psk_file = Path(tempfile.gettempdir()) / "cobratail_mesh_psk.tmp"
         try:
-            psk_file.write_text(psk)
-            os.chmod(psk_file, 0o600)
-
-            # If this is a rekey, remove the old pubkey first
-            if old_pubkey:
-                subprocess.run(
-                    ["sudo", "wg", "set", iface, "peer", old_pubkey, "remove"],
-                    capture_output=True, text=True, timeout=10,
-                )
-
             result = subprocess.run(
-                ["sudo", "wg", "set", iface,
-                 "peer", peer_wg_pubkey,
-                 "preshared-key", str(psk_file),
-                 "endpoint", peer_endpoint,
-                 "allowed-ips", f"{peer_allowed_ip}/32",
-                 "persistent-keepalive", "25"],
-                capture_output=True, text=True, timeout=10,
+                ["sudo", "wg-quick", "up", str(mesh_conf_path)],
+                capture_output=True, text=True, timeout=15,
             )
             if result.returncode == 0:
-                _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
-                                   my_mesh_ip, existing_peers)
-                log.info(f"Mesh peer updated via wg set: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
+                # Verify the IP was actually assigned after wg-quick up
+                _heal_mesh_interface_ip(iface)
+                log.info(f"Mesh peer added: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
                 return True
             else:
-                log.warning(f"wg set failed ({result.stderr.strip()}), falling back to interface reinstall")
-        except Exception as e:
-            log.warning(f"wg set failed ({e}), falling back to interface reinstall")
-        finally:
-            psk_file.unlink(missing_ok=True)
-
-    # Full interface reinstall — for new peers or if wg set failed.
-    # wg-quick down may fail if the interface is in a weird state, so we
-    # use the same hardened teardown approach as _wireguard_down() for the
-    # main tunnel: try wg-quick down, then forcibly delete the interface,
-    # then clean orphaned DNS entries.
-    _rewrite_mesh_conf(mesh_conf_path, wg_privkey, listen_port,
-                       my_mesh_ip, existing_peers)
-
-    subprocess.run(
-        ["sudo", "wg-quick", "down", str(mesh_conf_path)],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["sudo", "ip", "link", "delete", "dev", iface],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["sudo", "resolvconf", "-d", iface, "-f"],
-        capture_output=True,
-    )
-
-    try:
-        result = subprocess.run(
-            ["sudo", "wg-quick", "up", str(mesh_conf_path)],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0:
-            log.info(f"Mesh peer added: {peer_wg_pubkey[:20]}... -> {peer_allowed_ip} via {peer_endpoint}")
-            return True
-        else:
-            log.error(f"Failed to bring up mesh interface: {result.stderr.strip()}")
+                log.error(f"Failed to bring up mesh interface: {result.stderr.strip()}")
+                return False
+        except FileNotFoundError:
+            log.error("wg-quick not found — install wireguard-tools (apt install wireguard-tools)")
             return False
-    except FileNotFoundError:
-        log.error("wg-quick not found — install wireguard-tools (apt install wireguard-tools)")
-        return False
-    except subprocess.TimeoutExpired:
-        log.error("wg-quick up timed out")
-        return False
+        except subprocess.TimeoutExpired:
+            log.error("wg-quick up timed out")
+            return False
 
 def _mesh_interface_is_up(iface: str = "wg_mesh") -> bool:
-    """Check if the mesh WireGuard interface is running."""
+    """Check if the mesh WireGuard interface is running AND has its IP assigned.
+
+    Previously this only checked if the crypto layer was up (wg show succeeds).
+    Now it also verifies the IP is assigned — the exact failure mode where
+    the interface is 'up' but has no IP and black-holes all traffic.
+    """
     try:
         if platform.system() == "Windows":
             wg_path = _find_wg_windows()
             result = subprocess.run(
                 [wg_path, "show", iface], capture_output=True, timeout=5
             )
+            return result.returncode == 0
         else:
             result = subprocess.run(
                 ["sudo", "wg", "show", iface], capture_output=True, timeout=5
             )
-        return result.returncode == 0
+            if result.returncode != 0:
+                return False
+
+            # Crypto layer is up — also verify IP is assigned
+            my_mesh_ip = _get_my_mesh_ip()
+            if my_mesh_ip:
+                ip_result = subprocess.run(
+                    ["ip", "addr", "show", iface],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if ip_result.returncode == 0 and f"inet {my_mesh_ip}" not in ip_result.stdout:
+                    log.warning(
+                        f"_mesh_interface_is_up: {iface} crypto is up but "
+                        f"missing IP {my_mesh_ip} — reporting as DOWN"
+                    )
+                    return False
+            return True
     except Exception:
         return False
-
 
 def send_kem_relay(lighthouse_url: str, sender_id: str, target_id: str,
                    msg_type: str, payload: dict) -> bool:
@@ -3235,11 +3481,7 @@ class PeerKEMExchange:
                 f"AllowedIPs will fall back to VPN address, which may break routing"
             )
 
-        try:
-            state = load_state()
-            my_mesh_ip = state.get("mesh_ip", "")
-        except Exception:
-            pass
+        my_mesh_ip = _get_my_mesh_ip()
 
         # Retry loop for Windows service timing issues
         max_attempts = 3
@@ -3882,6 +4124,7 @@ class QuantumVPNService:
         last_rekey_check = 0
         last_candidate_warm = 0
         last_wstunnel_check = 0
+        last_mesh_ip_health = 0
 
         # Heartbeat jitter: randomize the interval each cycle so N clients
         # don't all hit the Lighthouse in the same second window
@@ -4013,6 +4256,14 @@ class QuantumVPNService:
                             _stop_wstunnel()
                             self._handle_connection_loss()
                     last_wstunnel_check = now
+
+                # Mesh interface IP health check — verify the interface has its IP
+                # Catches the silent failure where wg_mesh is "up" (crypto works)
+                # but has no IP assigned (packets black-hole)
+                if now - last_mesh_ip_health >= MESH_INTERFACE_HEALTH_INTERVAL:
+                    if self.connected and self.mesh_peers:
+                        _heal_mesh_interface_ip()
+                    last_mesh_ip_health = now
 
                 # Network change detection
                 if now - last_network_check >= NETWORK_CHECK_INTERVAL:
@@ -4291,13 +4542,15 @@ class QuantumVPNService:
                     log.info(f"WireGuard endpoint: {wg_endpoint}")
                     log.info(f"Quantum PSK: {KEM_ALGORITHM}")
 
-                    # Save state for restarts
+                    # Save state for restarts — preserve existing mesh_ip
+                    existing_state = load_state()
                     save_state({
                         "wg_privkey": self.wg_privkey,
                         "wg_pubkey": self.wg_pubkey,
                         "mesh_wg_privkey": self.mesh_wg_privkey,
                         "mesh_wg_pubkey": self.mesh_wg_pubkey,
                         "vpn_address": self.vpn_address,
+                        "mesh_ip": reg_result.get("mesh_address") or existing_state.get("mesh_ip", ""),
                         "lighthouse_url": self.lighthouse_url,
                         "is_local": self.is_local,
                         "server_public_key": handshake.get("server_public_key", ""),
@@ -4416,6 +4669,9 @@ class QuantumVPNService:
                         daemon=True,
                         name=f"netchange-repunch-{request_id[:8]}",
                     ).start()
+                    # Also verify the mesh interface didn't lose its IP during
+                    # the network transition (DHCP renewal, WiFi reassociation)
+                    _heal_mesh_interface_ip()
         else:
             self.last_gateway = current_gateway
             self._last_local_ip = current_ip
@@ -4732,8 +4988,7 @@ class QuantumVPNService:
         if rehydrated and not self.is_local:
             mesh_conf_path = CONFIG_DIR / "wg_mesh.conf"
             try:
-                state = load_state()
-                my_mesh_ip = state.get("mesh_ip", "")
+                my_mesh_ip = _get_my_mesh_ip()
                 _rewrite_mesh_conf(
                     mesh_conf_path, self.mesh_wg_privkey,
                     MESH_WG_LISTEN_PORT, my_mesh_ip, disk_peers,
@@ -4793,6 +5048,7 @@ class QuantumVPNService:
                             )
                             if result.returncode == 0:
                                 log.info("Mesh rehydrate: wg_mesh interface is now UP")
+                                _heal_mesh_interface_ip()
                                 # Verify peers are loaded on the interface
                                 time.sleep(1)
                                 try:
@@ -4857,6 +5113,7 @@ class QuantumVPNService:
                             )
                             if result.returncode == 0:
                                 log.info("Mesh rehydrate: wg_mesh interface is now UP")
+                                _heal_mesh_interface_ip()
                             else:
                                 log.error(f"Mesh rehydrate: failed to bring up wg_mesh: {result.stderr.strip()}")
 

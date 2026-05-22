@@ -1714,6 +1714,7 @@ async def register_device(req: RegisterRequest):
         "status": "registered",
         "device_id": req.device_id,
         "vpn_address": vpn_addr,
+        "mesh_address": mesh_addr,
         "server_public_key": server_pubkey,
         "server_endpoint": f"{CONFIG['server_url'].split('://')[1].split(':')[0]}:{CONFIG['wireguard']['listen_port']}",
         "local_endpoint": local_wg_endpoint,
@@ -1810,6 +1811,13 @@ async def heartbeat(req: HeartbeatRequest):
         if result.rowcount == 0:
             raise HTTPException(404, "Device not registered")
 
+        # Fetch this device's persistent mesh address to return to the client
+        peer_row = conn.execute(
+            "SELECT mesh_address FROM peers WHERE device_id = ?",
+            (req.device_id,),
+        ).fetchone()
+        device_mesh_address = peer_row["mesh_address"] if peer_row and peer_row["mesh_address"] else ""
+
         # Check for pending mesh tunnel requests targeting this device
         pending_mesh = conn.execute(
             "SELECT COUNT(*) FROM mesh_tunnels WHERE target_id = ? AND status = 'pending'",
@@ -1868,6 +1876,7 @@ async def heartbeat(req: HeartbeatRequest):
 
     return {
         "status": "ok",
+        "your_mesh_ip": device_mesh_address,
         "pending_mesh_requests": pending_mesh,
         "peer_candidates_updated": peer_candidates_updated,
         "mesh_events": [{"event": e["event"], "device_id": e["device_id"]} for e in mesh_events],
