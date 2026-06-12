@@ -73,6 +73,50 @@ def _load_version() -> str:
 
 VERSION = _load_version()
 
+# ─── SSH Lockdown ────────────────────────────────────────────────────────────
+
+SSH_PORT_DEFAULT = 2244
+WG_INTERFACE_DEFAULT = "wg0"
+WG_LIGHTHOUSE_IP_DEFAULT = "10.100.0.1"
+WG_SUBNET_DEFAULT = "10.100.0.0/24"
+WG_EXTRA_SUBNETS_DEFAULT = "10.200.0.0/24"  # cobra mesh
+SSHD_DROPIN_PATH = Path("/etc/ssh/sshd_config.d/99-lighthouse-lockdown.conf")
+SSHD_OVERRIDE_PATH = Path("/etc/systemd/system/ssh.service.d/override.conf")
+UFW_RULE_COMMENT = "lighthouse-lockdown"
+
+SSH_HARDENING_KEYS = [
+    "PermitRootLogin",
+    "PasswordAuthentication",
+    "PubkeyAuthentication",
+    "MaxAuthTries",
+    "LoginGraceTime",
+    "MaxSessions",
+    "KbdInteractiveAuthentication",
+    "X11Forwarding",
+]
+
+DEFAULT_HARDENING = {
+    "PermitRootLogin": "no",
+    "PasswordAuthentication": "no",
+    "PubkeyAuthentication": "yes",
+    "MaxAuthTries": "3",
+    "LoginGraceTime": "30",
+    "MaxSessions": "4",
+    "KbdInteractiveAuthentication": "no",
+    "X11Forwarding": "no",
+}
+
+SSH_HARDENING_DESCRIPTIONS = {
+    "PermitRootLogin": "Allow root user to SSH in (no/yes/prohibit-password)",
+    "PasswordAuthentication": "Allow password-based SSH login (yes/no)",
+    "PubkeyAuthentication": "Allow public-key SSH login (yes/no)",
+    "MaxAuthTries": "Max failed auth attempts per connection (number)",
+    "LoginGraceTime": "Seconds before unauth'd connection is dropped (number)",
+    "MaxSessions": "Max concurrent sessions per network connection (number)",
+    "KbdInteractiveAuthentication": "Allow PAM keyboard-interactive auth (yes/no)",
+    "X11Forwarding": "Allow X11 GUI forwarding (yes/no)",
+}
+
 # ─── GitHub Update Config ────────────────────────────────────────────────────
 
 GITHUB_REPO = "CobraTechLLC/Cobra_Tail"
@@ -847,6 +891,302 @@ def menu_update_from_github():
     wait_for_key()
 
 
+# ─── SSH Lockdown Helpers ────────────────────────────────────────────────────
+
+
+def _ufw_installed() -> bool:
+    return shutil.which("ufw") is not None
+
+
+def _ensure_ufw_installed() -> bool:
+    """Install UFW via apt if missing. Returns True if available after."""
+    if _ufw_installed():
+        return True
+    if not shutil.which("apt-get"):
+        print_error("UFW is not installed and apt-get is unavailable.")
+        print_info("Install UFW manually for your distro, then re-run this option.")
+        return False
+    print_info("Installing UFW via apt...")
+    try:
+        subprocess.run(["apt-get", "update"], timeout=60, check=False)
+        result = subprocess.run(
+            ["apt-get", "install", "-y", "ufw"],
+            timeout=180, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print_error(f"apt-get install ufw failed: {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        print_error(f"Failed to install UFW: {e}")
+        return False
+    if not _ufw_installed():
+        print_error("UFW install reported success but `ufw` not found on PATH.")
+        return False
+    print_success("UFW installed.")
+    return True
+
+
+def _detect_wg_iface_and_ip() -> tuple[str, str, str]:
+    """Best-effort detection. Returns (interface, ip, subnet)."""
+    iface, ip, subnet = WG_INTERFACE_DEFAULT, WG_LIGHTHOUSE_IP_DEFAULT, WG_SUBNET_DEFAULT
+    try:
+        out = subprocess.run(
+            ["wg", "show", "interfaces"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        ifaces = out.split()
+        for cand in ifaces:
+            if cand.startswith("wg"):
+                iface = cand
+                break
+        else:
+            if ifaces:
+                iface = ifaces[0]
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "dev", iface],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        for part in out.split():
+            if "/" in part and "." in part:
+                ip = part.split("/")[0]
+                octets = ip.split(".")
+                subnet = f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+                break
+    except Exception:
+        pass
+    return iface, ip, subnet
+
+
+def _check_ssh_lockdown_status() -> dict:
+    """Check current state of the lockdown components."""
+    state = {
+        "ufw_installed": _ufw_installed(),
+        "ufw_active": False,
+        "sshd_dropin": SSHD_DROPIN_PATH.exists(),
+        "systemd_override": SSHD_OVERRIDE_PATH.exists(),
+        "ssh_running": False,
+        "ssh_bound_to_mesh": False,
+    }
+    if state["ufw_installed"]:
+        try:
+            out = subprocess.run(
+                ["ufw", "status"], capture_output=True, text=True, timeout=5,
+            ).stdout
+            state["ufw_active"] = "Status: active" in out
+        except Exception:
+            pass
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "ssh"],
+            capture_output=True, text=True, timeout=5,
+        )
+        state["ssh_running"] = result.stdout.strip() == "active"
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["ss", "-tlnp"], capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            if "sshd" in line and ":2244" in line and "10." in line:
+                state["ssh_bound_to_mesh"] = True
+                break
+    except Exception:
+        pass
+    return state
+
+
+def _ufw_remove_managed_rules() -> None:
+    """Remove all UFW rules tagged with our comment. Used before re-apply and on revert."""
+    try:
+        out = subprocess.run(
+            ["ufw", "status", "numbered"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        rule_nums = []
+        for line in out.splitlines():
+            if UFW_RULE_COMMENT not in line:
+                continue
+            stripped = line.strip()
+            if not stripped.startswith("["):
+                continue
+            end = stripped.find("]")
+            if end <= 0:
+                continue
+            try:
+                rule_nums.append(int(stripped[1:end].strip()))
+            except ValueError:
+                continue
+        # Delete from highest to lowest so index numbers don't shift under us
+        for num in sorted(rule_nums, reverse=True):
+            subprocess.run(
+                ["ufw", "--force", "delete", str(num)],
+                capture_output=True, timeout=10,
+            )
+    except Exception:
+        pass
+
+
+def _prompt_hardening_settings(defaults: dict) -> dict:
+    """Walk through each hardening setting and let the user override."""
+    c = Colors
+    settings = dict(defaults)
+    print()
+    print(f"  {c.BOLD}SSH hardening settings:{c.RESET}")
+    print(f"  {c.DIM}Press Enter to accept the default in [brackets].{c.RESET}")
+    print()
+    for key in SSH_HARDENING_KEYS:
+        desc = SSH_HARDENING_DESCRIPTIONS.get(key, key)
+        print(f"  {c.DIM}{desc}{c.RESET}")
+        settings[key] = prompt(f"  {key}", settings[key])
+        print()
+    return settings
+
+
+def _apply_ssh_lockdown(iface: str, lighthouse_ip: str, subnets: list,
+                       ssh_port: int, settings: dict) -> bool:
+    """Apply the SSH lockdown. Returns True on success."""
+    if not _ensure_ufw_installed():
+        return False
+
+    # Make sure wg interface is up before binding sshd (the race-condition bug)
+    iface_up = False
+    try:
+        result = subprocess.run(
+            ["ip", "-o", "link", "show", "dev", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        iface_up = result.returncode == 0 and "state UP" in result.stdout
+    except Exception:
+        pass
+    if not iface_up:
+        print_warn(f"WireGuard interface '{iface}' is not up.")
+        print_info("Start the Lighthouse first, then re-run this option.")
+        print_info("Otherwise sshd will fail to bind right now.")
+        if not prompt_confirm("Proceed anyway?", default_yes=False):
+            return False
+
+    # sshd drop-in
+    dropin_lines = [
+        "# Managed by lighthouse_launcher — SSH lockdown for mesh-only access.",
+        "# Remove this file (or use the launcher's revert option) to undo.",
+        f"Port {ssh_port}",
+        f"ListenAddress {lighthouse_ip}",
+        "ListenAddress 127.0.0.1",
+    ]
+    for key in SSH_HARDENING_KEYS:
+        if key in settings:
+            dropin_lines.append(f"{key} {settings[key]}")
+    dropin_lines.append("")
+
+    SSHD_DROPIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SSHD_DROPIN_PATH.write_text("\n".join(dropin_lines))
+    os.chmod(SSHD_DROPIN_PATH, 0o644)
+    print_success(f"Wrote sshd drop-in: {SSHD_DROPIN_PATH}")
+
+    # Warn if cloud-init drop-in disables password auth and the user wanted it on
+    if settings.get("PasswordAuthentication") == "yes":
+        try:
+            for p in sorted(Path("/etc/ssh/sshd_config.d").glob("*.conf")):
+                if p == SSHD_DROPIN_PATH:
+                    continue
+                if "PasswordAuthentication no" in p.read_text():
+                    print_warn(f"{p} also sets PasswordAuthentication=no and may")
+                    print_warn("override ours (load order). Edit/remove that line")
+                    print_warn("if password login fails.")
+                    break
+        except Exception:
+            pass
+
+    # systemd override — fixes the boot race against wg-quick
+    override_lines = [
+        "[Unit]",
+        f"After=wg-quick@{iface}.service network-online.target",
+        f"Wants=wg-quick@{iface}.service",
+        "",
+        "[Service]",
+        "Restart=on-failure",
+        "RestartSec=5",
+        "",
+    ]
+    SSHD_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SSHD_OVERRIDE_PATH.write_text("\n".join(override_lines))
+    os.chmod(SSHD_OVERRIDE_PATH, 0o644)
+    print_success(f"Wrote systemd override: {SSHD_OVERRIDE_PATH}")
+
+    subprocess.run(["systemctl", "daemon-reload"], timeout=10)
+    result = subprocess.run(
+        ["systemctl", "restart", "ssh"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        print_error(f"sshd restart failed: {result.stderr.strip()}")
+        print_info("Check: journalctl -u ssh -e")
+        return False
+    print_success("sshd restarted.")
+
+    # UFW rules — clean managed rules first so re-apply is idempotent
+    _ufw_remove_managed_rules()
+
+    base_rules = [
+        ["ufw", "allow", "51820/udp", "comment", UFW_RULE_COMMENT],
+        ["ufw", "allow", "8443/tcp", "comment", UFW_RULE_COMMENT],
+        ["ufw", "allow", "443/tcp", "comment", UFW_RULE_COMMENT],
+        ["ufw", "allow", "in", "on", iface, "comment", UFW_RULE_COMMENT],
+    ]
+    for cmd in base_rules:
+        subprocess.run(cmd, capture_output=True, timeout=10)
+
+    for subnet in subnets:
+        subprocess.run(
+            ["ufw", "allow", "from", subnet, "to", "any",
+             "port", str(ssh_port), "proto", "tcp",
+             "comment", UFW_RULE_COMMENT],
+            capture_output=True, timeout=10,
+        )
+
+    status = subprocess.run(
+        ["ufw", "status"], capture_output=True, text=True, timeout=5,
+    ).stdout
+    if "Status: active" not in status:
+        subprocess.run(["ufw", "--force", "enable"], capture_output=True, timeout=10)
+        print_success("UFW enabled.")
+    print_success("UFW rules applied.")
+    return True
+
+
+def _revert_ssh_lockdown() -> None:
+    """Remove launcher-managed lockdown pieces and managed UFW rules."""
+    removed_any = False
+    if SSHD_DROPIN_PATH.exists():
+        SSHD_DROPIN_PATH.unlink()
+        print_success(f"Removed {SSHD_DROPIN_PATH}")
+        removed_any = True
+    if SSHD_OVERRIDE_PATH.exists():
+        SSHD_OVERRIDE_PATH.unlink()
+        print_success(f"Removed {SSHD_OVERRIDE_PATH}")
+        removed_any = True
+
+    _ufw_remove_managed_rules()
+    print_success(f"Removed UFW rules tagged '{UFW_RULE_COMMENT}'.")
+
+    if removed_any:
+        subprocess.run(["systemctl", "daemon-reload"], timeout=10)
+        result = subprocess.run(
+            ["systemctl", "restart", "ssh"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            print_success("sshd restarted with default config.")
+        else:
+            print_error(f"sshd restart failed: {result.stderr.strip()}")
+    else:
+        print_info("No drop-in or override files to remove.")
+
+
 # ─── Management Menu (A2) ───────────────────────────────────────────────────
 
 
@@ -883,6 +1223,8 @@ def show_menu():
             menu_check_updates()
         elif choice == "12":
             menu_update_from_github()
+        elif choice == "13":
+            menu_ssh_lockdown()
         elif choice == "0":
             print_info("Goodbye.")
             break
@@ -994,6 +1336,8 @@ def _draw_menu_options():
     print(f"  {c.DIM}─────────────────────────────{c.RESET}")
     print(f"  [11] Check for Updates")
     print(f"  [12] Update from GitHub")
+    print(f"  {c.DIM}─────────────────────────────{c.RESET}")
+    print(f"  [13] SSH Lockdown (mesh-only)")
     print(f"  [0]  Exit")
     print()
 
@@ -1518,6 +1862,126 @@ def menu_rerun_wizard():
         time.sleep(1)
 
     run_wizard()
+
+
+def menu_ssh_lockdown():
+    """Lock SSH down to the mesh VPN only."""
+    clear_screen()
+    print_banner("SSH Lockdown (mesh-only)")
+    c = Colors
+
+    state = _check_ssh_lockdown_status()
+    locked = state["sshd_dropin"] and state["systemd_override"]
+
+    def _yn(b, on="YES", off="NO"):
+        return f"{c.GREEN}{on}{c.RESET}" if b else f"{c.DIM}{off}{c.RESET}"
+
+    print(f"  {c.BOLD}Current state:{c.RESET}")
+    print(f"    UFW installed:    {_yn(state['ufw_installed'])}")
+    print(f"    UFW active:       {_yn(state['ufw_active'])}")
+    print(f"    sshd drop-in:     {_yn(state['sshd_dropin'], 'INSTALLED', 'MISSING')}")
+    print(f"    systemd override: {_yn(state['systemd_override'], 'INSTALLED', 'MISSING')}")
+    print(f"    sshd bound mesh:  {_yn(state['ssh_bound_to_mesh'])}")
+    print(f"    Lockdown:         "
+          f"{c.GREEN + 'ENABLED' + c.RESET if locked else c.YELLOW + 'NOT ENABLED' + c.RESET}")
+    print()
+
+    if locked:
+        options = ["Re-apply / refresh lockdown", "Revert lockdown", "Back"]
+    else:
+        options = ["Apply lockdown", "Back"]
+
+    idx = prompt_choice(options)
+    selected = options[idx]
+
+    if selected == "Back":
+        return
+
+    if selected == "Revert lockdown":
+        print()
+        print_warn("This removes the sshd drop-in, systemd override, and UFW rules")
+        print_warn(f"tagged '{UFW_RULE_COMMENT}'. Existing SSH sessions will not be killed.")
+        if not prompt_confirm("Proceed with revert?", default_yes=False):
+            return
+        print()
+        _revert_ssh_lockdown()
+        wait_for_key()
+        return
+
+    # Apply / re-apply
+    iface, ip, primary_subnet = _detect_wg_iface_and_ip()
+    print()
+    print(f"  Detected WireGuard interface: {c.CYAN}{iface}{c.RESET}")
+    print(f"  Detected Lighthouse IP:       {c.CYAN}{ip}{c.RESET}")
+    print(f"  Inferred primary subnet:      {c.CYAN}{primary_subnet}{c.RESET}")
+    print()
+
+    if not prompt_confirm("Use these values?"):
+        iface = prompt("WireGuard interface", iface)
+        ip = prompt("Lighthouse mesh IP", ip)
+        primary_subnet = prompt("Primary mesh subnet (CIDR)", primary_subnet)
+
+    print()
+    print(f"  {c.DIM}Additional subnets allowed to SSH (e.g. cobra mesh 10.200.0.0/24).{c.RESET}")
+    print(f"  {c.DIM}Comma-separated, or blank for none.{c.RESET}")
+    extra_str = prompt("Additional subnets", WG_EXTRA_SUBNETS_DEFAULT)
+    extras = [s.strip() for s in extra_str.split(",") if s.strip()]
+    subnets = [primary_subnet] + [s for s in extras if s != primary_subnet]
+
+    ssh_port_str = prompt("SSH port", str(SSH_PORT_DEFAULT))
+    try:
+        ssh_port = int(ssh_port_str)
+    except ValueError:
+        print_error("SSH port must be a number.")
+        wait_for_key()
+        return
+
+    print()
+    print(f"  {c.BOLD}SSH hardening:{c.RESET}")
+    print(f"    Defaults are tuned tight (pubkey-only, 3 auth tries, 30s grace).")
+    print(f"    Pick {c.BOLD}custom{c.RESET} to walk through every setting one by one.")
+    print()
+    if prompt_confirm("Customize hardening settings?", default_yes=False):
+        settings = _prompt_hardening_settings(DEFAULT_HARDENING)
+    else:
+        settings = dict(DEFAULT_HARDENING)
+
+    if settings.get("PasswordAuthentication", "no") == "no" and \
+       settings.get("PubkeyAuthentication", "yes") == "no":
+        print_warn("Both password and pubkey auth are disabled — you'd be locked out.")
+        if not prompt_confirm("Continue anyway?", default_yes=False):
+            return
+
+    print()
+    print(f"  {c.BOLD}Summary of changes:{c.RESET}")
+    print(f"    • sshd binds only to {ip} and 127.0.0.1 on port {ssh_port}")
+    print(f"    • UFW allows SSH from: {', '.join(subnets)}")
+    print(f"    • UFW also allows 51820/udp, 8443/tcp, 443/tcp")
+    print(f"    • UFW trusts all traffic on {iface}")
+    print(f"    • systemd override added so sshd waits for {iface} on boot")
+    print(f"    • SSH hardening:")
+    for k in SSH_HARDENING_KEYS:
+        print(f"        {k} = {settings[k]}")
+    print()
+    if not prompt_confirm("Apply lockdown now?"):
+        return
+
+    print()
+    success = _apply_ssh_lockdown(iface, ip, subnets, ssh_port, settings)
+    print()
+    if success:
+        new_state = _check_ssh_lockdown_status()
+        if new_state["ssh_bound_to_mesh"]:
+            print_success("Verified: sshd is bound to the mesh interface.")
+        else:
+            print_warn("Could not verify mesh binding (run `ss -tlnp | grep ssh`).")
+        print()
+        print_success("SSH lockdown complete.")
+        print_info(f"Test from a mesh client: ssh -p {ssh_port} <user>@{ip}")
+        print_info("From outside the mesh, SSH should time out.")
+    else:
+        print_error("Lockdown did not complete cleanly. See messages above.")
+    wait_for_key()
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
