@@ -3644,24 +3644,79 @@ def build_wireguard_config(handshake_result: dict, wg_privkey: str,
 
 def apply_wireguard_config(config_text: str) -> bool:
     """Write the WG config and bring up the tunnel.
-    Wipes the config string from memory after writing to disk."""
-    # Write config as bytes via bytearray so we can wipe after
+    Wipes the config string from memory after writing to disk.
+
+    Two fast paths to avoid disruptive teardown:
+      1. On-disk config identical AND tunnel up → no-op.
+      2. Only non-PSK fields changed (e.g. endpoint flipped LAN ↔ public)
+         AND tunnel up → live `wg set` endpoint update, no down/up.
+
+    Full down/up only fires when the PSK genuinely changed (new handshake
+    material) or the tunnel is actually down.
+    """
+    import re
+
+    def _parse(text):
+        psk = re.search(r"^PresharedKey\s*=\s*(\S+)", text, re.M)
+        ep  = re.search(r"^Endpoint\s*=\s*(\S+)", text, re.M)
+        pub = re.search(r"^PublicKey\s*=\s*(\S+)", text, re.M)
+        return (psk.group(1) if psk else None,
+                ep.group(1)  if ep  else None,
+                pub.group(1) if pub else None)
+
+    def _is_up():
+        try:
+            if platform.system() == "Windows":
+                wg_path = _find_wg_windows()
+                r = subprocess.run([wg_path, "show", "wg_quantum"], capture_output=True, timeout=5)
+            else:
+                r = subprocess.run(["wg", "show", "wg_quantum"], capture_output=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # Fast path 1: byte-for-byte identical and tunnel up → nothing to do
+    try:
+        if WG_CONFIG_PATH.exists() and WG_CONFIG_PATH.read_text() == config_text and _is_up():
+            log.info("WireGuard config unchanged and tunnel is up — skipping reapply")
+            return True
+    except Exception:
+        pass
+
+    # Fast path 2: PSK + peer pubkey unchanged → live update only
+    try:
+        if WG_CONFIG_PATH.exists() and _is_up():
+            old_psk, old_ep, old_pub = _parse(WG_CONFIG_PATH.read_text())
+            new_psk, new_ep, new_pub = _parse(config_text)
+            if old_psk and new_psk and old_psk == new_psk and old_pub == new_pub:
+                if new_ep and new_ep != old_ep:
+                    log.info(f"WireGuard PSK unchanged — live endpoint update {old_ep} → {new_ep}")
+                    update_wireguard_endpoint(new_ep)
+                else:
+                    log.info("WireGuard PSK unchanged — skipping reapply (no disruptive change)")
+                config_buf = bytearray(config_text.encode())
+                WG_CONFIG_PATH.write_bytes(config_buf)
+                secure_wipe(config_buf)
+                try:
+                    os.chmod(WG_CONFIG_PATH, 0o600)
+                except Exception:
+                    pass
+                return True
+    except Exception as e:
+        log.debug(f"PSK-compare fast path failed: {e}")
+
+    # Slow path: real PSK change or tunnel actually down — full rebuild
     config_buf = bytearray(config_text.encode())
     WG_CONFIG_PATH.write_bytes(config_buf)
     secure_wipe(config_buf)
 
-    # Note: os.chmod doesn't do much on Windows, but doesn't hurt.
     try:
         os.chmod(WG_CONFIG_PATH, 0o600)
     except Exception:
         pass
 
     log.info(f"WireGuard config written to {WG_CONFIG_PATH}")
-
-    # Bring down existing tunnel if any
     _wireguard_down()
-
-    # Pass the WG_CONFIG_PATH variable to bring the tunnel up
     return _wireguard_up(WG_CONFIG_PATH)
 
 def _wireguard_up(config_path):

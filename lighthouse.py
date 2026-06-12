@@ -617,6 +617,10 @@ def setup_wireguard() -> tuple[str, str]:
     Initialize the WireGuard interface on the Pi 4.
     Generates server keys if needed and brings up the interface.
     Returns (private_key, public_key).
+
+    If wg0 is already up with the correct keypair (e.g. this is a service
+    restart, not a fresh boot), skip the down/up cycle so existing tunnel
+    sessions through it (such as an SSH session from a peer) survive.
     """
     wg = CONFIG["wireguard"]
     key_dir = Path(wg["key_dir"])
@@ -641,6 +645,26 @@ def setup_wireguard() -> tuple[str, str]:
         pubkey = pub_path.read_text().strip()
         log.info(f"Loaded WireGuard keys (pub: {pubkey[:20]}...)")
 
+    # Fast path: if wg0 is already up with our pubkey, leave it alone so
+    # active sessions through the tunnel aren't killed by a down/up cycle.
+    try:
+        result = subprocess.run(
+            ["wg", "show", wg["interface"], "public-key"],
+            capture_output=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.decode().strip() == pubkey:
+            log.info(
+                f"WireGuard interface {wg['interface']} is already up with matching "
+                f"keypair — skipping down/up to preserve active sessions"
+            )
+            try:
+                restore_wireguard_peers()
+            except Exception as e:
+                log.warning(f"Peer restore failed: {e}")
+            return privkey, pubkey
+    except Exception:
+        pass
+
     # Write wg0.conf
     conf_path = Path(f"/etc/wireguard/{wg['interface']}.conf")
     conf_content = (
@@ -651,22 +675,16 @@ def setup_wireguard() -> tuple[str, str]:
         "SaveConfig = false\n"
     )
 
-    # Enable IP forwarding (required for peer-to-peer relay and exit-node)
-    # This is the kernel flag that was missing and caused mesh relay to silently drop packets.
     conf_content += (
         "PostUp = sysctl -w net.ipv4.ip_forward=1\n"
     )
 
-    # Always allow peer-to-peer forwarding through the tunnel (mesh relay)
-    # Without this, VPN-routed mesh fallback fails when a client is behind symmetric NAT.
     conf_content += (
         "PostUp = iptables -A FORWARD -i %i -o %i -j ACCEPT\n"
         "PostDown = iptables -D FORWARD -i %i -o %i -j ACCEPT\n"
     )
 
     if wg.get("exit_node"):
-        # Auto-detect the default outbound interface instead of hardcoding wlan0/eth0
-        # This works whether the Pi is on ethernet, wifi, or anything else.
         conf_content += (
             "PostUp = iptables -A FORWARD -i %i -o $(ip route show default | awk '/default/ {print $5}' | head -1) -j ACCEPT; "
             "iptables -A FORWARD -i $(ip route show default | awk '/default/ {print $5}' | head -1) -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; "
@@ -679,7 +697,6 @@ def setup_wireguard() -> tuple[str, str]:
     conf_path.write_text(conf_content)
     os.chmod(conf_path, 0o600)
 
-    # Bring up the interface
     try:
         subprocess.run(["wg-quick", "down", wg["interface"]],
                        capture_output=True, timeout=10)
@@ -693,14 +710,12 @@ def setup_wireguard() -> tuple[str, str]:
     except subprocess.CalledProcessError as e:
         log.error(f"Failed to bring up WireGuard: {e.stderr.decode()}")
 
-    # Restore previously connected peers from database
     try:
         restore_wireguard_peers()
     except Exception as e:
         log.warning(f"Peer restore failed: {e}")
 
     return privkey, pubkey
-
 
 def allocate_vpn_address() -> str:
     """Allocate the next available VPN address from the pool."""
@@ -1004,7 +1019,12 @@ def request_vault_rekeygen() -> bool:
 
 
 def key_rotation_thread() -> None:
-    """Background thread that rotates keys on the configured schedule."""
+    """Background thread that rotates keys on the configured schedule.
+
+    The first rotation fires after one full rotation_seconds interval, not
+    immediately on startup. An on-startup rotation would change every peer's
+    PSK ~60s after every restart and kill any active wg0 sessions.
+    """
     rotation_hours = CONFIG["pqc"].get("key_rotation_hours", 0)
     if rotation_hours <= 0:
         log.info("Key rotation disabled (key_rotation_hours = 0)")
@@ -1013,19 +1033,14 @@ def key_rotation_thread() -> None:
     rotation_seconds = rotation_hours * 3600
     log.info(f"Key rotation enabled: every {rotation_hours} hours")
 
-    # Wait for initial startup to complete before first rotation
-    time.sleep(60)
-
     while True:
+        time.sleep(rotation_seconds)
         try:
-            # Step 1: Ask the Vault to regen its ML-KEM keypair
             rekeygen_sent = request_vault_rekeygen()
             if rekeygen_sent:
-                # Give the Vault time to harvest entropy and generate new keys
                 log.info("Waiting for Vault to regenerate keypair...")
                 time.sleep(30)
 
-            # Step 2: Rotate all peer PSKs using the (potentially new) public key
             result = rotate_all_peers()
             log.info(f"Rotation cycle result: {result}")
 
@@ -1036,7 +1051,6 @@ def key_rotation_thread() -> None:
                 component="key_rotation",
             )
 
-        time.sleep(rotation_seconds)
 
 # ─── Vault UART Thread ──────────────────────────────────────────────────────
 
@@ -1965,15 +1979,11 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
     """
     v0.5.0 — Client-side encapsulation handshake.
 
-    The client has already run encap_secret() locally and sends the ciphertext.
-    The Lighthouse forwards ciphertext to the Vault over UART for decapsulation.
-    The Vault returns the HKDF-derived PSK over UART so WireGuard can be configured.
-    The Lighthouse NEVER performs encapsulation — it cannot fabricate a PSK.
-
-    NOTE: For this flow the client also needs to derive the same HKDF-bound PSK
-    on its own side using the same info string. Until the client is updated to
-    do that, the binding is enforced only on the Vault side and the client will
-    use whatever PSK the Vault returns.
+    Idempotent: if the peer already has a PSK in the database, return it
+    without triggering a new Vault KEM cycle. Doing a fresh KEM here would
+    cause `wg set preshared-key` to run on a live peer and invalidate any
+    active flows (e.g. SSH). Real PSK rotation is handled on schedule by
+    key_rotation_thread.
     """
     with get_db() as conn:
         client = conn.execute(
@@ -1989,12 +1999,47 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
         raise HTTPException(404, "Vault not registered")
     if vault["device_type"] != "vault":
         raise HTTPException(400, "Target must be a vault")
+
+    wg = CONFIG["wireguard"]
+    wg_pub = Path(wg["key_dir"]) / "server_public.key"
+    server_pubkey = wg_pub.read_text().strip() if wg_pub.exists() else ""
+
+    def _response(psk_value: str, req_id: str) -> dict:
+        return {
+            "request_id": req_id,
+            "status": "complete",
+            "quantum_psk": psk_value,
+            "vpn_address": client["vpn_address"],
+            "server_public_key": server_pubkey,
+            "server_endpoint": f"{CONFIG['server_url'].split('://')[1].split(':')[0]}:{wg['listen_port']}",
+            "dns": wg.get("dns", []),
+            "allowed_ips": "0.0.0.0/0, ::/0" if wg.get("exit_node") else client["vpn_address"] + "/32",
+        }
+
+    # Fast path: reuse stored PSK if one exists. Avoids a `wg set preshared-key`
+    # on a live peer, which would kill active SSH/data flows.
+    existing_psk = client["wg_psk"] if "wg_psk" in client.keys() else None
+    if existing_psk:
+        request_id = uuid.uuid4().hex[:12]
+        log.info(
+            f"Reusing existing PSK for {req.client_device_id} "
+            f"(skipping Vault KEM to preserve active tunnels)"
+        )
+        with get_db() as conn:
+            conn.execute("""
+                INSERT INTO handshakes
+                (request_id, client_device_id, vault_device_id, status, quantum_psk, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (request_id, req.client_device_id, req.target_device_id,
+                  "complete", existing_psk, _now_iso(), _now_iso()))
+        return _response(existing_psk, request_id)
+
+    # New peer — proceed with full Vault KEM
     if not _is_alive(vault["last_seen"] or 0):
         raise HTTPException(503, "Vault is offline")
 
     request_id = uuid.uuid4().hex[:12]
 
-    # Store handshake record (no quantum_psk yet — Vault will provide it)
     with get_db() as conn:
         conn.execute("""
             INSERT INTO handshakes
@@ -2003,8 +2048,6 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
         """, (request_id, req.client_device_id, req.target_device_id,
               "forwarding", _now_iso()))
 
-    # Forward ciphertext to Vault over UART for decapsulation.
-    # The Vault will HKDF-derive the PSK using this info string and return it.
     client_wg_pubkey = client["wireguard_pubkey"] or ""
     info_string = f"cobratail-wg-psk-v1|{client_wg_pubkey}|{request_id}"
     send_to_vault("kem_request", {
@@ -2014,20 +2057,17 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
         "ciphertext": req.ciphertext,
     })
 
-    # Wait for the Vault to return the derived PSK via UART
     psk = _wait_for_vault_psk(request_id, timeout=30.0)
 
     if not psk:
         raise HTTPException(504, "Vault did not respond with decapsulated secret in time")
 
-    # Configure WireGuard with the PSK the Vault derived
     if client["wireguard_pubkey"] and client["vpn_address"]:
         try:
             add_wireguard_peer(client["wireguard_pubkey"], client["vpn_address"], psk)
         except Exception as e:
             log.error(f"Failed to add WG peer: {e}")
 
-    # Update handshake record
     with get_db() as conn:
         conn.execute("""
             UPDATE handshakes SET status = ?, quantum_psk = ?, completed_at = ?
@@ -2035,21 +2075,7 @@ async def client_encap_handshake(req: ClientEncapHandshakeRequest):
         """, ("complete", psk, _now_iso(), request_id))
 
     log.info(f"Client-encap handshake complete: {req.client_device_id} → {req.target_device_id}")
-
-    wg = CONFIG["wireguard"]
-    wg_pub = Path(wg["key_dir"]) / "server_public.key"
-    server_pubkey = wg_pub.read_text().strip() if wg_pub.exists() else ""
-
-    return {
-        "request_id": request_id,
-        "status": "complete",
-        "quantum_psk": psk,
-        "vpn_address": client["vpn_address"],
-        "server_public_key": server_pubkey,
-        "server_endpoint": f"{CONFIG['server_url'].split('://')[1].split(':')[0]}:{wg['listen_port']}",
-        "dns": wg.get("dns", []),
-        "allowed_ips": "0.0.0.0/0, ::/0" if wg.get("exit_node") else client["vpn_address"] + "/32",
-    }
+    return _response(psk, request_id)
 
 @app.post("/api/v1/handshake/initiate")
 async def initiate_handshake(req: HandshakeInitRequest):

@@ -419,12 +419,9 @@ def start_service() -> bool:
 
 
 def stop_service() -> bool:
-    """Stop the client service — tears down WireGuard tunnels first, then kills the process."""
+    """Stop the client service — tears down WireGuard tunnels first, then kills ALL client processes."""
 
     # ── Step 1: Tear down WireGuard tunnel services BEFORE killing the process ──
-    # taskkill /F is a hard kill — Python's finally block never runs,
-    # so _shutdown() never calls _wireguard_down() / _mesh_wireguard_down().
-    # We must do it here.
     if IS_WINDOWS:
         wireguard_exe = None
         for candidate in [
@@ -442,10 +439,9 @@ def stop_service() -> bool:
                     if result.returncode == 0:
                         print(f"  {GREEN}Stopped tunnel: {iface}{RESET}")
                     else:
-                        # Check if it wasn't running
                         stderr = (result.stderr or "").lower()
                         if "not found" in stderr or "not installed" in stderr:
-                            pass  # Already stopped
+                            pass
                         else:
                             print(f"  {YELLOW}Could not stop tunnel {iface}: {result.stderr.strip()}{RESET}")
                 except Exception as e:
@@ -454,7 +450,7 @@ def stop_service() -> bool:
         else:
             print(f"  {YELLOW}WireGuard not found — tunnels may still be running{RESET}")
 
-    # ── Step 2: Stop the systemd service or kill the Python process ──
+    # ── Step 2: systemd path (Linux only) ──
     if IS_LINUX:
         service_file = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
         if service_file.exists():
@@ -466,41 +462,73 @@ def stop_service() -> bool:
                 print(f"  {RED}Failed to stop service: {result.stderr.strip()}{RESET}")
                 return False
 
-    # Manual PID-based stop (both platforms, or Linux without systemd)
-    pid = get_client_pid()
-    if not pid:
-        # Try saved PID
-        pid_path = DATA_DIR / "client.pid"
-        if pid_path.exists():
-            try:
-                pid = int(pid_path.read_text().strip())
-            except (ValueError, IOError):
-                pid = None
-
-    if pid:
+    # ── Step 3: Find and kill ALL client.py service processes ──
+    # The PID file only tracks the instance this launcher started. Orphans
+    # from prior runs, scheduled tasks, or manual launches must also be
+    # killed, otherwise they race the new instance over wg_quantum.
+    pids: list[int] = []
+    if IS_WINDOWS:
         try:
-            if IS_WINDOWS:
-                run_cmd(["taskkill", "/F", "/PID", str(pid)])
-            else:
-                os.kill(pid, signal.SIGTERM)
-            print(f"  {GREEN}Client stopped (PID {pid}){RESET}")
-        except (ProcessLookupError, PermissionError) as e:
-            print(f"  {YELLOW}Process {pid} already gone or access denied: {e}{RESET}")
-
-        # Clean up PID file — try directly, fall back to shell for admin-owned files
-        pid_path = DATA_DIR / "client.pid"
-        if pid_path.exists():
-            try:
-                pid_path.unlink()
-            except PermissionError:
-                if IS_WINDOWS:
-                    run_cmd(["cmd", "/c", "del", "/f", str(pid_path)])
-                else:
-                    run_cmd(["sudo", "rm", "-f", str(pid_path)])
-        return True
+            result = run_cmd([
+                "powershell", "-NoProfile", "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | "
+                "Where-Object { $_.CommandLine -like '*client.py*service*' } | "
+                "Select-Object -ExpandProperty ProcessId"
+            ])
+            if result.returncode == 0:
+                pids = [int(x.strip()) for x in result.stdout.splitlines() if x.strip().isdigit()]
+        except Exception as e:
+            print(f"  {YELLOW}Failed to enumerate client processes: {e}{RESET}")
     else:
+        try:
+            result = run_cmd(["pgrep", "-f", "client.py.*service"])
+            if result.returncode == 0:
+                pids = [int(x.strip()) for x in result.stdout.splitlines() if x.strip().isdigit()]
+        except Exception as e:
+            print(f"  {YELLOW}Failed to enumerate client processes: {e}{RESET}")
+
+    # Include the saved PID in case enumeration missed it
+    pid_path = DATA_DIR / "client.pid"
+    if pid_path.exists():
+        try:
+            saved = int(pid_path.read_text().strip())
+            if saved not in pids:
+                pids.append(saved)
+        except (ValueError, IOError):
+            pass
+
+    if not pids:
         print(f"  {YELLOW}No running client found{RESET}")
         return False
+
+    killed = 0
+    for pid in pids:
+        try:
+            if IS_WINDOWS:
+                r = run_cmd(["taskkill", "/F", "/PID", str(pid)])
+                if r.returncode == 0:
+                    killed += 1
+            else:
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+        except (ProcessLookupError, PermissionError) as e:
+            print(f"  {YELLOW}PID {pid} already gone or access denied: {e}{RESET}")
+        except Exception as e:
+            print(f"  {YELLOW}Failed to kill PID {pid}: {e}{RESET}")
+
+    if killed:
+        print(f"  {GREEN}Stopped {killed} client process(es){RESET}")
+
+    if pid_path.exists():
+        try:
+            pid_path.unlink()
+        except PermissionError:
+            if IS_WINDOWS:
+                run_cmd(["cmd", "/c", "del", "/f", str(pid_path)])
+            else:
+                run_cmd(["sudo", "rm", "-f", str(pid_path)])
+
+    return killed > 0
 
 def restart_service() -> bool:
     """Restart the client service."""
