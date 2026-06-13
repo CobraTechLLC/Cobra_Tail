@@ -5630,9 +5630,12 @@ class QuantumVPNService:
                     if "409" in err_msg or "already exists" in err_msg.lower():
                         log.debug(f"Mesh tunnel already exists with {device_id}")
                     elif "429" in err_msg:
-                        # Rate limited — back off longer
-                        self._mesh_failure_cooldowns[device_id] = time.time() + 300
-                        log.warning(f"Rate limited requesting mesh with {device_id} — cooldown 300s")
+                        # Rate limited — back off just past the lighthouse's window
+                        # (60s) plus a small buffer. Previously 300s, which was 5×
+                        # the lighthouse window and made recovery from any
+                        # rate-limit blip take 5 minutes.
+                        self._mesh_failure_cooldowns[device_id] = time.time() + 75
+                        log.warning(f"Rate limited requesting mesh with {device_id} — cooldown 75s")
                     else:
                         self._mesh_failure_cooldowns[device_id] = time.time() + 120
                         log.warning(f"Failed to request mesh tunnel with {device_id}: {e}")
@@ -5960,6 +5963,41 @@ class QuantumVPNService:
             log.debug(f"Path monitor: failed to read handshakes: {e}")
             return {}
 
+    def _request_orphan_cleanup(self, request_id: str, peer_id: str, reason: str) -> bool:
+        """Ask the Lighthouse to delete a mesh tunnel that we've determined is
+        unrecoverable (PSK mismatch, etc). Reconciliation + auto-mesh will then
+        rebuild it from scratch with a fresh PSK. Both sides re-mesh because
+        the Lighthouse notifies the other peer of the deletion."""
+        try:
+            resp = get_session().post(
+                f"{self.lighthouse_url}/api/v1/mesh/cleanup-orphan",
+                json={
+                    "device_id": get_client_id(),
+                    "request_id": request_id,
+                },
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                log.warning(
+                    f"Path monitor: requested orphan cleanup of tunnel with {peer_id} "
+                    f"— reason: {reason}. Both sides will re-mesh fresh."
+                )
+                # Drop local state so reconcile + auto-mesh don't fight us;
+                # if we keep the entry, _reconcile_mesh_state may treat the
+                # impending Lighthouse-side deletion as a foreign change and
+                # tear down our just-rebuilt tunnel.
+                self.mesh_peers.pop(request_id, None)
+                if hasattr(self, '_zero_hs_first_seen'):
+                    self._zero_hs_first_seen.pop(peer_id, None)
+                # Also clear cooldowns so auto-mesh can fire immediately
+                self._repunch_cooldown.pop(peer_id, None)
+                self._mesh_failure_cooldowns.pop(peer_id, None)
+                return True
+            log.debug(f"Cleanup-orphan returned {resp.status_code}: {resp.text[:120]}")
+        except Exception as e:
+            log.debug(f"Cleanup-orphan request failed: {e}")
+        return False
+
     def _path_monitor_repunch(self, request_id: str, peer_info: dict) -> None:
         """Phase 4 M2: Re-collect candidates, push to Lighthouse, fetch peer's
         latest candidates, and send hole-punch bursts. Retries up to
@@ -5971,6 +6009,12 @@ class QuantumVPNService:
         wasting time on stale port predictions.
         Cooldown: records timestamp when retries are exhausted so the path
         monitor skips this peer for PATH_MONITOR_COOLDOWN seconds.
+
+        PSK-mismatch self-heal: if after exhausting direct punching AND the
+        VPN-routed fallback the tunnel STILL has never completed a handshake,
+        we treat it as a corrupt initial setup (PSK desync between the two
+        sides) and ask the Lighthouse to delete the tunnel record. Auto-mesh
+        will rebuild it fresh with a new PSK on both ends.
         """
         peer_id = peer_info.get("peer_id", "unknown")
         peer_wg_pubkey = peer_info.get("peer_wg_pubkey", "")
@@ -6080,9 +6124,6 @@ class QuantumVPNService:
                 peer_info["endpoint"] = vpn_endpoint
 
                 # Give the VPN-routed path time to establish a handshake.
-                # Double-encapsulated WireGuard (mesh inside quantum tunnel)
-                # can take longer, especially on slower networks. Check
-                # multiple times over 15 seconds instead of once after 5.
                 vpn_route_success = False
                 for wait in (3, 4, 4, 4):  # total: 15 seconds
                     time.sleep(wait)
@@ -6100,6 +6141,22 @@ class QuantumVPNService:
                     return
 
                 log.warning(f"Path monitor: VPN-routed fallback also failed for {peer_id}")
+
+            # ── PSK-mismatch self-heal ──
+            # If after all retries (direct punching + VPN-routed) the tunnel
+            # has never completed a handshake, the PSK is out of sync between
+            # the two ends. No amount of network tweaking can fix that — we
+            # need to tear down and rebuild from scratch.
+            handshake_map = self._get_mesh_handshake_times()
+            final_hs = handshake_map.get(peer_wg_pubkey, 0)
+            if final_hs == 0:
+                cleaned = self._request_orphan_cleanup(
+                    request_id, peer_id,
+                    "tunnel never completed a handshake — likely PSK mismatch from initial setup",
+                )
+                if cleaned:
+                    # Don't set cooldown — we WANT auto-mesh to rebuild ASAP
+                    return
 
             log.warning(
                 f"Path monitor: exhausted {PATH_MONITOR_MAX_RETRIES} retries for {peer_id} "
