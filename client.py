@@ -3806,13 +3806,50 @@ def _wireguard_up(config_path):
             cmd = [wireguard_exe, "/installtunnelservice", str(config_path)]
             result = subprocess.run(cmd, capture_output=True, text=True)
 
+            already_up = False
             if result.returncode != 0:
                 err = result.stderr.lower()
                 if "already" in err and ("installed" in err or "running" in err or "exists" in err):
                     log.info("WireGuard service is already installed and running.")
-                    return True
-                log.error(f"WG install failed: {result.stderr}")
-                return False
+                    already_up = True
+                else:
+                    log.error(f"WG install failed: {result.stderr}")
+                    return False
+
+            # /installtunnelservice is ASYNC — it returns the moment the service
+            # is registered, but the wg_quantum adapter takes several seconds to
+            # actually come up (especially on a fresh install where the WG driver,
+            # firewall rules, and adapter binding are being initialized for the
+            # first time). If we return now, the caller's handshake-verify timer
+            # starts ticking before the adapter even exists, the handshake never
+            # gets a fair window, and the code falsely concludes UDP is blocked
+            # and triggers the wstunnel fallback.
+            #
+            # Poll `wg show wg_quantum` until it returns adapter info, so the
+            # adapter is provably ready before we report the tunnel as UP.
+            wg_path = _find_wg_windows()
+            adapter_ready = False
+            for _ in range(30):  # ~15s max
+                try:
+                    r = subprocess.run(
+                        [wg_path, "show", "wg_quantum"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if r.returncode == 0 and r.stdout.strip():
+                        adapter_ready = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+            if adapter_ready:
+                log.info("WireGuard adapter is ready")
+            elif already_up:
+                # Service was already installed but adapter never showed —
+                # something is wedged. Let the caller decide what to do.
+                log.warning("WireGuard service reports installed but adapter not visible")
+            else:
+                log.warning("WireGuard adapter did not appear within 15s — proceeding anyway")
         else:
             subprocess.run(["wg-quick", "up", str(config_path)], check=True)
 
