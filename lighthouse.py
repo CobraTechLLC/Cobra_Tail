@@ -20,6 +20,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import struct
 import subprocess
@@ -3401,7 +3402,6 @@ def main():
         # Write fingerprint back to config file
         config_path = args.config
         try:
-            import re
             config_text = Path(config_path).read_text()
             if 'cert_fingerprint: ""' in config_text:
                 config_text = config_text.replace(
