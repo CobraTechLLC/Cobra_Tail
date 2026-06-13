@@ -5,10 +5,8 @@ Run this on your dev machine (or any Windows box with PyInstaller) to produce
 CobraTailSetup.exe — a single-file installer that bundles:
   - installer.py (the install wizard)
   - client.py, cobra_launcher.py, identity_manager.py
-  - cobra_sentinel.py (AI diagnostic agent)
   - oqs.dll (if present)
   - wstunnel.exe (if present — TCP fallback for WireGuard)
-  - *.gguf LLM model (if present)
   - version.txt (offline fallback for the installer)
   - Icon and version info
 
@@ -22,8 +20,7 @@ Requirements (on the build machine):
 Usage:
     python build_windows_exe.py
     python build_windows_exe.py --skip-oqs       # don't bundle oqs.dll
-    python build_windows_exe.py --skip-model      # don't bundle .gguf model
-    python build_windows_exe.py --skip-wstunnel   # don't bundle wstunnel.exe
+    python build_windows_exe.py --skip-wstunnel  # don't bundle wstunnel.exe
     python build_windows_exe.py --output-dir dist # custom output folder
 
 Version management:
@@ -68,7 +65,6 @@ PAYLOAD_FILES = [
     "client.py",
     "cobra_launcher.py",
     "identity_manager.py",
-    "cobra_sentinel.py",
 ]
 
 # Directories to search for oqs.dll
@@ -185,7 +181,7 @@ def build(args):
     if missing:
         print(f"ERROR: Missing payload files: {', '.join(missing)}")
         print(f"  Expected in: {script_dir}")
-        print("  Copy client.py, cobra_launcher.py, identity_manager.py, cobra_sentinel.py here.")
+        print("  Copy client.py, cobra_launcher.py, identity_manager.py here.")
         sys.exit(1)
 
     # Find oqs.dll
@@ -241,19 +237,6 @@ def build(args):
         if wstunnel_exe:
             add_data_args.extend(["--add-data", f"{wstunnel_exe}{sep}payload/bin"])
 
-        # Bundle .gguf model if found
-        gguf_model = None
-        if not args.skip_model:
-            for f in sorted(script_dir.glob("*.gguf")):
-                gguf_model = f
-                break  # take the first one
-            if gguf_model:
-                add_data_args.extend(["--add-data", f"{gguf_model}{sep}payload/models"])
-                print(f"  Found LLM model: {gguf_model.name}")
-            else:
-                print("  WARNING: No .gguf model found — Sentinel AI diagnostics won't work")
-                print("  (Place a .gguf file next to this script, or use --skip-model)")
-
         # Bundle the setup_deps.ps1 helper if it exists
         deps_script = script_dir / "setup_deps.ps1"
         if deps_script.exists():
@@ -299,7 +282,6 @@ def build(args):
         print(f"  Payload: {', '.join(PAYLOAD_FILES)}")
         print(f"  OQS DLL: {'bundled' if oqs_dll else 'not bundled (will build on target)'}")
         print(f"  wstunnel: {'bundled' if wstunnel_exe else 'not bundled (installer will download)'}")
-        print(f"  LLM Model: {gguf_model.name if gguf_model else 'not bundled (no AI diagnostics)'}")
         print(f"  Output:  {output_dir}")
         print("=" * 60)
         print()
@@ -330,8 +312,6 @@ def main():
     parser = argparse.ArgumentParser(description="Build CobraTail Windows installer")
     parser.add_argument("--skip-oqs", action="store_true",
                         help="Don't bundle oqs.dll (installer will build on target)")
-    parser.add_argument("--skip-model", action="store_true",
-                        help="Don't bundle the .gguf LLM model (disables AI diagnostics)")
     parser.add_argument("--skip-wstunnel", action="store_true",
                         help="Don't bundle wstunnel.exe (installer will download on target)")
     parser.add_argument("--output-dir", type=str, default=None,

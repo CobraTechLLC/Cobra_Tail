@@ -223,6 +223,15 @@ PEER_KEM_TIMEOUT = 60             # Timeout for the full KEM exchange handshake
 MESH_REKEY_INTERVAL = 86400       # Re-key mesh tunnels 120-for test. 86400-for production every 24 hours (seconds)
 MESH_REKEY_CHECK_INTERVAL = 300   # Check for rekey-eligible peers every 5 minutes
 
+# MagicDNS — write peer hostnames into the system hosts file so old apps
+# can reach peers as "myserver" or "myserver.cobra"
+MAGIC_DNS_SUFFIX = "cobra"
+MAGIC_DNS_BEGIN = "# === COBRATAIL MAGIC DNS BEGIN ==="
+MAGIC_DNS_END = "# === COBRATAIL MAGIC DNS END ==="
+MAGIC_DNS_SYNC_INTERVAL = 30   # Re-sync hosts file at most every 30s
+_magic_dns_last_sync = 0.0
+_magic_dns_last_hash = ""
+
 # Mesh interface mutation lock — serializes all wg_mesh conf rewrites and
 # interface teardown/bring-up operations so background threads (path monitor,
 # rekey, reconciliation) can't race each other.
@@ -313,48 +322,6 @@ log = logging.getLogger("client")
 # Physical IP cache — avoids spawning PowerShell on every STUN/holepunch call
 _physical_ip_cache = {"ip": "", "timestamp": 0.0}
 _PHYSICAL_IP_CACHE_TTL = 30.0  # Re-check every 30 seconds
-
-# ─── Sentinel Notification ───────────────────────────────────────────────────
-# Fire-and-forget: if the Sentinel is running, it gets the event instantly.
-# If it's not running, the connection fails silently and we move on.
-
-SENTINEL_SOCKET_PATH = "/tmp/cobra-sentinel.sock"
-SENTINEL_TCP_PORT = 9877
-
-def notify_sentinel(error_msg: str, component: str = "general", **extra_context) -> None:
-    """
-    Push an error event to the Cobra Sentinel for AI diagnosis.
-    Non-blocking, fire-and-forget. Does nothing if Sentinel isn't running.
-    """
-    event = json.dumps({
-        "source": "client",
-        "severity": "error",
-        "error": error_msg,
-        "context": {
-            "component": component,
-            "device_id": get_client_id() if CLIENT_ID_PATH.exists() else "unknown",
-            **extra_context,
-        },
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }) + "\n"
-
-    def _send():
-        try:
-            if platform.system() == "Windows":
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2)
-                sock.connect(("127.0.0.1", SENTINEL_TCP_PORT))
-            else:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(2)
-                sock.connect(SENTINEL_SOCKET_PATH)
-            sock.sendall(event.encode("utf-8"))
-            sock.close()
-        except (ConnectionRefusedError, FileNotFoundError, OSError):
-            pass  # Sentinel not running — that's fine
-
-    # Don't block the client's main loop
-    threading.Thread(target=_send, daemon=True, name="sentinel-notify").start()
 
 # ─── TLS Certificate Pinning ────────────────────────────────────────────────
 
@@ -702,12 +669,6 @@ def classify_nat_type(quiet: bool = False) -> tuple[str, list[dict]]:
     if len(endpoints) < 2:
         log.warning(f"NAT classification: only {len(endpoints)} STUN responses (need 2+)")
         nat_type = NAT_TYPE_UNKNOWN
-        notify_sentinel(
-            f"STUN failed — only {len(endpoints)} responses (need 2+), NAT type unknown. Possible DNS resolution failure.",
-            component="stun",
-            stun_responses=len(endpoints),
-            stun_servers_queried=len(servers),
-        )
         return nat_type, endpoints
 
     ports = [ep["port"] for ep in endpoints]
@@ -2073,6 +2034,125 @@ def fetch_online_clients(lighthouse_url: str) -> list:
         log.debug(f"Failed to fetch online clients: {e}")
     return []
 
+def _hosts_file_path() -> Path:
+    """OS hosts file location."""
+    if platform.system() == "Windows":
+        return Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
+    return Path("/etc/hosts")
+
+
+def _sanitize_hostname(name: str) -> str:
+    """Make a node_name safe for a hosts file (lowercase, [a-z0-9-] only, max 63 chars)."""
+    name = (name or "").strip().lower()
+    out = []
+    for ch in name:
+        if ch.isalnum() or ch == "-":
+            out.append(ch)
+        else:
+            out.append("-")
+    clean = "".join(out).strip("-")[:63]
+    return clean
+
+
+def sync_magic_dns_hosts(lighthouse_url: str, force: bool = False) -> bool:
+    """Fetch /api/v1/peers and write a managed block into the system hosts file
+    so peers resolve by hostname (e.g. 'myserver' or 'myserver.cobra').
+    Internally debounced — safe to call on every heartbeat."""
+    global _magic_dns_last_sync, _magic_dns_last_hash
+    now = time.time()
+    if not force and now - _magic_dns_last_sync < MAGIC_DNS_SYNC_INTERVAL:
+        return False
+
+    try:
+        resp = get_session().get(f"{lighthouse_url}/api/v1/peers", timeout=5)
+        if resp.status_code != 200:
+            return False
+        peers = resp.json().get("peers", [])
+    except Exception as e:
+        log.debug(f"MagicDNS: peer fetch failed: {e}")
+        return False
+
+    suffix = MAGIC_DNS_SUFFIX.lstrip(".")
+    lines, seen = [], set()
+    for p in peers:
+        host = _sanitize_hostname(p.get("hostname", ""))
+        vpn = (p.get("vpn_address") or "").strip()
+        if not host or not vpn or host in seen:
+            continue
+        seen.add(host)
+        lines.append(f"{vpn}\t{host} {host}.{suffix}")
+
+    block = MAGIC_DNS_BEGIN + "\n" + "\n".join(lines) + "\n" + MAGIC_DNS_END + "\n"
+    block_hash = hashlib.sha256(block.encode()).hexdigest()
+    if not force and block_hash == _magic_dns_last_hash:
+        _magic_dns_last_sync = now
+        return False
+
+    hosts_path = _hosts_file_path()
+    try:
+        existing = hosts_path.read_text(encoding="utf-8", errors="replace") if hosts_path.exists() else ""
+    except Exception as e:
+        log.debug(f"MagicDNS: cannot read {hosts_path}: {e}")
+        return False
+
+    # Strip any prior managed block (with surrounding blank lines)
+    if MAGIC_DNS_BEGIN in existing and MAGIC_DNS_END in existing:
+        start = existing.index(MAGIC_DNS_BEGIN)
+        end = existing.index(MAGIC_DNS_END) + len(MAGIC_DNS_END)
+        while end < len(existing) and existing[end] == "\n":
+            end += 1
+        while start > 0 and existing[start - 1] == "\n":
+            start -= 1
+        existing = existing[:start] + existing[end:]
+
+    new_contents = existing.rstrip() + "\n\n" + block
+
+    try:
+        tmp = hosts_path.with_suffix(hosts_path.suffix + ".cobratail.tmp")
+        tmp.write_text(new_contents, encoding="utf-8")
+        os.replace(tmp, hosts_path)
+    except PermissionError:
+        log.warning(f"MagicDNS: no permission to write {hosts_path} (need admin/root)")
+        return False
+    except Exception as e:
+        log.debug(f"MagicDNS: write failed: {e}")
+        return False
+
+    _magic_dns_last_sync = now
+    _magic_dns_last_hash = block_hash
+    log.info(f"MagicDNS: synced {len(lines)} host(s) → {hosts_path}")
+    return True
+
+
+def clear_magic_dns_hosts() -> bool:
+    """Remove the CobraTail managed block from the hosts file (call on shutdown)."""
+    global _magic_dns_last_hash
+    hosts_path = _hosts_file_path()
+    try:
+        if not hosts_path.exists():
+            return False
+        existing = hosts_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    if MAGIC_DNS_BEGIN not in existing or MAGIC_DNS_END not in existing:
+        return False
+    start = existing.index(MAGIC_DNS_BEGIN)
+    end = existing.index(MAGIC_DNS_END) + len(MAGIC_DNS_END)
+    while end < len(existing) and existing[end] == "\n":
+        end += 1
+    while start > 0 and existing[start - 1] == "\n":
+        start -= 1
+    new_contents = (existing[:start] + existing[end:]).rstrip() + "\n"
+    try:
+        tmp = hosts_path.with_suffix(hosts_path.suffix + ".cobratail.tmp")
+        tmp.write_text(new_contents, encoding="utf-8")
+        os.replace(tmp, hosts_path)
+        _magic_dns_last_hash = ""
+        log.info("MagicDNS: cleared managed block from hosts file")
+        return True
+    except Exception as e:
+        log.debug(f"MagicDNS: clear failed: {e}")
+        return False
 
 def request_mesh_tunnel(lighthouse_url: str, target_device_id: str,
                          wg_pubkey: str, wg_listen_port: int = MESH_WG_LISTEN_PORT,
@@ -2372,10 +2452,6 @@ def _rewrite_mesh_conf(mesh_conf_path: Path, wg_privkey: str,
         log.error(
             "_rewrite_mesh_conf: REFUSING to write conf — my_mesh_ip is empty "
             "and could not be recovered. Interface would come up without an IP."
-        )
-        notify_sentinel(
-            "Mesh conf rewrite blocked: my_mesh_ip is empty",
-            component="mesh",
         )
         return
 
@@ -4124,13 +4200,6 @@ class QuantumVPNService:
             if startup_attempts % 3 == 0:
                 self._try_auto_heal_fingerprint()
             log.warning(f"Initial connection failed — retrying in {startup_delay:.0f}s...")
-            notify_sentinel(
-                f"Initial connection failed (attempt #{startup_attempts}) — retrying in {startup_delay:.0f}s",
-                component="startup",
-                startup_attempts=startup_attempts,
-                lighthouse_public=self.public_url or "",
-                lighthouse_local=self.local_url or "",
-            )
             time.sleep(startup_delay)
             startup_delay = min(startup_delay * RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_DELAY)
 
@@ -4201,11 +4270,6 @@ class QuantumVPNService:
                             hb_result = send_heartbeat(self.lighthouse_url)
                         if not hb_result:
                             log.warning("Heartbeat failed twice — connection may be lost")
-                            notify_sentinel(
-                                "Heartbeat failed (2 attempts) — connection may be lost",
-                                component="heartbeat",
-                                lighthouse_url=self.lighthouse_url or "",
-                            )
                             self._handle_connection_loss()
                         else:
                             # Heartbeat succeeded — reset backoff state
@@ -4264,6 +4328,7 @@ class QuantumVPNService:
 
                         # Phase 2 U7: Renew UPnP mappings on heartbeat
                         renew_upnp_mappings()
+                        sync_magic_dns_hosts(self.lighthouse_url)
                         last_heartbeat = now
                         # Pick a fresh jittered interval for next cycle
                         next_heartbeat_interval = HEARTBEAT_INTERVAL + random.uniform(-HEARTBEAT_JITTER,
@@ -4480,11 +4545,6 @@ class QuantumVPNService:
                 vault = discover_vault(self.lighthouse_url)
                 if not vault:
                     log.error("No vault available — will retry")
-                    notify_sentinel(
-                        "No vault available for KEM handshake",
-                        component="vault",
-                        lighthouse_url=self.lighthouse_url or "",
-                    )
                     return False
                 handshake = initiate_handshake(self.lighthouse_url, vault["device_id"])
 
@@ -4617,11 +4677,6 @@ class QuantumVPNService:
 
             # Tunnel failed to come up at all
             log.error("Tunnel failed to come up")
-            notify_sentinel(
-                "WireGuard tunnel failed to come up",
-                component="wireguard",
-                lighthouse_url=self.lighthouse_url or "",
-            )
             return False
 
         except Exception as e:
@@ -4632,11 +4687,6 @@ class QuantumVPNService:
                 log.error(f"Connection failed: {type(e).__name__} (no message)")
             import traceback
             log.error(f"Traceback:\n{traceback.format_exc()}")
-            notify_sentinel(
-                f"Connection failed: {type(e).__name__}: {msg or 'no details'}",
-                component="tunnel",
-                lighthouse_url=self.lighthouse_url or "",
-            )
             return False
 
     def _check_network_change(self) -> None:
@@ -4746,15 +4796,6 @@ class QuantumVPNService:
         # Stop wstunnel — _full_connect will re-test and restart if needed
         if _wstunnel_active:
             _stop_wstunnel()
-
-        # Notify Sentinel for AI-assisted diagnosis
-        notify_sentinel(
-            f"Connection lost to Lighthouse (attempt #{self._consecutive_failures})",
-            component="connection",
-            consecutive_failures=self._consecutive_failures,
-            lighthouse_url=self.lighthouse_url or "",
-            reconnect_delay=self._reconnect_delay,
-        )
 
         # If the lighthouse_url was switched to VPN-internal (10.x.x.x) after
         # connect, it's unreachable now that the tunnel is down. Reset so
@@ -5878,13 +5919,6 @@ class QuantumVPNService:
                         f"({peer_wg_pubkey[:20]}...) — {age:.0f}s old, threshold {HANDSHAKE_STALE_THRESHOLD}s"
                     )
 
-                    notify_sentinel(
-                        f"Mesh handshake stale for peer {peer_id} — {age:.0f}s since last handshake",
-                        component="mesh",
-                        peer_id=peer_id,
-                        handshake_age_seconds=int(age),
-                        threshold_seconds=HANDSHAKE_STALE_THRESHOLD,
-                    )
 
                     self._path_monitor_repunch(request_id, peer_info)
 
@@ -6072,12 +6106,6 @@ class QuantumVPNService:
                 f"— entering {PATH_MONITOR_COOLDOWN}s cooldown before next attempt"
             )
             self._repunch_cooldown[peer_id] = time.time()
-            notify_sentinel(
-                f"Mesh path recovery failed for peer {peer_id} after {PATH_MONITOR_MAX_RETRIES} retries — needs relay or manual fix",
-                component="mesh",
-                peer_id=peer_id,
-                retries_exhausted=PATH_MONITOR_MAX_RETRIES,
-            )
         finally:
             self._repunch_active.pop(peer_id, None)
 

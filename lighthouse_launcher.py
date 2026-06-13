@@ -127,9 +127,7 @@ GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRAN
 UPDATABLE_FILES = {
     "lighthouse.py": LIGHTHOUSE_PY,
     "lighthouse_launcher.py": LAUNCHER_PY,
-    "cobra_sentinel.py": LIGHTHOUSE_DIR / "cobra_sentinel.py",
     "version.txt": LIGHTHOUSE_DIR / "version.txt",
-    "troubleshooting.md": CONFIG_DIR / "troubleshooting.md",
 }
 
 # ─── Terminal Helpers ────────────────────────────────────────────────────────

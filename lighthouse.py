@@ -66,48 +66,6 @@ logging.basicConfig(
 log = logging.getLogger("lighthouse")
 
 
-# ─── Sentinel Notification ───────────────────────────────────────────────────
-# Fire-and-forget: pushes error events to the Cobra Sentinel for AI diagnosis.
-# Does nothing if the Sentinel service isn't running.
-
-import socket as _socket
-
-SENTINEL_SOCKET_PATH = "/tmp/cobra-sentinel.sock"
-SENTINEL_TCP_PORT = 9877
-
-def notify_sentinel(error_msg: str, component: str = "general", **extra_context) -> None:
-    """
-    Push an error event to the Cobra Sentinel for AI diagnosis.
-    Non-blocking, fire-and-forget. Does nothing if Sentinel isn't running.
-    """
-    event = json.dumps({
-        "source": "lighthouse",
-        "severity": "error",
-        "error": error_msg,
-        "context": {
-            "component": component,
-            **extra_context,
-        },
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }) + "\n"
-
-    def _send():
-        try:
-            if sys.platform == "win32":
-                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                sock.settimeout(2)
-                sock.connect(("127.0.0.1", SENTINEL_TCP_PORT))
-            else:
-                sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-                sock.settimeout(2)
-                sock.connect(SENTINEL_SOCKET_PATH)
-            sock.sendall(event.encode("utf-8"))
-            sock.close()
-        except (ConnectionRefusedError, FileNotFoundError, OSError):
-            pass  # Sentinel not running — that's fine
-
-    threading.Thread(target=_send, daemon=True, name="sentinel-notify").start()
-
 # ─── Global Config ───────────────────────────────────────────────────────────
 
 CONFIG: dict = {}
@@ -261,10 +219,6 @@ def _start_wstunnel_server() -> None:
                  f"ws://0.0.0.0:{listen_port} → {forward_to}")
     except Exception as e:
         log.warning(f"wstunnel: failed to start — {e}")
-        notify_sentinel(
-            f"wstunnel failed to start: {e}",
-            component="wstunnel",
-        )
         _wstunnel_process = None
 
 
@@ -896,11 +850,6 @@ def rotate_peer_psk(device_id: str, wg_pubkey: str, vpn_address: str) -> bool:
     full HKDF info string and re-derives the same PSK independently."""
     if oqs is None:
         log.error("liboqs not available — cannot rotate PSK")
-        notify_sentinel(
-            "liboqs not available — cannot rotate PSK",
-            component="psk_rotation",
-            device_id=device_id,
-        )
         return False
 
     with get_db() as conn:
@@ -910,11 +859,6 @@ def rotate_peer_psk(device_id: str, wg_pubkey: str, vpn_address: str) -> bool:
 
     if not vault:
         log.error("No online vault — cannot rotate PSK")
-        notify_sentinel(
-            "No online vault — cannot rotate PSK",
-            component="vault",
-            device_id=device_id,
-        )
         return False
 
     try:
@@ -952,12 +896,6 @@ def rotate_peer_psk(device_id: str, wg_pubkey: str, vpn_address: str) -> bool:
 
     except Exception as e:
         log.error(f"PSK rotation failed for {device_id}: {e}")
-        notify_sentinel(
-            f"PSK rotation failed for {device_id}: {e}",
-            component="psk_rotation",
-            device_id=device_id,
-            vpn_address=vpn_address,
-        )
         return False
 
 def rotate_all_peers() -> dict:
@@ -1046,10 +984,6 @@ def key_rotation_thread() -> None:
 
         except Exception as e:
             log.error(f"Key rotation cycle failed: {e}")
-            notify_sentinel(
-                f"Key rotation cycle failed: {e}",
-                component="key_rotation",
-            )
 
 
 # ─── Vault UART Thread ──────────────────────────────────────────────────────
@@ -1148,11 +1082,6 @@ def vault_uart_thread() -> None:
 
         except Exception as e:
             log.error(f"Vault UART error: {e} — reconnecting in 5s")
-            notify_sentinel(
-                f"Vault UART link lost: {e}",
-                component="uart",
-                uart_device=device,
-            )
             if vault_uart:
                 try:
                     vault_uart.close()
@@ -1237,11 +1166,6 @@ def send_to_vault(msg_type: str, data: dict) -> bool:
         return True
     except Exception as e:
         log.error(f"Failed to queue message for Vault: {e}")
-        notify_sentinel(
-            f"Failed to queue message for Vault: {e}",
-            component="vault",
-            msg_type=msg_type,
-        )
         return False
 
 # ─── Pending PSK Store (for client-side encap) ──────────────────────────────
@@ -1900,7 +1824,12 @@ async def heartbeat(req: HeartbeatRequest):
 @app.get("/api/v1/peers")
 async def list_peers():
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM peers").fetchall()
+        rows = conn.execute("""
+            SELECT p.*, e.node_name AS hostname
+            FROM peers p
+            LEFT JOIN enrollment_tokens e
+                   ON e.device_id = p.device_id AND e.status = 'used'
+        """).fetchall()
 
     peers = []
     for row in rows:
@@ -1908,6 +1837,7 @@ async def list_peers():
         peers.append({
             "device_id": row["device_id"],
             "device_type": row["device_type"],
+            "hostname": row["hostname"] or "",
             "vpn_address": row["vpn_address"],
             "status": status,
             "kem_algorithm": row["kem_algorithm"],
@@ -3549,10 +3479,6 @@ def main():
     except Exception as e:
         log.error(f"WireGuard setup failed: {e}")
         log.info("Continuing without WireGuard — tunnel management disabled")
-        notify_sentinel(
-            f"WireGuard setup failed on startup: {e}",
-            component="wireguard",
-        )
 
     uart_thread = threading.Thread(target=vault_uart_thread, daemon=True)
     uart_thread.start()
