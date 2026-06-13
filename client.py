@@ -4928,6 +4928,7 @@ class QuantumVPNService:
             for ext_port in list(_active_upnp_mappings.keys()):
                 release_upnp_mapping(ext_port)
 
+        clear_magic_dns_hosts()
         _wireguard_down()
         _mesh_wireguard_down()
         _stop_wstunnel()

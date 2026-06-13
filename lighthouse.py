@@ -1705,8 +1705,8 @@ async def enroll_node(req: EnrollRequest):
     with get_db() as conn:
         conn.execute(
             "UPDATE enrollment_tokens SET status = 'used', device_id = ?, "
-            "used_at = ?, used_by_ip = ? WHERE token = ?",
-            (device_id, _now_iso(), req.hostname, req.token),
+            "used_at = ? WHERE token = ?",
+            (device_id, _now_iso(), req.token),
         )
 
     # Get the cert fingerprint so the client can pin it
@@ -3158,7 +3158,12 @@ def main():
             print("Example: python lighthouse.py add-node cobra3")
             sys.exit(1)
 
-        node_name = args.node_name
+        node_name = args.node_name.strip().lower()
+        # DNS-safe: [a-z0-9-], must start/end alphanumeric, 1-63 chars
+        if not re.match(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", node_name):
+            print(f"  Invalid node name: '{args.node_name}'")
+            print(f"  Use lowercase letters, digits, or hyphens (e.g., 'cobra3', 'web-01').")
+            sys.exit(1)
         init_database(CONFIG["database"]["path"])
 
         # Check if already enrolled

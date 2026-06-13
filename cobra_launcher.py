@@ -1593,74 +1593,128 @@ def main_menu():
 
 
 def show_mesh_peers():
-    """Display current mesh peer information."""
-    print_header("Mesh Peers")
+    """Display all known peers from the Lighthouse with online/offline state.
+    Annotates peers that have an active mesh tunnel with handshake health."""
+    print_header("Peers")
 
-    if not MESH_PEERS_PATH.exists():
-        print(f"  {DIM}No mesh peers configured yet.{RESET}")
-        print(f"  {DIM}Mesh tunnels are established automatically when the client is running.{RESET}")
+    enrollment = load_enrollment()
+    public_url = enrollment.get("lighthouse_public", "")
+    local_url = enrollment.get("lighthouse_local", "")
+    my_device_id = enrollment.get("device_id", "")
+
+    if not (public_url or local_url):
+        print(f"  {RED}Not enrolled — no Lighthouse to query.{RESET}")
         pause()
         return
 
     try:
-        peers = json.loads(MESH_PEERS_PATH.read_text())
-    except Exception:
-        print(f"  {RED}Failed to read mesh peers file{RESET}")
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except ImportError:
+        print(f"  {RED}requests not installed.{RESET}")
+        pause()
+        return
+
+    # Prefer LAN URL, fall back to public
+    peers = None
+    last_err = None
+    for url in [local_url, public_url]:
+        if not url:
+            continue
+        try:
+            resp = requests.get(f"{url}/api/v1/peers", verify=False, timeout=8)
+            if resp.status_code == 200:
+                peers = resp.json().get("peers", [])
+                break
+            last_err = f"HTTP {resp.status_code}"
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    if peers is None:
+        print(f"  {RED}Could not reach Lighthouse{RESET}  {DIM}({last_err}){RESET}")
         pause()
         return
 
     if not peers:
-        print(f"  {DIM}No active mesh peers.{RESET}")
+        print(f"  {DIM}No peers registered yet.{RESET}")
         pause()
         return
 
-    print(f"  {BOLD}Active Mesh Peers ({len(peers)}){RESET}")
-    print()
-    print(f"  {'Mesh IP':<18s}  {'Endpoint':<28s}  {'VPN IP'}")
-    print(f"  {'─' * 18}  {'─' * 28}  {'─' * 16}")
+    # Map vpn_address → pubkey from local mesh state
+    pubkey_by_vpn = {}
+    if MESH_PEERS_PATH.exists():
+        try:
+            for pubkey, info in json.loads(MESH_PEERS_PATH.read_text()).items():
+                vpn = info.get("vpn_address")
+                if vpn:
+                    pubkey_by_vpn[vpn] = pubkey
+        except Exception:
+            pass
 
-    for pubkey, info in peers.items():
-        mesh_ip = info.get("mesh_ip", "—")
-        vpn_ip = info.get("vpn_address", "—")
-        endpoint = info.get("endpoint", "—")
-        print(f"  {mesh_ip:<18s}  {endpoint:<28s}  {vpn_ip}")
-
-    print()
-
-    # Also try to show WireGuard handshake status
-    if IS_WINDOWS:
-        wg_path = r"C:\Program Files\WireGuard\wg.exe"
-        if not Path(wg_path).exists():
+    # Map pubkey → last-handshake timestamp via `wg show wg_mesh latest-handshakes`
+    handshake_by_pubkey = {}
+    if pubkey_by_vpn:
+        if IS_WINDOWS:
+            wg_path = r"C:\Program Files\WireGuard\wg.exe"
+            if not Path(wg_path).exists():
+                wg_path = "wg"
+        else:
             wg_path = "wg"
-    else:
-        wg_path = "wg"
+        wg_cmd = [wg_path, "show", "wg_mesh", "latest-handshakes"]
+        if not IS_WINDOWS:
+            wg_cmd = ["sudo"] + wg_cmd
+        result = run_cmd(wg_cmd)
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                parts = line.split("\t")
+                if len(parts) == 2 and parts[1].isdigit():
+                    handshake_by_pubkey[parts[0]] = int(parts[1])
 
-    wg_cmd = [wg_path, "show", "wg_mesh", "latest-handshakes"]
-    if not IS_WINDOWS:
-        wg_cmd = ["sudo"] + wg_cmd
-    result = run_cmd(wg_cmd)
-    if result.returncode == 0 and result.stdout.strip():
-        print(f"  {BOLD}Handshakes{RESET}")
-        for line in result.stdout.strip().splitlines():
-            parts = line.split("\t")
-            if len(parts) == 2:
-                pubkey_short = parts[0][:16] + "..."
-                ts = int(parts[1]) if parts[1].isdigit() else 0
-                if ts > 0:
-                    age = int(time.time()) - ts
-                    if age < 120:
-                        health = f"{GREEN}healthy{RESET} ({age}s ago)"
-                    elif age < 300:
-                        health = f"{YELLOW}stale{RESET} ({age}s ago)"
-                    else:
-                        health = f"{RED}dead{RESET} ({age}s ago)"
+    online_count = sum(1 for p in peers if p.get("status") == "online")
+    print(f"  {BOLD}Network: {len(peers)} node(s), {online_count} online{RESET}")
+    print()
+    print(f"      {'Hostname':<24s} {'VPN IP':<18s} {'Status':<8s} Mesh")
+    print(f"      {'─'*24} {'─'*18} {'─'*8} {'─'*24}")
+
+    # Sort: online first, then alphabetical by hostname
+    peers.sort(key=lambda p: (p.get("status") != "online", p.get("hostname", "")))
+
+    now = int(time.time())
+    for p in peers:
+        hostname = p.get("hostname", "") or "—"
+        vpn = p.get("vpn_address", "") or "—"
+        status = p.get("status", "unknown")
+        is_self = (p.get("device_id", "") == my_device_id)
+
+        dot = f"{GREEN}●{RESET}" if status == "online" else f"{RED}●{RESET}"
+
+        # Per-peer mesh column: handshake health if a tunnel exists, else self/none
+        if is_self:
+            mesh_str = f"{DIM}(this device){RESET}"
+        elif vpn in pubkey_by_vpn:
+            pubkey = pubkey_by_vpn[vpn]
+            ts = handshake_by_pubkey.get(pubkey, 0)
+            if ts > 0:
+                age = now - ts
+                if age < 120:
+                    mesh_str = f"{GREEN}healthy{RESET} ({age}s)"
+                elif age < 300:
+                    mesh_str = f"{YELLOW}stale{RESET} ({age}s)"
                 else:
-                    health = f"{DIM}no handshake{RESET}"
-                print(f"  {pubkey_short}  {health}")
-        print()
+                    mesh_str = f"{RED}dead{RESET} ({age}s)"
+            else:
+                mesh_str = f"{DIM}no handshake{RESET}"
+        else:
+            mesh_str = f"{DIM}—{RESET}"
 
+        host_display = (hostname[:23] + "…") if len(hostname) > 24 else hostname
+
+        print(f"   {dot}  {host_display:<24s} {vpn:<18s} {status:<8s} {mesh_str}")
+
+    print()
     pause()
-
 
 # =============================================================================
 # CLI ENTRY POINT
