@@ -1228,13 +1228,16 @@ def settings_menu():
 
         # wstunnel status
         wstunnel_path = BIN_DIR / ("wstunnel.exe" if IS_WINDOWS else "wstunnel")
-        if wstunnel_path.exists():
+        if wstunnel_path.is_file() and (IS_WINDOWS or os.access(wstunnel_path, os.X_OK)):
             ws_status = f"{GREEN}installed{RESET}"
         elif shutil.which("wstunnel"):
             ws_status = f"{GREEN}installed (PATH){RESET}"
         else:
             ws_status = f"{YELLOW}not installed{RESET} {DIM}(public wifi fallback unavailable){RESET}"
         print(f"  {DIM}wstunnel:  {ws_status}{RESET}")
+        ws_installer = BIN_DIR / "install_wstunnel.sh"
+        if not IS_WINDOWS and ws_installer.exists():
+            print(f"  [6] Install / repair wstunnel")
         print()
         print(f"  [0] Back to main menu")
         print()
@@ -1275,6 +1278,15 @@ def settings_menu():
                 if get_service_status() == "running":
                     stop_service()
                 enrollment_wizard()
+
+        elif choice == "6" and not IS_WINDOWS and (BIN_DIR / "install_wstunnel.sh").exists():
+            print()
+            cmd = [str(BIN_DIR / "install_wstunnel.sh"), "--force"]
+            if os.geteuid() != 0:
+                cmd = ["sudo"] + cmd
+            subprocess.run(cmd)
+            print(f"\n  {DIM}Restart the service so the client picks it up.{RESET}")
+            pause()
 
         elif choice == "5":
             print(f"\n  {RED}WARNING: This will delete ALL Cobra user data:{RESET}")
@@ -1806,4 +1818,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()

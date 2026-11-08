@@ -211,11 +211,20 @@ def _start_wstunnel_server() -> None:
     ]
 
     try:
+        # Log to a file: an unread stderr=PIPE fills its 64 KB buffer and
+        # then wstunnel blocks on its next log write, freezing every
+        # client that is on the TCP fallback.
+        try:
+            ws_log = open("/var/log/lighthouse-wstunnel.log", "ab")
+        except OSError:
+            ws_log = subprocess.DEVNULL
         _wstunnel_process = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=ws_log,
+            stderr=subprocess.STDOUT,
         )
+        if ws_log is not subprocess.DEVNULL:
+            ws_log.close()
         log.info(f"wstunnel: started (PID {_wstunnel_process.pid}) "
                  f"ws://0.0.0.0:{listen_port} → {forward_to}")
     except Exception as e:
@@ -3520,4 +3529,4 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
+    main()

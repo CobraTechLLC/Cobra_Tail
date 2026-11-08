@@ -1440,7 +1440,7 @@ def _find_wstunnel() -> str:
             Path(__file__).parent / "wstunnel",
         ]
         for p in candidates:
-            if p.exists():
+            if p.is_file() and os.access(p, os.X_OK):
                 return str(p)
         # Try PATH
         try:
@@ -1455,7 +1455,8 @@ def _find_wstunnel() -> str:
     return ""
 
 
-def _start_wstunnel(remote_host: str, remote_wg_port: int) -> bool:
+def _start_wstunnel(remote_host: str, remote_wg_port: int,
+                    remote_ws_port: int = WSTUNNEL_REMOTE_PORT) -> bool:
     """Start a local wstunnel client process that tunnels WireGuard UDP over TCP.
 
     Creates: 127.0.0.1:WSTUNNEL_LOCAL_UDP_PORT (UDP) → remote_host:WSTUNNEL_REMOTE_PORT (TCP)
@@ -1478,42 +1479,64 @@ def _start_wstunnel(remote_host: str, remote_wg_port: int) -> bool:
     # This creates a local UDP listener that tunnels to the remote host over WebSocket.
     # The remote wstunnel server (--restrict-to 127.0.0.1:51820) unwraps and delivers
     # to its local WireGuard instance.
-    local_spec = f"udp://127.0.0.1:{WSTUNNEL_LOCAL_UDP_PORT}:127.0.0.1:{remote_wg_port}"
-    remote_url = f"ws://{remote_host}:{WSTUNNEL_REMOTE_PORT}"
+    #
+    # ?timeout_sec=0 is required for WireGuard: without it wstunnel closes the
+    # UDP tunnel after 30s (its default), which drops the WG session and forces
+    # a reconnect loop. See wstunnel README "Wireguard and wstunnel".
+    local_spec = (
+        f"udp://127.0.0.1:{WSTUNNEL_LOCAL_UDP_PORT}:127.0.0.1:{remote_wg_port}"
+        f"?timeout_sec=0"
+    )
+    # Use the port the Lighthouse advertises (lighthouse wizard lets the
+    # operator pick it) instead of assuming 443.
+    remote_url = f"ws://{remote_host}:{remote_ws_port}"
 
     cmd = [wstunnel_bin, "client", "-L", local_spec, remote_url]
 
     log.info(f"Starting wstunnel: {' '.join(cmd)}")
 
+    ws_log_path = LOG_DIR / "wstunnel.log"
     with _wstunnel_lock:
         try:
+            try:
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                ws_log = open(ws_log_path, "ab")
+            except OSError:
+                ws_log = subprocess.DEVNULL
             if platform.system() == "Windows":
                 _wstunnel_process = _SUBPROCESS_ORIG_POPEN(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=ws_log,
+                    stderr=subprocess.STDOUT,
                     creationflags=_CREATE_NO_WINDOW,
                     startupinfo=_STARTUPINFO,
                 )
             else:
                 _wstunnel_process = _SUBPROCESS_ORIG_POPEN(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=ws_log,
+                    stderr=subprocess.STDOUT,
                 )
+            if ws_log is not subprocess.DEVNULL:
+                ws_log.close()  # child keeps its own copy of the fd
 
             # Give it a moment to start and check it didn't exit immediately
             time.sleep(1.0)
             if _wstunnel_process.poll() is not None:
-                stderr = _wstunnel_process.stderr.read().decode(errors="replace").strip()
-                log.error(f"wstunnel exited immediately: {stderr}")
+                tail = ""
+                try:
+                    tail = ws_log_path.read_text(errors="replace").strip().splitlines()[-5:]
+                    tail = " | ".join(tail)
+                except Exception:
+                    pass
+                log.error(f"wstunnel exited immediately: {tail or '(no output)'}")
                 _wstunnel_process = None
                 return False
 
             _wstunnel_active = True
             log.info(
                 f"wstunnel running (PID {_wstunnel_process.pid}): "
-                f"UDP 127.0.0.1:{WSTUNNEL_LOCAL_UDP_PORT} → TCP {remote_host}:{WSTUNNEL_REMOTE_PORT}"
+                f"UDP 127.0.0.1:{WSTUNNEL_LOCAL_UDP_PORT} → TCP {remote_host}:{remote_ws_port}"
             )
             return True
 
@@ -3698,10 +3721,15 @@ def build_wireguard_config(handshake_result: dict, wg_privkey: str,
     dns_line = f"DNS = {', '.join(dns_servers)}\n" if is_full_tunnel else ""
 
     # Build config as bytearray so we can wipe the PSK from memory after use
+    # Over wstunnel every WG packet gains WebSocket+TCP+IP framing; the
+    # default 1420 MTU then fragments and large transfers stall.
+    mtu_line = "MTU = 1380\n" if endpoint.startswith("127.0.0.1:") else ""
+
     config = (
         "[Interface]\n"
         f"PrivateKey = {wg_privkey}\n"
         f"Address = {vpn_addr}/32\n"
+        f"{mtu_line}"
         f"{dns_line}"
         "\n"
         "[Peer]\n"
@@ -4172,6 +4200,7 @@ class QuantumVPNService:
         self.wg_pubkey = None
         self.vpn_address = None
         self.wg_port = 51820
+        self.wstunnel_port = WSTUNNEL_REMOTE_PORT
         self.last_gateway = None
         self.discovery = LANDiscovery()
         self._running = False
@@ -4557,6 +4586,10 @@ class QuantumVPNService:
 
             self.vpn_address = reg_result.get("vpn_address")
             self.wg_port = int(reg_result.get("server_endpoint", ":51820").split(":")[-1])
+            try:
+                self.wstunnel_port = int(reg_result.get("wstunnel_port", WSTUNNEL_REMOTE_PORT))
+            except (TypeError, ValueError):
+                self.wstunnel_port = WSTUNNEL_REMOTE_PORT
 
             # Step 3: Client-side KEM encapsulation (v0.5.0) with retry
             handshake = None
@@ -4613,14 +4646,14 @@ class QuantumVPNService:
                         # UDP is blocked — try wstunnel TCP fallback
                         log.warning(
                             f"Direct UDP to {wg_endpoint} blocked — "
-                            f"attempting wstunnel TCP fallback via port {WSTUNNEL_REMOTE_PORT}"
+                            f"attempting wstunnel TCP fallback via port {self.wstunnel_port}"
                         )
 
                         # Extract the public host IP from the endpoint
                         remote_host = wg_endpoint.split(":")[0]
                         remote_wg_port = self.wg_port
 
-                        if _start_wstunnel(remote_host, remote_wg_port):
+                        if _start_wstunnel(remote_host, remote_wg_port, self.wstunnel_port):
                             # Rewrite WireGuard endpoint to point at the local wstunnel listener
                             wstunnel_endpoint = f"127.0.0.1:{WSTUNNEL_LOCAL_UDP_PORT}"
                             log.info(f"Switching WireGuard endpoint: {wg_endpoint} → {wstunnel_endpoint} (via wstunnel)")
@@ -4668,7 +4701,7 @@ class QuantumVPNService:
                         else:
                             log.error(
                                 "wstunnel not available — cannot bypass UDP block. "
-                                "Install wstunnel: https://github.com/erebe/wstunnel/releases"
+                                "Install: sudo /opt/cobratail/bin/install_wstunnel.sh"
                             )
                             return False
 
@@ -6699,4 +6732,4 @@ def main():
             print("\nDiscovery stopped")
 
 if __name__ == "__main__":
-    main()
+    main()

@@ -35,6 +35,7 @@ REQUIRED_FILES=(
     "client.py"
     "cobra_launcher.py"
     "identity_manager.py"
+    "install_wstunnel.sh"
 )
 
 for f in "${REQUIRED_FILES[@]}"; do
@@ -68,6 +69,7 @@ echo "[2/5] Copying application files..."
 cp "${SCRIPT_DIR}/client.py"           "${PKG_DIR}/opt/cobratail/bin/"
 cp "${SCRIPT_DIR}/cobra_launcher.py"   "${PKG_DIR}/opt/cobratail/bin/"
 cp "${SCRIPT_DIR}/identity_manager.py" "${PKG_DIR}/opt/cobratail/bin/"
+cp "${SCRIPT_DIR}/install_wstunnel.sh" "${PKG_DIR}/opt/cobratail/bin/"
 
 # Write version file
 echo "${VERSION}" > "${PKG_DIR}/opt/cobratail/version.txt"
@@ -79,6 +81,7 @@ touch "${PKG_DIR}/opt/cobratail/.cobratail"
 chmod 755 "${PKG_DIR}/opt/cobratail/bin/client.py"
 chmod 755 "${PKG_DIR}/opt/cobratail/bin/cobra_launcher.py"
 chmod 755 "${PKG_DIR}/opt/cobratail/bin/identity_manager.py"
+chmod 755 "${PKG_DIR}/opt/cobratail/bin/install_wstunnel.sh"
 chmod 644 "${PKG_DIR}/opt/cobratail/version.txt"
 chmod 644 "${PKG_DIR}/opt/cobratail/.cobratail"
 
@@ -194,60 +197,179 @@ touch /opt/cobratail/.cobratail
 
 echo "  Created /opt/cobratail/{config,data,logs}/"
 
+# ── Raspberry Pi Zero 2 W: low-memory install path ───────────
+# The Zero 2 W has 512 MB RAM. A full parallel liboqs build runs it out
+# of memory and freezes the board, so on this model only we:
+#   - make sure DNS works first (installing systemd-resolved as a
+#     dependency can leave name resolution dead until it is restarted)
+#   - build a minimal liboqs (ML-KEM-1024 only, no tests) one job at a
+#     time, with progress printed so it doesn't look hung
+#   - pin liboqs + liboqs-python to matching versions
+# Every other device takes the original install path unchanged.
+
+IS_PI_ZERO2=false
+NET_OK=true          # only re-checked on the Zero 2 W; always true elsewhere
+ZERO_LIBOQS_VERSION="0.16.0"
+ZERO_LIBOQS_PY_VERSION="0.16.0.1"
+
+if [ -r /proc/device-tree/model ] && tr -d '\0' < /proc/device-tree/model | grep -q "Raspberry Pi Zero 2"; then
+    IS_PI_ZERO2=true
+    echo ""
+    echo "  Detected Raspberry Pi Zero 2 W — using low-memory install path"
+
+    zero_dns_ok() {
+        getent hosts github.com >/dev/null 2>&1
+    }
+
+    echo "  Checking DNS..."
+    if ! zero_dns_ok; then
+        echo "  DNS not responding — restarting systemd-resolved..."
+        systemctl restart systemd-resolved 2>/dev/null || true
+        for _ in 1 2 3 4 5 6; do
+            sleep 5
+            zero_dns_ok && break
+        done
+    fi
+
+    if zero_dns_ok; then
+        echo "  DNS OK"
+    else
+        NET_OK=false
+        echo ""
+        echo "  WARNING: DNS still not working — skipping downloads (liboqs,"
+        echo "  pip packages, wstunnel). Fix DNS, then retry with:"
+        echo "    sudo systemctl restart systemd-resolved"
+        echo "    getent hosts github.com"
+        echo "    sudo dpkg-reconfigure cobra-client"
+    fi
+fi
+
 # ── Build and install liboqs C library ───────────────────────
 
 echo "[2/5] Checking liboqs shared library..."
 
 LIBOQS_FOUND=false
-for lib_path in /usr/local/lib/liboqs.so /usr/lib/liboqs.so /usr/local/lib64/liboqs.so; do
-    if [ -f "$lib_path" ]; then
-        echo "  Found: $lib_path"
-        LIBOQS_FOUND=true
-        break
-    fi
-done
+# ldconfig knows every library path, including multiarch ones like
+# /usr/local/lib/aarch64-linux-gnu that the fixed list below would miss
+if ldconfig -p 2>/dev/null | grep -q 'liboqs\.so'; then
+    echo "  Found: $(ldconfig -p | grep -m1 'liboqs\.so' | awk '{print $NF}')"
+    LIBOQS_FOUND=true
+else
+    for lib_path in /usr/local/lib/liboqs.so /usr/lib/liboqs.so /usr/local/lib64/liboqs.so; do
+        if [ -f "$lib_path" ]; then
+            echo "  Found: $lib_path"
+            LIBOQS_FOUND=true
+            break
+        fi
+    done
+fi
 
-if [ "$LIBOQS_FOUND" = false ]; then
-    echo "  liboqs not found — building from source..."
-    echo "  (This takes a few minutes on first install)"
+if [ "$LIBOQS_FOUND" = false ] && [ "$IS_PI_ZERO2" = true ] && [ "$NET_OK" = false ]; then
+    echo "  liboqs not found — skipping build (no DNS, see warning above)"
+    echo "  The client will use server-side ML-KEM encapsulation until it's installed."
+
+elif [ "$LIBOQS_FOUND" = false ] && [ "$IS_PI_ZERO2" = true ]; then
+    echo "  liboqs not found — building minimal liboqs ${ZERO_LIBOQS_VERSION} (ML-KEM-1024 only)..."
+    echo "  On a Pi Zero 2 W this takes roughly 10–20 minutes. Progress is shown"
+    echo "  below every 30 seconds — don't interrupt it."
     echo ""
 
     BUILD_DIR=$(mktemp -d)
+    BUILD_LOG=/opt/cobratail/logs/liboqs-build.log
+    : > "$BUILD_LOG"
 
-    cd "$BUILD_DIR"
-    echo "  Cloning liboqs..."
-    git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git 2>&1 | tail -1
-    cd liboqs
-    mkdir build && cd build
+    # Each step returns explicitly on failure because `set -e` is ignored
+    # inside a function called from an `if` test.
+    zero_build_liboqs() {
+        cd "$BUILD_DIR" || return 1
+        echo "  Downloading liboqs ${ZERO_LIBOQS_VERSION}..."
+        git clone --depth 1 --branch "$ZERO_LIBOQS_VERSION" \
+            https://github.com/open-quantum-safe/liboqs.git >> "$BUILD_LOG" 2>&1 || return 1
+        cd liboqs && mkdir build && cd build || return 1
 
-    echo "  Running cmake..."
-    cmake -GNinja -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local .. -Wno-dev > /dev/null 2>&1
+        echo "  Configuring..."
+        cmake -GNinja -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DOQS_BUILD_ONLY_LIB=ON \
+            -DOQS_MINIMAL_BUILD="KEM_ml_kem_1024" \
+            -DOQS_DIST_BUILD=OFF -DOQS_OPT_TARGET=generic \
+            .. -Wno-dev >> "$BUILD_LOG" 2>&1 || return 1
 
-    echo "  Compiling (this is the slow part)..."
-    ninja > /dev/null 2>&1
+        # One compile job at a time keeps memory use within 512 MB
+        echo "  Compiling (1 job at a time)..."
+        ninja -j1 >> "$BUILD_LOG" 2>&1 &
+        local ninja_pid=$!
+        local progress
+        while kill -0 "$ninja_pid" 2>/dev/null; do
+            sleep 30
+            progress=$(grep -o '^\[[0-9]*/[0-9]*\]' "$BUILD_LOG" 2>/dev/null | tail -1)
+            [ -n "$progress" ] && echo "    progress: ${progress}"
+        done
+        wait "$ninja_pid" || return 1
 
-    echo "  Installing library..."
-    ninja install > /dev/null 2>&1
+        echo "  Installing..."
+        ninja install >> "$BUILD_LOG" 2>&1 || return 1
+    }
 
-    # Update library cache so Python can find liboqs.so
-    ldconfig
+    if zero_build_liboqs; then
+        ldconfig
+        echo "  liboqs built and installed successfully"
+    else
+        echo ""
+        echo "  WARNING: liboqs build failed — see $BUILD_LOG"
+        echo "  The client still works: it falls back to server-side ML-KEM"
+        echo "  encapsulation. To retry the build:"
+        echo "    sudo dpkg-reconfigure cobra-client"
+        echo ""
+    fi
 
     cd /
     rm -rf "$BUILD_DIR"
 
-    if [ -f /usr/local/lib/liboqs.so ]; then
+elif [ "$LIBOQS_FOUND" = false ]; then
+    echo "  liboqs not found — building from source..."
+    echo "  (This takes a few minutes on first install — don't interrupt it)"
+    echo ""
+
+    BUILD_DIR=$(mktemp -d)
+    BUILD_LOG=/opt/cobratail/logs/liboqs-build.log
+
+    # On ARM (Raspberry Pi) the optimized build emits SHA3 instructions
+    # (e.g. eor3) that Debian 12's assembler rejects. The portable build
+    # avoids them; ML-KEM speed is irrelevant for a key exchange.
+    OQS_ARCH_FLAGS=""
+    case "$(uname -m)" in
+        aarch64|arm64|armv7l|armv6l)
+            OQS_ARCH_FLAGS="-DOQS_DIST_BUILD=OFF -DOQS_OPT_TARGET=generic" ;;
+    esac
+
+    # The build runs in a subshell whose failure is caught below. Without
+    # this, `set -e` aborted the whole postinst on any build error (or a
+    # Ctrl+C), leaving the package half-configured — and apt then re-ran
+    # this entire build during every unrelated `apt install` afterwards.
+    echo "  Building (full output in $BUILD_LOG)..."
+    # (steps are chained with && because bash ignores `set -e` inside an
+    # `if` test, so each step must explicitly stop the chain on failure)
+    if {
+        cd "$BUILD_DIR" &&
+        git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git &&
+        cd liboqs && mkdir build && cd build &&
+        cmake -GNinja -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local $OQS_ARCH_FLAGS .. -Wno-dev &&
+        ninja &&
+        ninja install
+    } > "$BUILD_LOG" 2>&1; then
+        ldconfig
         echo "  liboqs built and installed successfully"
     else
         echo ""
-        echo "  WARNING: liboqs build may have failed"
-        echo "  Post-quantum crypto will be unavailable until liboqs is installed"
-        echo "  To retry manually:"
-        echo "    cd /tmp && git clone --depth 1 https://github.com/open-quantum-safe/liboqs.git"
-        echo "    cd liboqs && mkdir build && cd build"
-        echo "    cmake -GNinja -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/usr/local .. -Wno-dev"
-        echo "    ninja && sudo ninja install && sudo ldconfig"
+        echo "  WARNING: liboqs build failed — see $BUILD_LOG"
+        echo "  The client is installed, but post-quantum key exchange won't work"
+        echo "  until liboqs is installed. To retry:"
+        echo "    sudo dpkg-reconfigure cobra-client"
         echo ""
     fi
+
+    cd /
+    rm -rf "$BUILD_DIR"
 else
     echo "  liboqs already installed"
 fi
@@ -255,6 +377,42 @@ fi
 # ── Install Python dependencies ──────────────────────────────
 
 echo "[3/5] Installing Python dependencies..."
+
+if [ "$IS_PI_ZERO2" = true ]; then
+    # ── Pi Zero 2 W path ──
+    if [ "$NET_OK" = true ]; then
+        pip3 install --break-system-packages requests psutil 2>/dev/null || \
+        echo "  WARNING: pip install failed for core packages"
+    else
+        echo "  Skipping pip packages (no DNS)"
+    fi
+
+    # Only install liboqs-python when liboqs itself is present. Without it,
+    # importing liboqs-python tries to download and compile liboqs on its
+    # own, which would freeze a Zero 2 W just like the full build does.
+    if ldconfig -p 2>/dev/null | grep -q 'liboqs\.so'; then
+        if [ "$NET_OK" = true ]; then
+            pip3 install --break-system-packages "liboqs-python==${ZERO_LIBOQS_PY_VERSION}" 2>/dev/null || \
+            echo "  WARNING: liboqs-python install failed — using server-side encapsulation"
+        fi
+
+        echo "  Verifying ML-KEM-1024 support..."
+        python3 -c "
+import oqs
+kem = oqs.KeyEncapsulation('ML-KEM-1024')
+pub = kem.generate_keypair()
+ct, ss = kem.encap_secret(pub)
+print('  ML-KEM-1024 self-test: PASSED (client-side encapsulation enabled)')
+" 2>/dev/null || {
+            echo "  ML-KEM-1024 self-test failed — client will use server-side encapsulation"
+        }
+    else
+        echo "  liboqs not installed — skipping liboqs-python"
+        echo "  Client will use server-side ML-KEM encapsulation (fully supported)"
+    fi
+
+else
+# ── All other devices: original path ──
 
 # Install core pip packages
 pip3 install --break-system-packages \
@@ -285,97 +443,28 @@ print('  ML-KEM-1024 self-test: PASSED')
     echo "  until liboqs is properly built and liboqs-python is installed."
 }
 
+fi  # end Pi Zero 2 W / other devices
+
 # ── Install wstunnel (TCP fallback for UDP-hostile networks) ──
+# Delegated to install_wstunnel.sh so it can be re-run by hand
+# (sudo /opt/cobratail/bin/install_wstunnel.sh) without dpkg-reconfigure,
+# and so a download problem can never abort this postinst under `set -e`.
 
 echo "[4/5] Installing wstunnel TCP fallback..."
 
-WSTUNNEL_BIN="/opt/cobratail/bin/wstunnel"
-WSTUNNEL_INSTALLED=false
-
-if [ -f "$WSTUNNEL_BIN" ] && [ -x "$WSTUNNEL_BIN" ]; then
-    echo "  wstunnel already installed"
-    WSTUNNEL_INSTALLED=true
-elif [ -f "/usr/local/bin/wstunnel" ]; then
-    echo "  wstunnel found at /usr/local/bin/wstunnel — symlinking"
-    ln -sf /usr/local/bin/wstunnel "$WSTUNNEL_BIN" 2>/dev/null || true
-    WSTUNNEL_INSTALLED=true
-fi
-
-if [ "$WSTUNNEL_INSTALLED" = false ]; then
-    # Detect architecture for download
-    # Note: wstunnel uses arm64/amd64 naming, not aarch64/x86_64
-    MACHINE=$(uname -m)
-    case "$MACHINE" in
-        x86_64)  WS_ARCH="amd64" ;;
-        aarch64) WS_ARCH="arm64" ;;
-        armv7l)  WS_ARCH="armv7" ;;
-        *)       WS_ARCH="" ;;
-    esac
-
-    if [ -n "$WS_ARCH" ]; then
-        echo "  Downloading wstunnel for ${MACHINE} (arch: ${WS_ARCH})..."
-
-        # Get latest release URL from GitHub API
-        WS_URL=$(python3 -c "
-import json, urllib.request
-try:
-    req = urllib.request.Request(
-        'https://api.github.com/repos/erebe/wstunnel/releases/latest',
-        headers={'User-Agent': 'CobraTail-Installer'}
-    )
-    data = json.loads(urllib.request.urlopen(req, timeout=15).read())
-    for asset in data.get('assets', []):
-        name = asset['name']
-        if 'linux' in name and '${WS_ARCH}' in name and name.endswith('.tar.gz'):
-            print(asset['browser_download_url'])
-            break
-except Exception as e:
-    pass
-" 2>/dev/null)
-
-        if [ -n "$WS_URL" ]; then
-            TMPDIR=$(mktemp -d)
-            if wget -q -O "${TMPDIR}/wstunnel.tar.gz" "$WS_URL" 2>/dev/null || \
-               curl -sL -o "${TMPDIR}/wstunnel.tar.gz" "$WS_URL" 2>/dev/null; then
-                tar -xzf "${TMPDIR}/wstunnel.tar.gz" -C "${TMPDIR}/" 2>/dev/null
-                # The binary is either at the root or in a subdirectory
-                WS_EXTRACTED=$(find "${TMPDIR}" -name "wstunnel" -type f | head -1)
-                if [ -n "$WS_EXTRACTED" ]; then
-                    cp "$WS_EXTRACTED" "$WSTUNNEL_BIN"
-                    chmod 755 "$WSTUNNEL_BIN"
-                    echo "  wstunnel installed to ${WSTUNNEL_BIN}"
-                    WSTUNNEL_INSTALLED=true
-                else
-                    echo "  WARNING: Could not find wstunnel binary in archive"
-                fi
-            else
-                echo "  WARNING: wstunnel download failed"
-            fi
-            rm -rf "${TMPDIR}"
-        else
-            echo "  WARNING: Could not determine wstunnel download URL"
-        fi
-    else
-        echo "  WARNING: Unsupported architecture (${MACHINE}) — skipping wstunnel"
-    fi
-fi
-
-if [ "$WSTUNNEL_INSTALLED" = true ]; then
-    # Verify it runs
-    if "$WSTUNNEL_BIN" --version >/dev/null 2>&1; then
-        WS_VER=$("$WSTUNNEL_BIN" --version 2>&1 | head -1)
-        echo "  wstunnel verified: ${WS_VER}"
-    else
-        echo "  wstunnel binary present but --version failed (may still work)"
-    fi
+if [ "$NET_OK" = true ]; then
+    /opt/cobratail/bin/install_wstunnel.sh || true
 else
+    echo "  Skipping wstunnel download (no DNS)"
+fi
+
+if ! /opt/cobratail/bin/wstunnel --version >/dev/null 2>&1; then
     echo ""
     echo "  WARNING: wstunnel not installed"
     echo "  The VPN will work on most networks, but public wifi and"
     echo "  corporate networks that block UDP will not be able to connect."
-    echo "  To install manually:"
-    echo "    Download from https://github.com/erebe/wstunnel/releases"
-    echo "    Place the binary at ${WSTUNNEL_BIN}"
+    echo "  Details: /opt/cobratail/logs/wstunnel-install.log"
+    echo "  Retry:   sudo /opt/cobratail/bin/install_wstunnel.sh --force"
     echo ""
 fi
 
